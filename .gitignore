@@ -10,3 +10,4 @@ artifacts/
 logs/
 /uv.lock
 /.idea
+/package-lock.json
