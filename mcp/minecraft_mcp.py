@@ -1,0 +1,2880 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, ClassVar, Literal
+from uuid import uuid4
+
+import requests
+from fastmcp import Context, FastMCP
+from fastmcp.tools import ToolResult
+from mcp.types import ImageContent, TextContent
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from standalone_support import atomic_write_bytes, readable_yaml_bytes
+
+PACKAGE_DIR = Path(__file__).resolve().parents[1]
+MCP_DIR = Path(__file__).resolve().parent
+TEMPLATE_DIR = MCP_DIR / "templates"
+RUNNER_PATH = MCP_DIR / "ts_runner.ts"
+COLLECT_BLOCKS_PRIMITIVE = MCP_DIR / "primitives" / "collect_blocks.ts"
+MAX_TYPESCRIPT_TIMEOUT_SECONDS = 90.0
+MATERIAL_ACTIONS = frozenset(
+    {
+        "collect_blocks",
+        "craft_item",
+        "execute_typescript",
+        "fine_control",
+        "fine_control_mine",
+        "find_block",
+        "mine_block",
+        "pillar_up",
+        "place_block",
+        "smelt",
+        "walk_to",
+    }
+)
+MATERIAL_NO_GAIN_REASSESSMENT_THRESHOLD = 2
+MATERIAL_ATTEMPT_FAILURE_REASONS = frozenset(
+    {
+        "dig_failed",
+        "unharvestable",
+        "place_failed",
+        "place_unverified",
+        "pillar_up_failed",
+    }
+)
+
+
+def material_action_key(
+    action: str,
+    parameters: dict[str, Any],
+) -> str:
+    if action != "fine_control":
+        return action
+    controls = parameters.get("controls")
+    if isinstance(controls, dict) and controls.get("mine") is True:
+        return "fine_control_mine"
+    return action
+
+
+def navigation_cell(
+    position: dict[str, Any],
+) -> tuple[int, int, int] | None:
+    if not all(
+        isinstance(position.get(axis), (int, float))
+        for axis in ("x", "y", "z")
+    ):
+        return None
+    return (
+        int(float(position["x"]) // 3),
+        int(float(position["y"]) // 1),
+        int(float(position["z"]) // 3),
+    )
+
+
+def typescript_runner_command(
+    skill_path: Path,
+    input_path: Path,
+    result_path: Path,
+) -> list[str]:
+    arguments = [
+        str(RUNNER_PATH),
+        "--skill",
+        str(skill_path),
+        "--input",
+        str(input_path),
+        "--result",
+        str(result_path),
+    ]
+    if os.name == "nt":
+        node = shutil.which("node.exe") or shutil.which("node")
+        tsx_cli = (
+            PACKAGE_DIR
+            / "node_modules"
+            / "tsx"
+            / "dist"
+            / "cli.mjs"
+        )
+        if node is None:
+            raise FileNotFoundError("Node.js executable not found")
+        if not tsx_cli.is_file():
+            raise FileNotFoundError(f"tsx CLI not found: {tsx_cli}")
+        return [node, str(tsx_cli), *arguments]
+    tsx = PACKAGE_DIR / "node_modules" / ".bin" / "tsx"
+    if not tsx.is_file():
+        raise FileNotFoundError(f"tsx executable not found: {tsx}")
+    return [str(tsx), *arguments]
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def write_readable_yaml(path: Path, value: Any) -> None:
+    atomic_write_bytes(path, readable_yaml_bytes(without_image_bytes(value)))
+
+
+def relative_workspace_paths(value: Any, workspace: Path) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: relative_workspace_paths(item, workspace)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [relative_workspace_paths(item, workspace) for item in value]
+    if isinstance(value, str):
+        candidate = Path(value)
+        if candidate.is_absolute():
+            try:
+                return candidate.resolve().relative_to(
+                    workspace.resolve()
+                ).as_posix()
+            except ValueError:
+                return value
+    return value
+
+
+def slug(value: str) -> str:
+    rendered = "".join(
+        character if character.isalnum() or character in "-_" else "_" for character in value
+    )
+    if not rendered:
+        raise ValueError("username must contain at least one filename-safe character")
+    return rendered
+
+
+class ServerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    minecraft_host: str
+    minecraft_port: int = Field(ge=1, le=65535)
+    username: str
+    agent_home: Path
+    artifact_root: Path
+    web_host: str
+    web_port: int = Field(ge=1, le=65535)
+    viewer_port: int = Field(ge=1, le=65535)
+    mcp_host: str
+    mcp_port: int = Field(ge=1, le=65535)
+    startup_timeout_seconds: float = Field(gt=0)
+    capture_images: bool
+    max_skill_characters: int = Field(ge=1)
+    viewer_scale: int = Field(ge=1)
+    viewer_fov: int = Field(ge=1)
+    view_distance: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_instance_binding(self) -> ServerConfig:
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", self.username):
+            raise ValueError("Minecraft username must contain 1-16 letters, digits, or underscores")
+        ports = {
+            self.minecraft_port,
+            self.web_port,
+            self.viewer_port,
+            self.mcp_port,
+        }
+        if len(ports) != 4:
+            raise ValueError("Minecraft, body, viewer, and MCP ports must be distinct")
+        return self
+
+    @property
+    def body_url(self) -> str:
+        return f"http://{self.web_host}:{self.web_port}"
+
+    @property
+    def mcp_url(self) -> str:
+        return f"http://{self.mcp_host}:{self.mcp_port}/mcp"
+
+    @property
+    def player_log_dir(self) -> Path:
+        """Compatibility alias for the instance-owned artifact directory."""
+        return self.artifact_root
+
+
+class PositionTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    x: float
+    y: float
+    z: float
+
+
+class MaterialProgressSignal(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    schema_name: Literal["cog.material-progress-signal.v1"] = Field(
+        default="cog.material-progress-signal.v1",
+        serialization_alias="schema",
+    )
+    kind: Literal[
+        "material_inventory_changed",
+        "relevant_state_changed",
+        "material_no_gain",
+        "material_action_blocked",
+    ]
+    action: str = Field(min_length=1)
+    consecutive_no_gain_count: int = Field(
+        ge=0,
+        serialization_alias="consecutiveNoGainCount",
+    )
+    same_action_no_gain_count: int = Field(
+        ge=0,
+        serialization_alias="sameActionNoGainCount",
+    )
+    inventory_changes: dict[str, int] = Field(
+        serialization_alias="inventoryChanges",
+    )
+    relevant_inventory_items: list[str] = Field(
+        serialization_alias="relevantInventoryItems",
+    )
+    requires_reassessment: bool = Field(
+        serialization_alias="requiresReassessment",
+    )
+
+
+class PostconditionSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal[
+        "inventory_min",
+        "inventory_delta_min",
+        "y_min",
+        "y_max",
+        "health_min",
+        "position_changed_min",
+        "distance_max",
+        "held_item",
+    ] | None = None
+    item: str | None = None
+    count: int | None = None
+    value: float | None = None
+    target: PositionTarget | None = None
+    all: list[PostconditionSpec] | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> PostconditionSpec:
+        if self.all is not None:
+            if not self.all:
+                raise ValueError("postcondition all must not be empty")
+            if any(
+                value is not None
+                for value in (
+                    self.kind,
+                    self.item,
+                    self.count,
+                    self.value,
+                    self.target,
+                )
+            ):
+                raise ValueError(
+                    "composite postcondition accepts only all"
+                )
+            return self
+        if self.kind in {"inventory_min", "inventory_delta_min"}:
+            if (
+                not self.item
+                or self.count is None
+                or self.count < 0
+            ):
+                raise ValueError(
+                    f"{self.kind} requires item and non-negative count"
+                )
+            return self
+        if self.kind in {
+            "y_min",
+            "y_max",
+            "health_min",
+            "position_changed_min",
+        }:
+            if self.value is None:
+                raise ValueError(f"{self.kind} requires value")
+            return self
+        if self.kind == "distance_max":
+            if self.target is None or self.value is None:
+                raise ValueError(
+                    "distance_max requires target and value"
+                )
+            return self
+        if self.kind == "held_item":
+            if not self.item:
+                raise ValueError("held_item requires item")
+            return self
+        raise ValueError("postcondition requires kind or all")
+
+    def as_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+class BodyHttpError(RuntimeError):
+    def __init__(self, method: str, path: str, status: int, payload: Any) -> None:
+        super().__init__(
+            f"Minecraft body {method} {path} returned HTTP {status}: {json.dumps(payload, ensure_ascii=False)}"
+        )
+        self.method = method
+        self.path = path
+        self.status = status
+        self.payload = payload
+
+
+class TeeTextStream:
+    def __init__(self, terminal: Any, log_stream: Any) -> None:
+        self.terminal = terminal
+        self.log_stream = log_stream
+        self.lock = threading.Lock()
+        self.encoding = terminal.encoding
+        self.errors = terminal.errors
+
+    def write(self, value: str) -> int:
+        with self.lock:
+            terminal_result = self.terminal.write(value)
+            self.log_stream.write(value)
+            return terminal_result
+
+    def flush(self) -> None:
+        with self.lock:
+            self.terminal.flush()
+            self.log_stream.flush()
+
+    def isatty(self) -> bool:
+        return self.terminal.isatty()
+
+    def fileno(self) -> int:
+        return self.terminal.fileno()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.terminal, name)
+
+
+class BodyApi:
+    ACTION_ROUTES: ClassVar[dict[str, tuple[str, str]]] = {
+        "find_block": ("POST", "/api/world/find-block"),
+        "walk_to": ("POST", "/api/command/walk-to"),
+        "mine_block": ("POST", "/api/command/mine-block"),
+        "place_block": ("POST", "/api/command/place-block"),
+        "jump_place_block": ("POST", "/api/command/jump-place-block"),
+        "pillar_up": ("POST", "/api/command/pillar-up"),
+        "use_block": ("POST", "/api/command/use-block"),
+        "inspect": ("POST", "/api/command/inspect"),
+        "rotate": ("POST", "/api/command/rotate"),
+        "look_at": ("POST", "/api/command/look-at"),
+        "fine_control": ("POST", "/api/command/fine-control"),
+        "sync_orientation": ("POST", "/api/command/sync-orientation"),
+        "stop": ("POST", "/api/command/stop"),
+        "hotbar_select": ("POST", "/api/hotbar/select"),
+        "inventory_select": ("POST", "/api/inventory/select"),
+        "inventory_equip": ("POST", "/api/inventory/equip"),
+        "open_inventory": ("POST", "/api/crafting/open-inventory"),
+        "craft_item": ("POST", "/api/crafting/craft-item"),
+        "open_crafting_table": ("POST", "/api/crafting/open-crafting-table"),
+        "set_crafting_grid": ("POST", "/api/crafting/set-grid"),
+        "take_crafting_output": ("POST", "/api/crafting/take-output"),
+        "clear_crafting_grid": ("POST", "/api/crafting/clear-grid"),
+        "close_crafting_window": ("POST", "/api/crafting/close-window"),
+        "smelt": ("POST", "/api/furnace/smelt"),
+        "resolve_pixel": ("POST", "/api/targeting/resolve-pixel"),
+        "chat": ("POST", "/api/chat/send"),
+    }
+
+    ACTION_SCHEMAS: ClassVar[dict[str, dict[str, Any]]] = {
+        "find_block": {
+            "blockName": "string",
+            "maxDistance": "positive integer",
+            "requireVisible": "boolean; defaults true for realistic line-of-sight search",
+        },
+        "walk_to": {
+            "target": {"x": "number", "y": "number", "z": "number"},
+            "tolerance": "positive number",
+        },
+        "mine_block": {
+            "block": {"x": "integer", "y": "integer", "z": "integer"},
+            "walkIntoRange": "boolean",
+        },
+        "place_block": {
+            "referenceBlock": {"x": "integer", "y": "integer", "z": "integer"},
+            "face": {"x": "-1|0|1", "y": "-1|0|1", "z": "-1|0|1"},
+            "walkIntoRange": "boolean",
+        },
+        "jump_place_block": {
+            "referenceBlock": {"x": "integer", "y": "integer", "z": "integer"},
+            "face": {"x": "-1|0|1", "y": "-1|0|1", "z": "-1|0|1"},
+            "walkIntoRange": "boolean",
+        },
+        "pillar_up": {},
+        "use_block": {
+            "block": {"x": "integer", "y": "integer", "z": "integer"},
+            "walkIntoRange": "boolean",
+        },
+        "inspect": {"block": {"x": "integer", "y": "integer", "z": "integer"}},
+        "rotate": {
+            "yaw": "relative degrees; positive is right",
+            "pitch": "relative degrees; positive is up",
+        },
+        "look_at": {"target": {"x": "number", "y": "number", "z": "number"}},
+        "fine_control": {
+            "controls": {"forward|back|left|right|jump|sprint|sneak": "boolean"},
+            "durationMs": "1..3000",
+            "visualCheckFrameId": "fresh frame id required by MCP",
+        },
+        "sync_orientation": {},
+        "stop": {},
+        "hotbar_select": {"slot": "integer 0..8"},
+        "inventory_select": {"slot": "inventory slot integer"},
+        "inventory_equip": {"itemName": "exact Mineflayer item name"},
+        "open_inventory": {},
+        "craft_item": {
+            "itemName": "exact Mineflayer item name",
+            "repetitions": "positive integer recipe repetitions",
+        },
+        "open_crafting_table": {},
+        "set_crafting_grid": {"grid": "4 or 9 entries; each null or {itemName,count}"},
+        "take_crafting_output": {},
+        "clear_crafting_grid": {},
+        "close_crafting_window": {},
+        "smelt": {
+            "inputItemName": "string",
+            "inputCount": "positive integer",
+            "fuelItemName": "string",
+            "fuelCount": "positive integer",
+            "timeoutMs": "positive integer",
+        },
+        "resolve_pixel": {
+            "frameId": "string",
+            "x": "pixel x",
+            "y": "pixel y",
+            "maxDistance": "positive number",
+        },
+        "chat": {"text": "ordinary chat or informational command only"},
+    }
+
+    ACTION_ALIASES: ClassVar[dict[str, str]] = {
+        "findBlock": "find_block",
+        "walkTo": "walk_to",
+        "mineBlock": "mine_block",
+        "placeBlock": "place_block",
+        "jumpPlaceBlock": "jump_place_block",
+        "pillarUp": "pillar_up",
+        "useBlock": "use_block",
+        "lookAt": "look_at",
+        "fineControl": "fine_control",
+        "syncOrientation": "sync_orientation",
+        "hotbarSelect": "hotbar_select",
+        "inventorySelect": "inventory_select",
+        "inventoryEquip": "inventory_equip",
+        "openInventory": "open_inventory",
+        "craftItem": "craft_item",
+        "openCraftingTable": "open_crafting_table",
+        "setCraftingGrid": "set_crafting_grid",
+        "takeCraftingOutput": "take_crafting_output",
+        "clearCraftingGrid": "clear_crafting_grid",
+        "closeCraftingWindow": "close_crafting_window",
+        "resolvePixel": "resolve_pixel",
+    }
+
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        timeout_seconds: float = 30,
+    ) -> dict[str, Any]:
+        response = self.session.request(
+            method, f"{self.base_url}{path}", json=body, timeout=timeout_seconds
+        )
+        payload = response.json()
+        if response.status_code < 200 or response.status_code >= 300:
+            if isinstance(payload, dict) and payload.get("ok") is False:
+                payload["httpStatus"] = response.status_code
+                return payload
+            raise BodyHttpError(method, path, response.status_code, payload)
+        if not isinstance(payload, dict):
+            raise TypeError(f"Minecraft body {method} {path} returned a non-object JSON response")
+        return payload
+
+    def health(self) -> dict[str, Any]:
+        return self.request("GET", "/api/health", timeout_seconds=5)
+
+    def state(self) -> dict[str, Any]:
+        return self.request("GET", "/api/state", timeout_seconds=5)
+
+    def observe(self) -> dict[str, Any]:
+        return self.request("GET", "/api/observation", timeout_seconds=10)
+
+    def capture_frame(self) -> dict[str, Any]:
+        return self.request("GET", "/api/frame/current", timeout_seconds=30)
+
+    def call(
+        self, action: str, parameters: dict[str, Any], timeout_seconds: float
+    ) -> dict[str, Any]:
+        action = self.ACTION_ALIASES.get(action, action)
+        if action not in self.ACTION_ROUTES:
+            raise ValueError(
+                f"Unknown Minecraft action {action!r}. Available actions: {', '.join(sorted(self.ACTION_ROUTES))}"
+            )
+        method, path = self.ACTION_ROUTES[action]
+        body = dict(parameters)
+        if path.startswith("/api/command/") and action not in {"stop", "sync_orientation"}:
+            body["timeoutMs"] = round(timeout_seconds * 1000)
+        return self.request(method, path, body, timeout_seconds=timeout_seconds + 5)
+
+    def stop_and_wait(self, timeout_seconds: float = 10) -> dict[str, Any]:
+        stop_result = self.call("stop", {}, timeout_seconds=5)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            state = self.state()
+            if state.get("currentCommand") is None:
+                return {"stop": stop_result, "idle": True, "state": state}
+            time.sleep(0.1)
+        state = self.state()
+        raise TimeoutError(
+            f"Mineflayer command queue did not become idle after stop: {json.dumps(state.get('currentCommand'))}"
+        )
+
+    def wait_until_idle(self, timeout_seconds: float = 10) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            state = self.state()
+            if state.get("currentCommand") is None:
+                return state
+            time.sleep(0.1)
+        state = self.state()
+        raise TimeoutError(
+            f"Mineflayer command queue remained active: {json.dumps(state.get('currentCommand'))}"
+        )
+
+
+class AgentHome:
+    MEMORY_FILES: ClassVar[dict[str, str]] = {
+        "world": "WORLD.md",
+        "places": "PLACES.md",
+        "routes": "ROUTES.md",
+        "chests": "CHESTS.md",
+        "failures": "FAILURES.md",
+        "journal": "JOURNAL.md",
+    }
+
+    def __init__(self, config: ServerConfig) -> None:
+        self.config = config
+        self.root = config.agent_home
+        self.memory_dir = self.root / "memory" / "minecraft"
+        self.drafts_dir = self.root / "drafts"
+        self.skills_dir = self.root / "skills"
+        self.lib_dir = self.root / "lib"
+        self.agent_skills_dir = self.root / "skills"
+
+    def validate(self) -> None:
+        required = [
+            self.root / "AGENTS.md",
+            self.root / ".mcp.json",
+            self.root / "lib" / "minecraft.ts",
+            self.memory_dir,
+            self.drafts_dir,
+            self.skills_dir,
+        ]
+        missing = [path for path in required if not path.exists()]
+        if missing:
+            rendered = ", ".join(str(path) for path in missing)
+            raise FileNotFoundError(
+                f"agent home was not initialized by this repository: {rendered}"
+            )
+
+    def write_character(self, observation: dict[str, Any]) -> None:
+        player = observation["player"]
+        world = observation["world"]
+        inventory = observation["inventory"]
+        surroundings = observation["surroundings"]
+        items = (
+            ", ".join(f"{item['name']} x {item['count']}" for item in inventory["items"]) or "empty"
+        )
+        nearby_blocks = (
+            "\n".join(
+                f"- {block['name']}: {block['count']} (nearest {json.dumps(block['nearest'])}, distance {block['distance']})"
+                for block in surroundings["nearbyBlocks"][:20]
+            )
+            or "- none"
+        )
+        nearby_entities = (
+            "\n".join(
+                f"- {entity['name']} ({entity['kind']}) at {json.dumps(entity['position'])}, distance {entity['distance']}"
+                for entity in surroundings["nearbyEntities"]
+            )
+            or "- none"
+        )
+        local_airspace = surroundings.get("localAirspace", {})
+        horizontal_openings = local_airspace.get(
+            "horizontalOpenings",
+            [],
+        )
+        opening_lines = "\n".join(
+            format_airspace_opening(opening) for opening in horizontal_openings
+        ) or "- unavailable"
+        text = f"""# Character: {self.config.username}
+
+Automatically refreshed by the Minecraft MCP server after observations and actions.
+
+- Captured: {observation["capturedAt"]}
+- Position: {json.dumps(player["position"], ensure_ascii=False)}
+- Block position: {json.dumps(player["blockPosition"], ensure_ascii=False)}
+- Facing: {player["facing"]} (yaw {player["yawDegrees"]}, pitch {player["pitchDegrees"]})
+- Dimension: {world["dimension"]}
+- Biome: {world["biome"]}
+- Health: {player["health"]}
+- Food: {player["food"]}
+- Oxygen: {player["oxygenLevel"]}
+- Experience level: {player["experienceLevel"]}
+- Held item: {json.dumps(inventory["heldItem"], ensure_ascii=False)}
+- Armor: {json.dumps(inventory["armor"], ensure_ascii=False)}
+- Empty inventory slots: {inventory["emptySlots"]}
+- Inventory: {items}
+
+## Nearby blocks
+
+{nearby_blocks}
+
+## Nearby entities
+
+{nearby_entities}
+
+## Local airspace
+
+- Scan radius: {local_airspace.get("scanRadius", "unavailable")}
+- Clear blocks above head: {local_airspace.get("clearanceBlocksAboveHead", "unavailable")}
+
+{opening_lines}
+"""
+        (self.memory_dir / "CHARACTER.md").write_text(text, encoding="utf-8")
+
+    def append_note(
+        self,
+        kind: Literal[
+            "world",
+            "places",
+            "routes",
+            "chests",
+            "failures",
+            "journal",
+        ],
+        markdown: str,
+    ) -> Path:
+        if not markdown.strip():
+            raise ValueError("markdown note must not be blank")
+        path = self.memory_dir / self.MEMORY_FILES[kind]
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"\n## {utc_now()}\n\n{markdown.rstrip()}\n")
+        return path
+
+
+def format_airspace_opening(opening: dict[str, Any]) -> str:
+    """Render the explicit no-boundary state emitted by the body service."""
+    boundary = opening["firstBlockedBy"]
+    prefix = f"- {opening['direction']}: {opening['openBlocks']} open block(s); "
+    if boundary is None:
+        return prefix + "no boundary inside the scan radius"
+    return prefix + f"first boundary feet={boundary['feet']}, head={boundary['head']}"
+
+
+class BodySupervisor:
+    def __init__(self, config: ServerConfig, api: BodyApi) -> None:
+        self.config = config
+        self.api = api
+        self.process: subprocess.Popen[str] | None = None
+        self.output_thread: threading.Thread | None = None
+        self.log_stream: Any = None
+
+    def start(self) -> dict[str, Any]:
+        try:
+            existing = self.api.health()
+        except requests.RequestException:
+            existing = None
+        if existing is not None:
+            raise RuntimeError(
+                f"A Minecraft body service is already responding at {self.config.body_url}"
+            )
+
+        self.config.player_log_dir.mkdir(parents=True, exist_ok=True)
+        body_log_path = self.config.player_log_dir / "body.log"
+        self.log_stream = body_log_path.open("a", encoding="utf-8", buffering=1)
+        env = os.environ.copy()
+        env.update(
+            {
+                "MINECRAFT_HOST": self.config.minecraft_host,
+                "MINECRAFT_PORT": str(self.config.minecraft_port),
+                "MINECRAFT_USERNAME": self.config.username,
+                "MINECRAFT_VIEW_DISTANCE": str(self.config.view_distance),
+                "WEB_HOST": self.config.web_host,
+                "WEB_PORT": str(self.config.web_port),
+                "VIEWER_ENABLED": "true",
+                "VIEWER_PORT": str(self.config.viewer_port),
+                "VIEWER_FIRST_PERSON": "true",
+                "VIEWER_VIEW_DISTANCE": str(self.config.view_distance),
+                "VIEWER_DEVICE_SCALE_FACTOR": str(self.config.viewer_scale),
+                "VIEWER_FOV_DEGREES": str(self.config.viewer_fov),
+                "EVIDENCE_DIR": str(self.config.player_log_dir),
+                "ACTION_LOG_ENABLED": "true",
+                "ACTION_LOG_DIR": str(self.config.player_log_dir / "body-actions"),
+                "MINECRAFT_BODY_LOG_DIR": str(self.config.player_log_dir),
+            }
+        )
+        npm = "npm.cmd" if os.name == "nt" else "npm"
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        self.process = subprocess.Popen(
+            [npm, "run", "dev"],
+            cwd=PACKAGE_DIR,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+        )
+        self.output_thread = threading.Thread(target=self._copy_output, daemon=True)
+        self.output_thread.start()
+
+        deadline = time.monotonic() + self.config.startup_timeout_seconds
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    f"Minecraft body exited with code {self.process.returncode}; inspect {body_log_path}"
+                )
+            try:
+                health = self.api.health()
+            except requests.RequestException:
+                time.sleep(0.25)
+                continue
+            if health.get("ready") is True:
+                return health
+            last_error = health["mineflayer"]["lastError"]
+            if last_error:
+                raise RuntimeError(f"Mineflayer connection failed: {last_error}")
+            time.sleep(0.25)
+        raise TimeoutError(
+            f"Minecraft body did not become ready in {self.config.startup_timeout_seconds}s; inspect {body_log_path}"
+        )
+
+    def _copy_output(self) -> None:
+        if self.process is None or self.process.stdout is None or self.log_stream is None:
+            raise RuntimeError("Body output copier started before process initialization")
+        for line in self.process.stdout:
+            self.log_stream.write(line)
+            print(f"[minecraft-body] {line.rstrip()}", file=sys.stderr)
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                self.process.terminate()
+                self.process.wait(timeout=10)
+        if self.output_thread is not None:
+            self.output_thread.join(timeout=2)
+        if self.log_stream is not None:
+            self.log_stream.close()
+
+
+class MinecraftMcpRuntime:
+    def __init__(self, config: ServerConfig, api: BodyApi, home: AgentHome) -> None:
+        self.config = config
+        self.api = api
+        self.home = home
+        self.execution_dir = config.player_log_dir / "executions"
+        self.execution_dir.mkdir(parents=True, exist_ok=True)
+        self.run_status_path = config.player_log_dir / "run-status.json"
+        self.skill_versions_path = config.player_log_dir / "skill-versions.json"
+        self.skill_versions: dict[str, str] = (
+            json.loads(self.skill_versions_path.read_text(encoding="utf-8"))
+            if self.skill_versions_path.exists()
+            else {}
+        )
+        if not self.run_status_path.exists():
+            self._write_run_status("active", "fresh_character", {})
+        self.recent_visual_frames: dict[str, float] = {}
+        self.model_state_id = 0
+        self.last_model_observation: dict[str, Any] | None = None
+        self.material_no_gain_streak = 0
+        self.material_no_gain_by_action: dict[str, int] = {}
+        self.material_relevant_items_by_action: dict[str, list[str]] = {}
+        self.visited_navigation_cells: set[tuple[int, int, int]] = set()
+        self.no_frontier_recovery_walks: set[
+            tuple[tuple[int, int, int], tuple[int, int, int]]
+        ] = set()
+        self.lock = asyncio.Lock()
+
+    def _reset_material_progress(self) -> None:
+        self.material_no_gain_streak = 0
+        self.material_no_gain_by_action.clear()
+        self.material_relevant_items_by_action.clear()
+
+    def _reset_action_progress(self, action: str) -> None:
+        self.material_no_gain_streak = 0
+        self.material_no_gain_by_action.pop(action, None)
+        self.material_relevant_items_by_action.pop(action, None)
+
+    def _material_action_blocked(self, action: str) -> bool:
+        return (
+            action in MATERIAL_ACTIONS
+            and self.material_no_gain_by_action.get(action, 0)
+            >= MATERIAL_NO_GAIN_REASSESSMENT_THRESHOLD
+        )
+
+    def _claim_no_frontier_recovery_walk(
+        self,
+        observation: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> bool:
+        navigation = (
+            observation.get("surroundings", {})
+            .get("localAirspace", {})
+            .get("navigationSummary", {})
+        )
+        if (
+            not isinstance(navigation, dict)
+            or navigation.get("frontierWaypoints") != []
+        ):
+            return False
+        player = observation.get("player")
+        target = parameters.get("target")
+        if not isinstance(player, dict) or not isinstance(target, dict):
+            return False
+        origin_cell = navigation_cell(player.get("position"))
+        target_cell = navigation_cell(target)
+        if (
+            origin_cell is None
+            or target_cell is None
+            or origin_cell == target_cell
+        ):
+            return False
+        attempt = (origin_cell, target_cell)
+        if attempt in self.no_frontier_recovery_walks:
+            return False
+        self.no_frontier_recovery_walks.add(attempt)
+        # A recovery walk is only useful if the body must actually leave the
+        # current cell.  The ordinary default tolerance can otherwise report a
+        # nearby target as reached without moving at all.
+        tolerance = parameters.get("tolerance", 1.5)
+        if isinstance(tolerance, int | float):
+            parameters["tolerance"] = min(float(tolerance), 0.25)
+        else:
+            parameters["tolerance"] = 0.25
+        return True
+
+    @staticmethod
+    def _align_observed_navigation_waypoint(
+        observation: dict[str, Any],
+        parameters: dict[str, Any],
+    ) -> bool:
+        """Translate a published standable block cell into its world center."""
+        navigation = (
+            observation.get("surroundings", {})
+            .get("localAirspace", {})
+            .get("navigationSummary", {})
+        )
+        target = parameters.get("target")
+        if not isinstance(navigation, dict) or not isinstance(target, dict):
+            return False
+        waypoints = [
+            navigation.get("highestWaypoint"),
+            navigation.get("maxClearanceWaypoint"),
+            navigation.get("furthestWaypoint"),
+        ]
+        frontiers = navigation.get("frontierWaypoints")
+        if isinstance(frontiers, list):
+            waypoints.extend(frontiers)
+        target_cell = navigation_cell(target)
+        for waypoint in waypoints:
+            if not isinstance(waypoint, dict):
+                continue
+            position = waypoint.get("position")
+            if (
+                not isinstance(position, dict)
+                or navigation_cell(position) != target_cell
+            ):
+                continue
+            try:
+                exactly_published_cell = all(
+                    float(target[axis]) == float(position[axis])
+                    for axis in ("x", "y", "z")
+                )
+            except (KeyError, TypeError, ValueError):
+                return False
+            if not exactly_published_cell:
+                continue
+            parameters["target"] = {
+                "x": float(position["x"]) + 0.5,
+                "y": float(position["y"]),
+                "z": float(position["z"]) + 0.5,
+            }
+            tolerance = parameters.get("tolerance", 1.5)
+            if isinstance(tolerance, int | float):
+                parameters["tolerance"] = min(float(tolerance), 0.25)
+            else:
+                parameters["tolerance"] = 0.25
+            return True
+        return False
+
+    def _progress_signal(
+        self,
+        action: str,
+        delta: dict[str, Any],
+        *,
+        progress_observed: bool | None = None,
+        relevant_inventory_items: set[str] | None = None,
+    ) -> dict[str, Any] | None:
+        if action not in MATERIAL_ACTIONS:
+            walked_to_new_material_context = (
+                action == "walk_to"
+                and position_distance(
+                    delta["positionBefore"],
+                    delta["positionAfter"],
+                )
+                >= 3
+            )
+            if walked_to_new_material_context:
+                self._reset_material_progress()
+            return None
+
+        inventory_changes = delta["inventoryChanges"]
+        relevant_items = sorted(relevant_inventory_items or set())
+        if progress_observed is None:
+            if action == "pillar_up":
+                progress_observed = (
+                    float(delta["positionAfter"]["y"])
+                    >= float(delta["positionBefore"]["y"]) + 0.99
+                    or any(change < 0 for change in inventory_changes.values())
+                )
+            elif action in {"fine_control", "walk_to"}:
+                before_cell = navigation_cell(delta["positionBefore"])
+                after_cell = navigation_cell(delta["positionAfter"])
+                if before_cell is not None:
+                    self.visited_navigation_cells.add(before_cell)
+                moved = position_distance(
+                    delta["positionBefore"],
+                    delta["positionAfter"],
+                ) >= 1
+                progress_observed = (
+                    moved
+                    and after_cell is not None
+                    and after_cell not in self.visited_navigation_cells
+                )
+                if moved and after_cell is not None:
+                    self.visited_navigation_cells.add(after_cell)
+            elif action == "place_block":
+                progress_observed = any(
+                    change < 0 for change in inventory_changes.values()
+                )
+            else:
+                progress_observed = any(
+                    change > 0 for change in inventory_changes.values()
+                )
+        if progress_observed:
+            if action == "find_block":
+                self._reset_action_progress(action)
+            else:
+                self._reset_material_progress()
+            return MaterialProgressSignal(
+                kind=(
+                    "material_inventory_changed"
+                    if inventory_changes
+                    else "relevant_state_changed"
+                ),
+                action=action,
+                consecutive_no_gain_count=0,
+                same_action_no_gain_count=0,
+                inventory_changes=inventory_changes,
+                relevant_inventory_items=relevant_items,
+                requires_reassessment=False,
+            ).model_dump(mode="json", by_alias=True)
+
+        self.material_no_gain_streak += 1
+        same_action_count = (
+            self.material_no_gain_by_action.get(action, 0) + 1
+        )
+        self.material_no_gain_by_action[action] = same_action_count
+        self.material_relevant_items_by_action[action] = relevant_items
+        return MaterialProgressSignal(
+            kind="material_no_gain",
+            action=action,
+            consecutive_no_gain_count=self.material_no_gain_streak,
+            same_action_no_gain_count=same_action_count,
+            inventory_changes=inventory_changes,
+            relevant_inventory_items=relevant_items,
+            requires_reassessment=(
+                same_action_count
+                >= MATERIAL_NO_GAIN_REASSESSMENT_THRESHOLD
+            ),
+        ).model_dump(mode="json", by_alias=True)
+
+    def _blocked_progress_signal(self, action: str) -> dict[str, Any]:
+        return MaterialProgressSignal(
+            kind="material_action_blocked",
+            action=action,
+            consecutive_no_gain_count=self.material_no_gain_streak,
+            same_action_no_gain_count=self.material_no_gain_by_action[
+                action
+            ],
+            inventory_changes={},
+            relevant_inventory_items=(
+                self.material_relevant_items_by_action.get(action, [])
+            ),
+            requires_reassessment=True,
+        ).model_dump(mode="json", by_alias=True)
+
+    def run_status(self) -> dict[str, Any]:
+        return json.loads(self.run_status_path.read_text(encoding="utf-8"))
+
+    def _write_run_status(self, status: str, reason: str, details: dict[str, Any]) -> None:
+        document = {
+            "username": self.config.username,
+            "status": status,
+            "reason": reason,
+            "details": details,
+            "updatedAt": utc_now(),
+            "survivalOnly": True,
+        }
+        self.run_status_path.write_text(
+            json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+    def retire_character(self, reason: str, details: dict[str, Any]) -> None:
+        current = self.run_status()
+        if current["status"] == "active":
+            self._write_run_status("retired", reason, details)
+
+    @staticmethod
+    def _skill_digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def register_skill_version(self, skill_path: Path) -> None:
+        key = str(skill_path)
+        digest = self._skill_digest(skill_path)
+        self.skill_versions[key] = digest
+        self.skill_versions_path.write_text(
+            json.dumps(self.skill_versions, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def assert_character_active(self) -> None:
+        status = self.run_status()
+        if status["status"] != "active":
+            raise RuntimeError(
+                f"Minecraft character {self.config.username} is retired ({status['reason']}). "
+                "Preserve its logs and restart with the next fresh username."
+            )
+
+    def inspect_survival_provenance(self, observation: dict[str, Any]) -> None:
+        game_mode = observation.get("player", {}).get("gameMode")
+        if game_mode is not None and game_mode != "survival":
+            self.retire_character(
+                "non_survival_game_mode",
+                {"observedGameMode": game_mode, "capturedAt": observation.get("capturedAt")},
+            )
+
+    def _snapshot_sync(self, include_image: bool | None = None) -> dict[str, Any]:
+        observation = self.api.observe()
+        self.inspect_survival_provenance(observation)
+        self.home.write_character(observation)
+        should_capture = self.config.capture_images and (
+            True if include_image is None else include_image
+        )
+        frame = self.api.capture_frame() if should_capture else None
+        frame_id = frame_identifier(frame)
+        if frame_id is not None:
+            self.recent_visual_frames[frame_id] = time.monotonic()
+            self.recent_visual_frames = {
+                key: captured
+                for key, captured in self.recent_visual_frames.items()
+                if time.monotonic() - captured <= 60
+            }
+        state_id = f"mcstate-{uuid4().hex[:12]}"
+        captured = str(observation.get("capturedAt", utc_now()))
+        timestamp = re.sub(r"[^0-9A-Za-z_-]", "-", captured)
+        state_record = {
+            "schema": "cog.minecraft-state.v1",
+            "state_id": state_id,
+            "captured_at": captured,
+            "username": self.config.username,
+            "observation": observation,
+            "screenshot": relative_workspace_paths(
+                screenshot_reference(frame),
+                self.home.root,
+            ),
+        }
+        state_path = self.config.player_log_dir / "state" / f"{timestamp}-{state_id}.yaml"
+        write_readable_yaml(state_path, state_record)
+        write_readable_yaml(
+            self.config.player_log_dir / "current_state.yaml",
+            state_record,
+        )
+        return {
+            "observation": observation,
+            "frame": frame,
+            "stateId": state_id,
+            "stateRef": state_path.relative_to(self.home.root).as_posix(),
+        }
+
+    async def snapshot(self, include_image: bool | None = None) -> dict[str, Any]:
+        return await asyncio.to_thread(self._snapshot_sync, include_image)
+
+    def model_state_update(
+        self, observation: dict[str, Any], force_full: bool = False
+    ) -> dict[str, Any]:
+        base_state_id = self.model_state_id or None
+        self.model_state_id += 1
+        if self.last_model_observation is None or force_full:
+            update = {
+                "mode": "full",
+                "stateId": self.model_state_id,
+                "baseStateId": base_state_id,
+                "state": compact_observation(observation),
+            }
+        else:
+            update = {
+                "mode": "delta",
+                "stateId": self.model_state_id,
+                "baseStateId": base_state_id,
+                "delta": model_state_delta(self.last_model_observation, observation),
+            }
+        self.last_model_observation = observation
+        return update
+
+    def tool_result(
+        self, envelope: dict[str, Any], summary: str, force_full: bool = False
+    ) -> ToolResult:
+        structured = public_envelope(envelope)
+        observation = envelope.get("observation") or envelope.get("stateAfter")
+        if isinstance(observation, dict):
+            structured["stateUpdate"] = self.model_state_update(observation, force_full)
+        content: list[Any] = [
+            TextContent(
+                type="text", text=summary + "\n\n" + json.dumps(structured, ensure_ascii=False)
+            )
+        ]
+        frame = envelope.get("frameAfter") or envelope.get("frame")
+        if isinstance(frame, dict) and isinstance(frame.get("pngBase64"), str):
+            content.append(
+                ImageContent(type="image", data=frame["pngBase64"], mimeType="image/png")
+            )
+        return ToolResult(content=content, structured_content=structured)
+
+    async def observe_tool(
+        self, include_image: bool = False, full_state: bool = False
+    ) -> ToolResult:
+        async with self.lock:
+            snapshot = await self.snapshot(include_image)
+            snapshot["runStatus"] = self.run_status()
+        return self.tool_result(snapshot, "Fresh Minecraft state captured.", full_state)
+
+    def _blocked_action_tool_result(
+        self,
+        action: str,
+        parameters: dict[str, Any],
+        timeout_seconds: float,
+        snapshot: dict[str, Any],
+        *,
+        progress_action: str | None = None,
+        target_assessment: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        action_id = f"mcaction-{uuid4().hex[:12]}"
+        observation = snapshot["observation"]
+        progress_signal = self._blocked_progress_signal(
+            progress_action or action
+        )
+        result = {
+            "ok": False,
+            "status": "strategy_reassessment_required",
+            "reason": "repeated_material_no_gain",
+            "message": (
+                f"{action} was not executed because its last "
+                f"{progress_signal['sameActionNoGainCount']} attempts "
+                "produced no task-relevant state gain."
+            ),
+        }
+        if target_assessment is not None:
+            result["data"] = {"targetAssessment": target_assessment}
+        envelope = {
+            "actionId": action_id,
+            "ok": False,
+            "status": "strategy_reassessment_required",
+            "action": action,
+            "durationMs": 0,
+            "result": result,
+            "stateBefore": observation,
+            "stateAfter": observation,
+            "stateDelta": state_delta(observation, observation),
+            "progressSignal": progress_signal,
+            "frameAfter": snapshot["frame"],
+            "runStatus": self.run_status(),
+        }
+        self._write_action_log(
+            envelope,
+            {
+                "schema": "cog.minecraft-action-request.v1",
+                "action_id": action_id,
+                "action": action,
+                "parameters": parameters,
+                "timeout_seconds": timeout_seconds,
+                "requested_at": utc_now(),
+                "state_before_ref": snapshot.get("stateRef"),
+            },
+        )
+        assessment_summary = ""
+        if target_assessment is not None:
+            held_item = target_assessment.get("heldItem")
+            held_name = (
+                held_item.get("name")
+                if isinstance(held_item, dict)
+                else None
+            )
+            eligibility = target_assessment.get(
+                "canHarvestWithHeldItem"
+            )
+            if eligibility is False:
+                assessment_summary = (
+                    " Current target assessment: "
+                    f"{held_name or 'empty hand'} cannot harvest drops from "
+                    f"{target_assessment.get('blockName', 'this block')}."
+                )
+        return self.tool_result(
+            envelope,
+            (
+                "STRATEGY REASSESSMENT REQUIRED: "
+                f"{result['message']}{assessment_summary} "
+                "Establish a changed prerequisite or "
+                "task-relevant state before retrying this action."
+            ),
+        )
+
+    async def _mine_target_assessment(
+        self,
+        parameters: dict[str, Any],
+        timeout_seconds: float,
+    ) -> dict[str, Any] | None:
+        block = parameters.get("block")
+        if not isinstance(block, dict):
+            return None
+        try:
+            inspected = await asyncio.to_thread(
+                self.api.call,
+                "inspect",
+                {"block": block},
+                min(timeout_seconds, 10),
+            )
+        except (requests.RequestException, TimeoutError):
+            return None
+        data = inspected.get("data")
+        return data if inspected.get("ok") is True and isinstance(data, dict) else None
+
+    async def call_tool(
+        self,
+        action: str,
+        parameters: dict[str, Any],
+        timeout_seconds: float,
+        include_image: bool = False,
+    ) -> ToolResult:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        async with self.lock:
+            self.assert_character_active()
+            progress_action = material_action_key(action, parameters)
+            preloaded_before: dict[str, Any] | None = None
+            if self._material_action_blocked(progress_action):
+                target_assessment = (
+                    await self._mine_target_assessment(
+                        parameters,
+                        timeout_seconds,
+                    )
+                    if action == "mine_block"
+                    else None
+                )
+                if (
+                    target_assessment is not None
+                    and target_assessment.get(
+                        "canHarvestWithHeldItem"
+                    )
+                    is True
+                ):
+                    self._reset_material_progress()
+                else:
+                    snapshot = await self.snapshot(include_image)
+                    if (
+                        progress_action == "walk_to"
+                        and self._claim_no_frontier_recovery_walk(
+                            snapshot["observation"],
+                            parameters,
+                        )
+                    ):
+                        self._reset_action_progress(progress_action)
+                        preloaded_before = snapshot
+                    else:
+                        return self._blocked_action_tool_result(
+                            action,
+                            parameters,
+                            timeout_seconds,
+                            snapshot,
+                            progress_action=progress_action,
+                            target_assessment=target_assessment,
+                        )
+            if action == "fine_control":
+                frame_id = parameters.pop("visualCheckFrameId", None)
+                if not isinstance(frame_id, str) or frame_id not in self.recent_visual_frames:
+                    raise ValueError(
+                        "fine_control requires visualCheckFrameId from a fresh minecraft_observe(include_image=true) call"
+                    )
+            before = preloaded_before or await self.snapshot(False)
+            if action == "walk_to":
+                self._align_observed_navigation_waypoint(
+                    before["observation"],
+                    parameters,
+                )
+            self.assert_character_active()
+            started = time.monotonic()
+            try:
+                result = await asyncio.to_thread(
+                    self.api.call,
+                    action,
+                    parameters,
+                    timeout_seconds,
+                )
+                await asyncio.to_thread(self.api.wait_until_idle, 10)
+            except (requests.RequestException, TimeoutError) as error:
+                try:
+                    cleanup: dict[str, Any] = await asyncio.to_thread(
+                        self.api.stop_and_wait,
+                        10,
+                    )
+                except (requests.RequestException, TimeoutError) as cleanup_error:
+                    cleanup = {
+                        "idle": False,
+                        "errorType": type(cleanup_error).__name__,
+                        "error": str(cleanup_error),
+                    }
+                result = {
+                    "ok": False,
+                    "status": "boundary_failed",
+                    "reason": "body_boundary_error",
+                    "message": f"{type(error).__name__}: {error}",
+                    "data": {
+                        "action": action,
+                        "cleanup": cleanup,
+                    },
+                }
+            after = await self.snapshot(include_image)
+            delta = state_delta(before["observation"], after["observation"])
+            progress_signal = (
+                self._progress_signal(
+                    progress_action,
+                    delta,
+                    progress_observed=(
+                        bool(result.get("ok"))
+                        if action == "find_block"
+                        else None
+                    ),
+                )
+                if (
+                    action == "find_block"
+                    or material_action_reached_world(result, delta)
+                )
+                else None
+            )
+        action_id = f"mcaction-{uuid4().hex[:12]}"
+        envelope = {
+            "actionId": action_id,
+            "ok": bool(result["ok"]),
+            "status": result["status"]
+            if "status" in result
+            else "succeeded"
+            if result["ok"]
+            else "failed",
+            "action": action,
+            "durationMs": round((time.monotonic() - started) * 1000),
+            "result": result,
+            "stateBefore": before["observation"],
+            "stateAfter": after["observation"],
+            "stateDelta": delta,
+            "progressSignal": progress_signal,
+            "frameAfter": after["frame"],
+            "runStatus": self.run_status(),
+        }
+        self._write_action_log(
+            envelope,
+            {
+                "schema": "cog.minecraft-action-request.v1",
+                "action_id": action_id,
+                "action": action,
+                "parameters": parameters,
+                "timeout_seconds": timeout_seconds,
+                "requested_at": utc_now(),
+                "state_before_ref": before.get("stateRef"),
+            },
+        )
+        summary = f"{action}: {result.get('message', envelope['status'])}."
+        if (
+            progress_action in MATERIAL_ACTIONS
+            and progress_signal is not None
+        ):
+            inventory_changes = envelope["stateDelta"]["inventoryChanges"]
+            if inventory_changes:
+                summary += (
+                    " Verified inventory delta: "
+                    + json.dumps(
+                        inventory_changes,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "."
+                )
+            else:
+                summary += " Verified inventory delta: unchanged."
+            result_data = result.get("data")
+            if (
+                action == "mine_block"
+                and isinstance(result_data, dict)
+                and result_data.get("canHarvest") is False
+            ):
+                held_before = result_data.get("heldItemBefore")
+                held_name = (
+                    held_before.get("name")
+                    if isinstance(held_before, dict)
+                    else None
+                )
+                summary += (
+                    " Harvest eligibility: "
+                    f"{held_name or 'empty hand'} cannot harvest drops from "
+                    f"{result_data.get('blockName', 'this block')}."
+                )
+        if (
+            progress_signal is not None
+            and progress_signal["requiresReassessment"]
+        ):
+            summary = (
+                "PROGRESS STALLED: repeated actions produced no "
+                "task-relevant state gain. Reassess unmet dependencies and "
+                "choose a "
+                "materially different strategy before another state-changing "
+                f"action. Consecutive no-gain count: "
+                f"{progress_signal['consecutiveNoGainCount']}. "
+                + summary
+            )
+        return self.tool_result(envelope, summary)
+
+    def _write_action_log(
+        self,
+        envelope: dict[str, Any],
+        request: dict[str, Any],
+    ) -> None:
+        action_dir = self.config.player_log_dir / "actions" / str(envelope["actionId"])
+        action_dir.mkdir(parents=True, exist_ok=False)
+        write_readable_yaml(
+            action_dir / "request.yaml",
+            relative_workspace_paths(request, self.home.root),
+        )
+        write_readable_yaml(
+            action_dir / "result.yaml",
+            relative_workspace_paths(
+                {
+                    "schema": "cog.minecraft-action-result.v1",
+                    **envelope,
+                },
+                self.home.root,
+            ),
+        )
+
+    async def suicide_avatar(
+        self,
+        reason: str,
+        timeout_seconds: float = 30,
+    ) -> ToolResult:
+        if not reason.strip():
+            raise ValueError("suicide reason must not be blank")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        execution_id = f"suicide-{uuid4().hex[:12]}"
+        run_dir = self.execution_dir / execution_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        write_readable_yaml(
+            run_dir / "input.yaml",
+            {
+                "schema": "cog.minecraft-suicide-input.v1",
+                "execution_id": execution_id,
+                "username": self.config.username,
+                "reason": reason.strip(),
+                "requested_at": utc_now(),
+                "timeout_seconds": timeout_seconds,
+            },
+        )
+        async with self.lock:
+            self.assert_character_active()
+            before = await self.snapshot(True)
+            health_before = await asyncio.to_thread(self.api.health)
+            mineflayer_before = health_before.get("mineflayer", {})
+            death_before = int(mineflayer_before.get("deathCount", 0))
+            spawn_before = int(mineflayer_before.get("spawnCount", 0))
+            command = await asyncio.to_thread(
+                self.api.call,
+                "chat",
+                {"text": "/kill"},
+                5,
+            )
+            deadline = time.monotonic() + timeout_seconds
+            death_observed = False
+            respawn_observed = False
+            final_health = health_before
+            while time.monotonic() < deadline:
+                final_health = await asyncio.to_thread(self.api.health)
+                status = final_health.get("mineflayer", {})
+                death_observed = int(status.get("deathCount", 0)) > death_before
+                respawn_observed = (
+                    death_observed
+                    and int(status.get("spawnCount", 0)) > spawn_before
+                    and status.get("spawned") is True
+                )
+                if respawn_observed:
+                    break
+                await asyncio.sleep(0.1)
+            after = await self.snapshot(True) if respawn_observed else None
+
+        final_status = final_health.get("mineflayer", {})
+        same_username = final_status.get("username") == self.config.username
+        ok = death_observed and respawn_observed and same_username
+        envelope = {
+            "schema": "cog.minecraft-suicide-result.v1",
+            "ok": ok,
+            "status": "succeeded" if ok else "failed",
+            "executionId": execution_id,
+            "reason": reason.strip(),
+            "actualEffect": ok,
+            "deathObserved": death_observed,
+            "respawnObserved": respawn_observed,
+            "sameUsername": same_username,
+            "username": final_status.get("username"),
+            "deathCountBefore": death_before,
+            "deathCountAfter": final_status.get("deathCount"),
+            "spawnCountBefore": spawn_before,
+            "spawnCountAfter": final_status.get("spawnCount"),
+            "lastDeathAt": final_status.get("lastDeathAt"),
+            "lastSpawnAt": final_status.get("lastSpawnAt"),
+            "command": command,
+            "stateBefore": before["observation"],
+            "stateBeforeRef": before.get("stateRef"),
+            "screenshotBefore": screenshot_reference(before.get("frame")),
+            "frameBefore": before.get("frame"),
+            "stateAfter": after["observation"] if after else None,
+            "stateAfterRef": after.get("stateRef") if after else None,
+            "screenshotAfter": (
+                screenshot_reference(after.get("frame")) if after else None
+            ),
+            "frameAfter": after.get("frame") if after else None,
+            "finishedAt": utc_now(),
+        }
+        write_readable_yaml(
+            run_dir / "result.yaml",
+            relative_workspace_paths(envelope, self.home.root),
+        )
+        if ok:
+            self.model_state_id = 0
+            self.last_model_observation = None
+        summary = (
+            "Genuine Minecraft death and respawn observed."
+            if ok
+            else "Minecraft death or respawn was not observed; suicide failed."
+        )
+        return self.tool_result(envelope, summary, force_full=ok)
+
+    async def execute_typescript(
+        self,
+        path: str,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        heartbeat_seconds: float,
+        ctx: Context,
+        postcondition: dict[str, Any],
+        include_image: bool = False,
+    ) -> ToolResult:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if timeout_seconds > MAX_TYPESCRIPT_TIMEOUT_SECONDS:
+            raise ValueError(
+                "timeout_seconds must be at most "
+                f"{MAX_TYPESCRIPT_TIMEOUT_SECONDS:g} so a skill cannot "
+                "outlive its MCP caller"
+            )
+        if heartbeat_seconds <= 0:
+            raise ValueError("heartbeat_seconds must be positive")
+        skill_path = Path(path).expanduser()
+        if not skill_path.is_absolute():
+            skill_path = self.home.root / skill_path
+        skill_path = skill_path.resolve()
+        if not skill_path.is_file():
+            raise FileNotFoundError(skill_path)
+        if skill_path.suffix.lower() not in {".ts", ".mts", ".cts"}:
+            raise ValueError(f"TypeScript skill must end in .ts, .mts, or .cts: {skill_path}")
+        allowed_roots = (
+            self.home.drafts_dir.resolve(),
+            self.home.skills_dir.resolve(),
+        )
+        workspace_owned = False
+        for root in allowed_roots:
+            try:
+                skill_path.relative_to(root)
+                workspace_owned = True
+                break
+            except ValueError:
+                continue
+        if not workspace_owned and skill_path != COLLECT_BLOCKS_PRIMITIVE.resolve():
+            raise ValueError(
+                "TypeScript execution is limited to this instance's drafts and skills directories"
+            )
+        character_count = len(skill_path.read_text(encoding="utf-8"))
+        if character_count > self.config.max_skill_characters:
+            raise ValueError(
+                f"Skill is too complex: {character_count} characters exceeds the "
+                f"{self.config.max_skill_characters}-character limit. Split it into small reusable skills."
+            )
+
+        async with self.lock:
+            self.assert_character_active()
+            if self._material_action_blocked("execute_typescript"):
+                snapshot = await self.snapshot(include_image)
+                if unsatisfied_inventory_postcondition_items(
+                    postcondition,
+                    snapshot["observation"],
+                ):
+                    return self._blocked_action_tool_result(
+                        "execute_typescript",
+                        {
+                            "path": str(skill_path),
+                            "arguments": arguments,
+                            "postcondition": postcondition,
+                        },
+                        timeout_seconds,
+                        snapshot,
+                    )
+            self.register_skill_version(skill_path)
+            return await self._execute_typescript_locked(
+                skill_path,
+                arguments,
+                timeout_seconds,
+                heartbeat_seconds,
+                ctx,
+                postcondition,
+                include_image,
+            )
+
+    async def _execute_typescript_locked(
+        self,
+        skill_path: Path,
+        arguments: dict[str, Any],
+        timeout_seconds: float,
+        heartbeat_seconds: float,
+        ctx: Context,
+        postcondition: dict[str, Any],
+        include_image: bool,
+    ) -> ToolResult:
+        execution_id = f"exec-{uuid4().hex[:12]}"
+        run_dir = self.execution_dir / execution_id
+        run_dir.mkdir(parents=True)
+        input_path = run_dir / "runner-input.json"
+        result_path = run_dir / "runner-result.json"
+        input_path.write_text(json.dumps(arguments, ensure_ascii=False), encoding="utf-8")
+        before = await self.snapshot(False)
+        write_readable_yaml(
+            run_dir / "input.yaml",
+            relative_workspace_paths(
+                {
+                    "schema": "cog.minecraft-typescript-input.v1",
+                    "execution_id": execution_id,
+                    "skill_path": str(skill_path),
+                    "skill_sha256": self._skill_digest(skill_path),
+                    "arguments": arguments,
+                    "postcondition": postcondition,
+                    "timeout_seconds": timeout_seconds,
+                    "state_before_ref": before.get("stateRef"),
+                },
+                self.home.root,
+            ),
+        )
+        command = typescript_runner_command(
+            skill_path,
+            input_path,
+            result_path,
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "MINECRAFT_BODY_URL": self.config.body_url,
+                "MINECRAFT_AGENT_HOME": str(self.home.root),
+                "MINECRAFT_USERNAME": self.config.username,
+                "MINECRAFT_EXECUTION_ID": execution_id,
+            }
+        )
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=self.home.root,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        stdout_task = asyncio.create_task(process.stdout.read())
+        stderr_task = asyncio.create_task(process.stderr.read())
+        started = time.monotonic()
+        heartbeats: list[dict[str, Any]] = []
+        timed_out = False
+
+        try:
+            while process.returncode is None:
+                elapsed = time.monotonic() - started
+                remaining = timeout_seconds - elapsed
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=min(heartbeat_seconds, remaining)
+                    )
+                except TimeoutError:
+                    observation = await asyncio.to_thread(self.api.observe)
+                    heartbeat = heartbeat_from_observation(
+                        elapsed=time.monotonic() - started, observation=observation
+                    )
+                    heartbeats.append(heartbeat)
+                    write_readable_yaml(
+                        run_dir / "heartbeats.yaml",
+                        {"heartbeats": heartbeats},
+                    )
+                    try:
+                        await ctx.report_progress(
+                            progress=min(time.monotonic() - started, timeout_seconds),
+                            total=timeout_seconds,
+                            message=heartbeat["message"],
+                        )
+                    except Exception as error:
+                        heartbeat["progressDeliveryError"] = f"{type(error).__name__}: {error}"
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                while current_task.cancelling():
+                    current_task.uncancel()
+            cleanup = await self._terminate_execution(process)
+            stdout_bytes, stderr_bytes = await asyncio.gather(
+                stdout_task,
+                stderr_task,
+            )
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            (run_dir / "stdout.log").write_text(stdout, encoding="utf-8")
+            (run_dir / "stderr.log").write_text(stderr, encoding="utf-8")
+            runner_result = (
+                json.loads(result_path.read_text(encoding="utf-8"))
+                if result_path.exists()
+                else None
+            )
+            after = await asyncio.shield(self.snapshot(False))
+            envelope = {
+                "ok": False,
+                "status": "client_cancelled",
+                "executionId": execution_id,
+                "skillPath": str(skill_path),
+                "arguments": arguments,
+                "timeoutSeconds": timeout_seconds,
+                "durationMs": round((time.monotonic() - started) * 1000),
+                "processExitCode": process.returncode,
+                "runnerResult": runner_result,
+                "stdout": stdout,
+                "stderr": stderr,
+                "heartbeats": heartbeats,
+                "cleanup": cleanup,
+                "stateBefore": before["observation"],
+                "stateAfter": after["observation"],
+                "stateDelta": state_delta(before["observation"], after["observation"]),
+                "frameAfter": None,
+                "logDirectory": str(run_dir),
+                "runStatus": self.run_status(),
+            }
+            write_readable_yaml(
+                run_dir / "result.yaml",
+                relative_workspace_paths(envelope, self.home.root),
+            )
+            write_readable_yaml(
+                run_dir / "heartbeats.yaml",
+                {"heartbeats": heartbeats},
+            )
+            raise
+
+        cleanup: dict[str, Any]
+        if timed_out:
+            cleanup = await self._terminate_execution(process)
+        else:
+            await process.wait()
+            state = await asyncio.to_thread(self.api.state)
+            cleanup = {
+                "processTerminated": True,
+                "mineflayerIdle": state.get("currentCommand") is None,
+            }
+            if state.get("currentCommand") is not None:
+                cleanup["mineflayer"] = await asyncio.to_thread(self.api.stop_and_wait, 10)
+                cleanup["mineflayerIdle"] = True
+
+        stdout = (await stdout_task).decode("utf-8", errors="replace")
+        stderr = (await stderr_task).decode("utf-8", errors="replace")
+        (run_dir / "stdout.log").write_text(stdout, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(stderr, encoding="utf-8")
+        runner_result = (
+            json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
+        )
+        after = await self.snapshot(include_image)
+        delta = state_delta(
+            before["observation"],
+            after["observation"],
+        )
+        relevant_inventory_items = (
+            unsatisfied_inventory_postcondition_items(
+                postcondition,
+                before["observation"],
+            )
+        )
+        progress_signal = None
+        if relevant_inventory_items:
+            progress_signal = self._progress_signal(
+                "execute_typescript",
+                delta,
+                progress_observed=any(
+                    delta["inventoryChanges"].get(item, 0) > 0
+                    for item in relevant_inventory_items
+                ),
+                relevant_inventory_items=relevant_inventory_items,
+            )
+        duration_ms = round((time.monotonic() - started) * 1000)
+        process_ok = (
+            not timed_out
+            and process.returncode == 0
+            and isinstance(runner_result, dict)
+            and runner_result.get("ok") is True
+        )
+        verification = evaluate_postcondition(
+            postcondition, before["observation"], after["observation"]
+        )
+        ok = process_ok and verification["ok"]
+        status = (
+            "timed_out"
+            if timed_out
+            else "postcondition_failed"
+            if process_ok and not verification["ok"]
+            else "succeeded"
+            if ok
+            else "failed"
+        )
+        envelope = {
+            "ok": ok,
+            "status": status,
+            "executionId": execution_id,
+            "skillPath": str(skill_path),
+            "arguments": arguments,
+            "timeoutSeconds": timeout_seconds,
+            "durationMs": duration_ms,
+            "processExitCode": process.returncode,
+            "runnerResult": runner_result,
+            "postcondition": postcondition,
+            "verification": verification,
+            "stdout": stdout,
+            "stderr": stderr,
+            "heartbeats": heartbeats,
+            "cleanup": cleanup,
+            "stateBefore": before["observation"],
+            "stateAfter": after["observation"],
+            "stateDelta": delta,
+            "progressSignal": progress_signal,
+            "frameAfter": after["frame"],
+            "logDirectory": str(run_dir),
+            "runStatus": self.run_status(),
+        }
+        write_readable_yaml(
+            run_dir / "result.yaml",
+            relative_workspace_paths(envelope, self.home.root),
+        )
+        write_readable_yaml(
+            run_dir / "heartbeats.yaml",
+            {"heartbeats": heartbeats},
+        )
+        if timed_out:
+            summary = f"{skill_path.name} timed out after {timeout_seconds}s and was terminated."
+        elif ok:
+            summary = f"{skill_path.name} succeeded in {duration_ms}ms."
+        elif process_ok:
+            summary = f"{skill_path.name} exited normally but failed its postcondition: {json.dumps(verification, ensure_ascii=False)}."
+        else:
+            stack = (
+                runner_result.get("error", {}).get("stack")
+                if isinstance(runner_result, dict)
+                else stderr
+            )
+            summary = f"{skill_path.name} failed with exit code {process.returncode}.\n{stack}"
+        if progress_signal is not None:
+            inventory_changes = delta["inventoryChanges"]
+            if inventory_changes:
+                summary += (
+                    " Verified inventory delta: "
+                    + json.dumps(
+                        inventory_changes,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "."
+                )
+            else:
+                summary += " Verified inventory delta: unchanged."
+            if (
+                progress_signal["kind"] == "material_no_gain"
+                and progress_signal["relevantInventoryItems"]
+            ):
+                summary += (
+                    " Relevant inventory gain for "
+                    + json.dumps(
+                        progress_signal["relevantInventoryItems"],
+                        ensure_ascii=False,
+                    )
+                    + ": none."
+                )
+            if progress_signal["requiresReassessment"]:
+                summary = (
+                    "PROGRESS STALLED: repeated material operations produced "
+                    "no inventory gain. Reassess unmet dependencies and choose "
+                    "a materially different strategy before another material "
+                    f"operation. Consecutive no-gain count: "
+                    f"{progress_signal['consecutiveNoGainCount']}. "
+                    + summary
+                )
+        return self.tool_result(envelope, summary)
+
+    async def _terminate_execution(self, process: asyncio.subprocess.Process) -> dict[str, Any]:
+        if process.returncode is None:
+            if os.name == "nt":
+                completed = await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "taskkill",
+                        "/PID",
+                        str(process.pid),
+                        "/T",
+                        "/F",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if completed.returncode != 0 and process.returncode is None:
+                    process.kill()
+            else:
+                process.kill()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10)
+        except TimeoutError:
+            if os.name != "nt":
+                raise
+            await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            await asyncio.wait_for(process.wait(), timeout=10)
+        stop_result = await asyncio.to_thread(
+            self.api.stop_and_wait,
+            10,
+        )
+        await asyncio.sleep(1)
+        late_state = await asyncio.to_thread(self.api.state)
+        late_stop = None
+        if late_state.get("currentCommand") is not None:
+            late_stop = await asyncio.to_thread(
+                self.api.stop_and_wait,
+                10,
+            )
+        return {
+            "processTerminated": True,
+            "mineflayerIdle": True,
+            "mineflayer": stop_result,
+            "lateMineflayer": late_stop,
+        }
+
+
+def without_image_bytes(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: without_image_bytes(item) for key, item in value.items() if key != "pngBase64"}
+    if isinstance(value, list):
+        return [without_image_bytes(item) for item in value]
+    return value
+
+
+def frame_identifier(frame: Any) -> str | None:
+    if not isinstance(frame, dict):
+        return None
+    if isinstance(frame.get("frameId"), str):
+        return frame["frameId"]
+    metadata = frame.get("metadata")
+    return (
+        metadata.get("frameId")
+        if isinstance(metadata, dict) and isinstance(metadata.get("frameId"), str)
+        else None
+    )
+
+
+def screenshot_reference(frame: Any) -> dict[str, Any] | None:
+    if not isinstance(frame, dict):
+        return None
+    metadata = frame.get("metadata") if isinstance(frame.get("metadata"), dict) else frame
+    return without_image_bytes(
+        {
+            key: metadata.get(key)
+            for key in (
+                "frameId",
+                "capturedAt",
+                "pngPath",
+                "metadataPath",
+                "width",
+                "height",
+                "projection",
+                "quality",
+            )
+            if metadata.get(key) is not None
+        }
+    )
+
+
+def compact_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    player = observation["player"]
+    world = observation["world"]
+    inventory = observation["inventory"]
+    surroundings = observation["surroundings"]
+    return {
+        "capturedAt": observation["capturedAt"],
+        "chat": {"unreadMessages": observation.get("chat", {}).get("messages", [])},
+        "player": {
+            key: player.get(key)
+            for key in (
+                "username",
+                "position",
+                "blockPosition",
+                "yawDegrees",
+                "pitchDegrees",
+                "facing",
+                "health",
+                "food",
+                "oxygenLevel",
+                "experienceLevel",
+                "gameMode",
+            )
+            if key in player
+        },
+        "world": {
+            key: world.get(key)
+            for key in (
+                "dimension",
+                "minecraftVersion",
+                "difficulty",
+                "biome",
+                "timeOfDay",
+                "isDay",
+                "isRaining",
+            )
+            if key in world
+        },
+        "inventory": {
+            "heldItem": inventory.get("heldItem"),
+            "armor": inventory.get("armor"),
+            "emptySlots": inventory.get("emptySlots"),
+            "items": item_counts(observation),
+        },
+        "blocksAtPlayer": {
+            key: surroundings.get(key) for key in ("blockAtFeet", "blockBelowFeet", "blockAtHead")
+        },
+        "nearbyBlocks": [
+            {
+                key: block.get(key)
+                for key in (
+                    "name",
+                    "count",
+                    "nearest",
+                    "distance",
+                    "canHarvestWithHeldItem",
+                    "harvestToolOptions",
+                )
+            }
+            for block in surroundings.get("nearbyBlocks", [])[:12]
+        ],
+        "localAirspace": surroundings.get(
+            "localAirspace",
+            {
+                "scanRadius": 0,
+                "clearanceBlocksAboveHead": 0,
+                "horizontalOpenings": [],
+            },
+        ),
+        "nearbyEntities": [
+            {key: entity.get(key) for key in ("name", "kind", "position", "distance")}
+            for entity in surroundings.get("nearbyEntities", [])[:8]
+        ],
+    }
+
+
+def model_state_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_compact = compact_observation(before)
+    after_compact = compact_observation(after)
+    delta: dict[str, Any] = {"capturedAt": after_compact["capturedAt"]}
+
+    read_message_ids = {message.get("id") for message in before_compact["chat"]["unreadMessages"]}
+    unread_messages = [
+        message
+        for message in after_compact["chat"]["unreadMessages"]
+        if message.get("id") not in read_message_ids
+    ]
+    if unread_messages:
+        delta["chat"] = {"unreadMessages": unread_messages}
+
+    for section in (
+        "player",
+        "world",
+        "blocksAtPlayer",
+        "localAirspace",
+    ):
+        changed = {
+            key: value
+            for key, value in after_compact[section].items()
+            if before_compact[section].get(key) != value
+        }
+        if changed:
+            delta[section] = changed
+
+    before_inventory = before_compact["inventory"]
+    after_inventory = after_compact["inventory"]
+    inventory_delta = {
+        key: after_inventory.get(key)
+        for key in ("heldItem", "armor", "emptySlots")
+        if before_inventory.get(key) != after_inventory.get(key)
+    }
+    before_items = before_inventory["items"]
+    after_items = after_inventory["items"]
+    item_changes = {
+        name: {
+            "count": after_items.get(name, 0),
+            "delta": after_items.get(name, 0) - before_items.get(name, 0),
+        }
+        for name in sorted(set(before_items) | set(after_items))
+        if before_items.get(name, 0) != after_items.get(name, 0)
+    }
+    if item_changes:
+        inventory_delta["itemChanges"] = item_changes
+    if inventory_delta:
+        delta["inventory"] = inventory_delta
+
+    before_blocks = {block["name"]: block for block in before_compact["nearbyBlocks"]}
+    after_blocks = {block["name"]: block for block in after_compact["nearbyBlocks"]}
+    block_changes = {
+        name: after_blocks.get(name)
+        for name in sorted(set(before_blocks) | set(after_blocks))
+        if before_blocks.get(name) != after_blocks.get(name)
+    }
+    if block_changes:
+        delta["nearbyBlockChanges"] = block_changes
+
+    if before_compact["nearbyEntities"] != after_compact["nearbyEntities"]:
+        delta["nearbyEntities"] = after_compact["nearbyEntities"]
+    return delta
+
+
+def public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    if "observation" in envelope:
+        return {
+            "stateId": envelope.get("stateId"),
+            "stateRef": envelope.get("stateRef"),
+            "screenshot": screenshot_reference(envelope.get("frame")),
+            "runStatus": envelope.get("runStatus"),
+        }
+    result = {
+        key: without_image_bytes(envelope[key])
+        for key in (
+            "ok",
+            "status",
+            "actionId",
+            "action",
+            "executionId",
+            "skillPath",
+            "durationMs",
+            "result",
+            "runnerResult",
+            "postcondition",
+            "verification",
+            "stdout",
+            "stderr",
+            "heartbeats",
+            "cleanup",
+            "logDirectory",
+            "runStatus",
+            "progressSignal",
+            "actualEffect",
+            "deathObserved",
+            "respawnObserved",
+            "sameUsername",
+            "username",
+            "deathCountBefore",
+            "deathCountAfter",
+            "spawnCountBefore",
+            "spawnCountAfter",
+            "lastDeathAt",
+            "lastSpawnAt",
+            "screenshotBefore",
+            "screenshotAfter",
+        )
+        if key in envelope
+    }
+    result["screenshotAfter"] = screenshot_reference(envelope.get("frameAfter"))
+    return result
+
+
+def unsatisfied_inventory_postcondition_items(
+    specification: dict[str, Any],
+    before: dict[str, Any],
+) -> set[str]:
+    children = specification.get("all")
+    if isinstance(children, list):
+        items: set[str] = set()
+        for child in children:
+            if isinstance(child, dict):
+                items.update(
+                    unsatisfied_inventory_postcondition_items(
+                        child,
+                        before,
+                    )
+                )
+        return items
+    if specification.get("kind") not in {
+        "inventory_min",
+        "inventory_delta_min",
+    }:
+        return set()
+    item = specification.get("item")
+    if not isinstance(item, str):
+        return set()
+    if evaluate_postcondition(
+        specification,
+        before,
+        before,
+    )["ok"]:
+        return set()
+    return {item}
+
+
+def postcondition_requires_inventory_change(
+    specification: dict[str, Any],
+    before: dict[str, Any],
+) -> bool:
+    return bool(
+        unsatisfied_inventory_postcondition_items(
+            specification,
+            before,
+        )
+    )
+
+
+def evaluate_postcondition(
+    specification: dict[str, Any], before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(specification, dict):
+        raise TypeError("postcondition must be an object")
+    checks = specification.get("all")
+    if checks is None:
+        checks = [specification]
+    if not isinstance(checks, list) or not checks:
+        raise ValueError("postcondition.all must be a non-empty array")
+    results = [evaluate_postcondition_check(check, before, after) for check in checks]
+    return {"ok": all(result["ok"] for result in results), "checks": results}
+
+
+def evaluate_postcondition_check(
+    check: Any, before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(check, dict) or not isinstance(check.get("kind"), str):
+        raise ValueError("each postcondition check must be an object with a string kind")
+    kind = check["kind"]
+    before_items = item_counts(before)
+    after_items = item_counts(after)
+    if kind in {"inventory_min", "inventory_delta_min"}:
+        item = check.get("item")
+        count = check.get("count")
+        if not isinstance(item, str) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"{kind} requires item:string and count:non-negative integer")
+        actual = (
+            after_items.get(item, 0)
+            if kind == "inventory_min"
+            else after_items.get(item, 0) - before_items.get(item, 0)
+        )
+        return {
+            "kind": kind,
+            "ok": actual >= count,
+            "item": item,
+            "expectedAtLeast": count,
+            "actual": actual,
+        }
+    if kind in {"y_min", "y_max", "health_min", "position_changed_min"}:
+        value = check.get("value")
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"{kind} requires value:number")
+        if kind == "health_min":
+            actual = after["player"]["health"]
+            ok = actual >= value
+        elif kind == "y_min":
+            actual = after["player"]["position"]["y"]
+            ok = actual >= value
+        elif kind == "y_max":
+            actual = after["player"]["position"]["y"]
+            ok = actual <= value
+        else:
+            actual = vector_distance(before["player"]["position"], after["player"]["position"])
+            ok = actual >= value
+        return {"kind": kind, "ok": ok, "expected": value, "actual": actual}
+    if kind == "distance_max":
+        target = check.get("target")
+        value = check.get("value")
+        if (
+            not isinstance(target, dict)
+            or not all(isinstance(target.get(axis), (int, float)) for axis in ("x", "y", "z"))
+            or not isinstance(value, (int, float))
+        ):
+            raise ValueError("distance_max requires target:{x,y,z} and value:number")
+        actual = vector_distance(after["player"]["position"], target)
+        return {
+            "kind": kind,
+            "ok": actual <= value,
+            "target": target,
+            "expectedAtMost": value,
+            "actual": actual,
+        }
+    if kind == "held_item":
+        item = check.get("item")
+        if not isinstance(item, str):
+            raise ValueError("held_item requires item:string")
+        held = after["inventory"].get("heldItem")
+        actual = held.get("name") if isinstance(held, dict) else None
+        return {"kind": kind, "ok": actual == item, "expected": item, "actual": actual}
+    raise ValueError(f"unknown postcondition kind {kind!r}")
+
+
+def vector_distance(left: dict[str, Any], right: dict[str, Any]) -> float:
+    return sum((float(left[axis]) - float(right[axis])) ** 2 for axis in ("x", "y", "z")) ** 0.5
+
+
+def observation_summary(observation: dict[str, Any]) -> str:
+    player = observation["player"]
+    inventory = observation["inventory"]
+    items = ", ".join(f"{item['name']}x{item['count']}" for item in inventory["items"]) or "empty"
+    return (
+        f"{player['username']} is at {player['position']} facing {player['facing']}; "
+        f"health {player['health']}, food {player['food']}, held {inventory['heldItem']}, inventory [{items}]."
+    )
+
+
+def item_counts(observation: dict[str, Any]) -> dict[str, int]:
+    return {item["name"]: item["count"] for item in observation["inventory"]["items"]}
+
+
+def state_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_items = item_counts(before)
+    after_items = item_counts(after)
+    names = sorted(set(before_items) | set(after_items))
+    inventory_changes = {
+        name: after_items.get(name, 0) - before_items.get(name, 0)
+        for name in names
+        if after_items.get(name, 0) != before_items.get(name, 0)
+    }
+    return {
+        "positionBefore": before["player"]["position"],
+        "positionAfter": after["player"]["position"],
+        "healthChange": numeric_delta(before["player"]["health"], after["player"]["health"]),
+        "foodChange": numeric_delta(before["player"]["food"], after["player"]["food"]),
+        "heldItemBefore": before.get("inventory", {}).get("heldItem"),
+        "heldItemAfter": after.get("inventory", {}).get("heldItem"),
+        "inventoryChanges": inventory_changes,
+    }
+
+
+def material_action_reached_world(
+    result: dict[str, Any],
+    delta: dict[str, Any],
+) -> bool:
+    if result.get("ok") is True:
+        return True
+    if delta["inventoryChanges"]:
+        return True
+    if result.get("status") in {"timed_out", "boundary_failed"}:
+        return True
+    return result.get("reason") in MATERIAL_ATTEMPT_FAILURE_REASONS
+
+
+def numeric_delta(before: Any, after: Any) -> float | None:
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+        return after - before
+    return None
+
+
+def position_distance(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> float:
+    return sum(
+        (float(after[axis]) - float(before[axis])) ** 2
+        for axis in ("x", "y", "z")
+    ) ** 0.5
+
+
+def heartbeat_from_observation(elapsed: float, observation: dict[str, Any]) -> dict[str, Any]:
+    player = observation["player"]
+    inventory = observation["inventory"]
+    message = (
+        f"Running {round(elapsed)}s — position {player['position']}, health {player['health']}, "
+        f"food {player['food']}, held {inventory['heldItem']}"
+    )
+    return {
+        "capturedAt": observation["capturedAt"],
+        "elapsedSeconds": round(elapsed, 2),
+        "position": player["position"],
+        "health": player["health"],
+        "food": player["food"],
+        "heldItem": inventory["heldItem"],
+        "message": message,
+    }
+
+
+def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
+    mcp = FastMCP(
+        name=f"Minecraft: {runtime.config.username}",
+        instructions=(
+            f"You embody Minecraft player {runtime.config.username}. Observe before acting. "
+            f"Use low-level tools while discovering a procedure, write TypeScript drafts in {runtime.home.drafts_dir}, and promote verified skills to {runtime.home.skills_dir} "
+            f"and run them with minecraft_execute_typescript. Each skill is limited to {runtime.config.max_skill_characters} characters; "
+            "compose short skills instead of building monoliths. Record durable world facts with minecraft_remember. "
+            "Never use progression-changing console commands or operator powers. Never claim success without checking returned state and inventory. "
+            "Revise failed skills in place and retry from actual state. Retire only a cheated, teleported, operator-modified, or genuinely broken character."
+        ),
+        mask_error_details=False,
+    )
+
+    @mcp.tool
+    async def minecraft_info() -> dict[str, Any]:
+        """Return this character's connection, agent-home, skill, memory, and log locations."""
+        health = await asyncio.to_thread(runtime.api.health)
+        return {
+            "username": runtime.config.username,
+            "minecraftServer": f"{runtime.config.minecraft_host}:{runtime.config.minecraft_port}",
+            "bodyUrl": runtime.config.body_url,
+            "agentHome": str(runtime.home.root),
+            "skillsDirectory": str(runtime.home.skills_dir),
+            "draftsDirectory": str(runtime.home.drafts_dir),
+            "memoryDirectory": str(runtime.home.memory_dir),
+            "logDirectory": str(runtime.config.player_log_dir),
+            "actionSchemas": runtime.api.ACTION_SCHEMAS,
+            "postconditionSchemas": {
+                "inventory_min": {"kind": "inventory_min", "item": "iron_pickaxe", "count": 1},
+                "inventory_delta_min": {"kind": "inventory_delta_min", "item": "coal", "count": 1},
+                "distance_max": {
+                    "kind": "distance_max",
+                    "target": {"x": 0, "y": 64, "z": 0},
+                    "value": 2,
+                },
+                "y_min|y_max|health_min|position_changed_min": {"kind": "y_min", "value": 64},
+                "held_item": {"kind": "held_item", "item": "stone_pickaxe"},
+                "composition": {
+                    "all": [
+                        {"kind": "inventory_min", "item": "iron_pickaxe", "count": 1},
+                        {"kind": "health_min", "value": 1},
+                    ]
+                },
+            },
+            "skillPolicy": {
+                "maxCharacters": runtime.config.max_skill_characters,
+                "acceptedExtensions": [".ts", ".mts", ".cts"],
+                "compositionPreferred": True,
+            },
+            "runStatus": runtime.run_status(),
+            "health": health,
+        }
+
+    @mcp.tool
+    async def minecraft_observe(
+        include_image: bool = False, full_state: bool = False
+    ) -> ToolResult:
+        """Get fresh state. Results are deltas after the first call; set full_state to reset the model-visible baseline."""
+        return await runtime.observe_tool(include_image, full_state)
+
+    @mcp.tool
+    async def minecraft_call(
+        action: str,
+        parameters: dict[str, Any],
+        timeout_seconds: float = 30,
+        include_image: bool = False,
+    ) -> ToolResult:
+        """Call a named Minecraft action using the exact schema from minecraft_info. Returns authoritative after-state and delta."""
+        return await runtime.call_tool(action, parameters, timeout_seconds, include_image)
+
+    @mcp.tool
+    async def minecraft_find_block(
+        block_name: str,
+        max_distance: int = 64,
+        require_visible: bool = True,
+        include_image: bool = False,
+    ) -> ToolResult:
+        """Find an exact block; visibility is required by default for realistic perception."""
+        return await runtime.call_tool(
+            "find_block",
+            {
+                "blockName": block_name,
+                "maxDistance": max_distance,
+                "requireVisible": require_visible,
+            },
+            15,
+            include_image,
+        )
+
+    @mcp.tool
+    async def minecraft_walk_to(
+        x: float,
+        y: float,
+        z: float,
+        tolerance: float = 1.5,
+        timeout_seconds: float = 60,
+        include_image: bool = False,
+    ) -> ToolResult:
+        """Walk using state-based adaptive pathfinding, including steps, safe drops, digging, block placement, and parkour. Returns route diagnostics."""
+        return await runtime.call_tool(
+            "walk_to",
+            {"target": {"x": x, "y": y, "z": z}, "tolerance": tolerance},
+            timeout_seconds,
+            include_image,
+        )
+
+    @mcp.tool
+    async def minecraft_mine_block(
+        x: int,
+        y: int,
+        z: int,
+        walk_into_range: bool = True,
+        timeout_seconds: float = 60,
+        include_image: bool = False,
+    ) -> ToolResult:
+        """Mine the block at exact world coordinates and verify the resulting block change."""
+        return await runtime.call_tool(
+            "mine_block",
+            {"block": {"x": x, "y": y, "z": z}, "walkIntoRange": walk_into_range},
+            timeout_seconds,
+            include_image,
+        )
+
+    @mcp.tool
+    async def minecraft_pillar_up(include_image: bool = False) -> ToolResult:
+        """Ascend exactly one block by naturally jumping and placing the currently held placeable block beneath the character. No coordinates or face are needed: the body derives the block below, retries up to three jumps, verifies the placed block, and waits for landing. Equip a suitable solid block and use a fresh observation whose localAirspace.clearanceBlocksAboveHead is at least 1."""
+        return await runtime.call_tool("pillar_up", {}, 30, include_image)
+
+    @mcp.tool
+    async def minecraft_collect_blocks(
+        block_name: str,
+        item_name: str,
+        count: int,
+        ctx: Context,
+        max_distance: int = 48,
+        timeout_seconds: float = 300,
+    ) -> ToolResult:
+        """Repeatedly find and mine an exact block until after-state proves the requested inventory delta. Uses only this body's ordinary find/mine primitives, not collectblock."""
+        if count <= 0:
+            raise ValueError("count must be positive")
+        return await runtime.execute_typescript(
+            str(COLLECT_BLOCKS_PRIMITIVE),
+            {
+                "blockName": block_name,
+                "itemName": item_name,
+                "count": count,
+                "maxDistance": max_distance,
+            },
+            timeout_seconds,
+            15,
+            ctx,
+            {"kind": "inventory_delta_min", "item": item_name, "count": count},
+            False,
+        )
+
+    @mcp.tool
+    async def minecraft_craft_item(
+        item_name: str, repetitions: int = 1, timeout_seconds: float = 60
+    ) -> ToolResult:
+        """Craft an exact item recipe through Mineflayer's normal survival crafting API and verify inventory after-state."""
+        return await runtime.call_tool(
+            "craft_item",
+            {"itemName": item_name, "repetitions": repetitions},
+            timeout_seconds,
+            False,
+        )
+
+    @mcp.tool
+    async def minecraft_smelt_item(
+        input_item_name: str,
+        input_count: int,
+        fuel_item_name: str,
+        fuel_count: int = 1,
+        timeout_seconds: float = 180,
+    ) -> ToolResult:
+        """Smelt ordinary inventory items in a nearby furnace and return verified after-state."""
+        return await runtime.call_tool(
+            "smelt",
+            {
+                "inputItemName": input_item_name,
+                "inputCount": input_count,
+                "fuelItemName": fuel_item_name,
+                "fuelCount": fuel_count,
+                "timeoutMs": round(timeout_seconds * 1000),
+            },
+            timeout_seconds,
+            False,
+        )
+
+    @mcp.tool
+    async def minecraft_equip(
+        item_name: str, timeout_seconds: float = 15, include_image: bool = False
+    ) -> ToolResult:
+        """Equip an inventory item by exact Mineflayer item name."""
+        return await runtime.call_tool(
+            "inventory_equip", {"itemName": item_name}, timeout_seconds, include_image
+        )
+
+    @mcp.tool
+    async def minecraft_rotate(
+        yaw_degrees: float = 0, pitch_degrees: float = 0, include_image: bool = False
+    ) -> ToolResult:
+        """Rotate relative to the current view. Positive yaw turns right; positive pitch looks up."""
+        return await runtime.call_tool(
+            "rotate", {"yaw": yaw_degrees, "pitch": pitch_degrees}, 10, include_image
+        )
+
+    @mcp.tool
+    async def minecraft_stop(include_image: bool = False) -> ToolResult:
+        """Stop the active Mineflayer command and clear pathfinding and movement controls."""
+        return await runtime.call_tool("stop", {}, 10, include_image)
+
+    @mcp.tool
+    async def minecraft_execute_typescript(
+        path: str,
+        ctx: Context,
+        postcondition: PostconditionSpec,
+        arguments: dict[str, Any] | None = None,
+        timeout_seconds: float = MAX_TYPESCRIPT_TIMEOUT_SECONDS,
+        heartbeat_seconds: float = 15,
+        include_image: bool = False,
+    ) -> ToolResult:
+        """Execute a local TypeScript skill. Normal exit is success only when the mandatory after-state postcondition also passes."""
+        return await runtime.execute_typescript(
+            path,
+            arguments or {},
+            timeout_seconds,
+            heartbeat_seconds,
+            ctx,
+            postcondition.as_dict(),
+            include_image,
+        )
+
+    @mcp.tool
+    async def minecraft_check_postcondition(
+        postcondition: PostconditionSpec,
+    ) -> dict[str, Any]:
+        """Evaluate a deterministic postcondition against a fresh state. Delta checks compare the same snapshot and are therefore zero."""
+        async with runtime.lock:
+            snapshot = await runtime.snapshot(False)
+        observation = snapshot["observation"]
+        specification = postcondition.as_dict()
+        return {
+            "stateId": snapshot["stateId"],
+            "stateRef": snapshot["stateRef"],
+            "screenshot": relative_workspace_paths(
+                screenshot_reference(snapshot.get("frame")),
+                runtime.home.root,
+            ),
+            "verification": evaluate_postcondition(
+                specification,
+                observation,
+                observation,
+            ),
+            "stateUpdate": runtime.model_state_update(observation),
+        }
+
+    @mcp.tool
+    async def minecraft_remember(
+        kind: Literal[
+            "world",
+            "places",
+            "routes",
+            "chests",
+            "failures",
+            "journal",
+        ],
+        markdown: str,
+    ) -> dict[str, Any]:
+        """Append a durable Markdown fact or note to the character's memory. Record coordinates, dimension, evidence, and uncertainty."""
+        path = await asyncio.to_thread(runtime.home.append_note, kind, markdown)
+        return {"ok": True, "kind": kind, "path": str(path), "writtenAt": utc_now()}
+
+    @mcp.tool
+    async def minecraft_suicide(
+        reason: str,
+        timeout_seconds: float = 30,
+    ) -> ToolResult:
+        """Kill and respawn only this avatar, with observed death evidence."""
+        return await runtime.suicide_avatar(reason, timeout_seconds)
+
+    @mcp.tool
+    async def minecraft_retire_character(
+        reason: Literal["cheated_item", "teleport", "operator_power", "character_broken", "other"],
+        evidence: str,
+    ) -> dict[str, Any]:
+        """Permanently retire this username after contamination. Preserve its logs and restart the MCP with a fresh numbered username."""
+        if not evidence.strip():
+            raise ValueError("evidence must describe what contaminated the character")
+        runtime.retire_character(reason, {"evidence": evidence.strip(), "reportedBy": "agent"})
+        return {
+            "ok": True,
+            "runStatus": runtime.run_status(),
+            "logDirectory": str(runtime.config.player_log_dir),
+        }
+
+    return mcp
+
+
+def parse_args(argv: list[str] | None = None) -> ServerConfig:
+    parser = argparse.ArgumentParser(
+        description="Start a per-character Minecraft body and MCP server."
+    )
+    parser.add_argument("--mc-host", default="127.0.0.1")
+    parser.add_argument("--mc-port", type=int, required=True)
+    parser.add_argument("--username", required=True)
+    parser.add_argument("--agent-home", type=Path, required=True)
+    parser.add_argument("--artifact-root", type=Path, required=True)
+    parser.add_argument("--web-host", default="127.0.0.1")
+    parser.add_argument("--web-port", type=int, default=3000)
+    parser.add_argument("--viewer-port", type=int, default=3007)
+    parser.add_argument("--mcp-host", default="127.0.0.1")
+    parser.add_argument("--mcp-port", type=int, default=8765)
+    parser.add_argument("--startup-timeout-seconds", type=float, default=60)
+    parser.add_argument("--max-skill-characters", type=int, default=50000)
+    parser.add_argument("--viewer-scale", type=int, default=2)
+    parser.add_argument("--viewer-fov", type=int, default=80)
+    parser.add_argument("--view-distance", type=int, default=12)
+    parser.add_argument(
+        "--no-images",
+        action="store_true",
+        help="Return state without capturing fresh frames from MCP tools.",
+    )
+    args = parser.parse_args(argv)
+    return ServerConfig(
+        minecraft_host=args.mc_host,
+        minecraft_port=args.mc_port,
+        username=args.username,
+        agent_home=args.agent_home.expanduser().resolve(),
+        artifact_root=args.artifact_root.expanduser().resolve(),
+        web_host=args.web_host,
+        web_port=args.web_port,
+        viewer_port=args.viewer_port,
+        mcp_host=args.mcp_host,
+        mcp_port=args.mcp_port,
+        startup_timeout_seconds=args.startup_timeout_seconds,
+        capture_images=not args.no_images,
+        max_skill_characters=args.max_skill_characters,
+        viewer_scale=args.viewer_scale,
+        viewer_fov=args.viewer_fov,
+        view_distance=args.view_distance,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    config = parse_args(argv)
+    config.player_log_dir.mkdir(parents=True, exist_ok=True)
+    server_log = (config.player_log_dir / "mcp-server.log").open("a", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeTextStream(original_stdout, server_log)
+    sys.stderr = TeeTextStream(original_stderr, server_log)
+    home = AgentHome(config)
+    home.validate()
+    api = BodyApi(config.body_url)
+    supervisor = BodySupervisor(config, api)
+    print(
+        f"Starting Minecraft character {config.username} against {config.minecraft_host}:{config.minecraft_port}",
+        file=sys.stderr,
+    )
+    try:
+        health = supervisor.start()
+        print(f"Minecraft body ready: {json.dumps(health['mineflayer'])}", file=sys.stderr)
+        mineflayer = health.get("mineflayer", {})
+        if mineflayer.get("username") != config.username:
+            raise RuntimeError(
+                f"Mineflayer joined with an unexpected username: {mineflayer.get('username')!r}"
+            )
+        negotiated_version = mineflayer.get("version")
+        if not isinstance(negotiated_version, str) or not negotiated_version.startswith("1.19"):
+            raise RuntimeError(
+                f"Minecraft negotiated version must be 1.19.x, got {negotiated_version!r}"
+            )
+        initial_observation = api.observe()
+        if initial_observation.get("player", {}).get("gameMode") != "survival":
+            raise RuntimeError(
+                "Minecraft game mode must be survival, got "
+                f"{initial_observation.get('player', {}).get('gameMode')!r}"
+            )
+        home.write_character(initial_observation)
+        runtime = MinecraftMcpRuntime(config, api, home)
+        mcp = build_mcp(runtime)
+        print(f"Agent home: {home.root}", file=sys.stderr)
+        print(f"Artifact root: {config.player_log_dir}", file=sys.stderr)
+        print(f"Minecraft MCP: {config.mcp_url}", file=sys.stderr)
+        mcp.run(
+            transport="streamable-http",
+            host=config.mcp_host,
+            port=config.mcp_port,
+            path="/mcp",
+            show_banner=True,
+        )
+    finally:
+        try:
+            supervisor.stop()
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            server_log.close()
+
+
+if __name__ == "__main__":
+    main()

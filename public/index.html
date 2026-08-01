@@ -1,0 +1,1020 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turnbased Minecraft Control</title>
+<style>
+:root {
+  --bg: #1a1a2e; --surface: #16213e; --panel: #0f3460;
+  --accent: #e94560; --text: #eee; --muted: #8899aa;
+  --success: #4caf50; --warn: #ff9800; --border: #334;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: monospace; font-size: 12px; color: var(--text); background: var(--bg); overflow: hidden; height: 100vh; display: flex; flex-direction: column; }
+button { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: 11px; border-radius: 2px; }
+button:hover { background: var(--accent); }
+button.active { background: var(--accent); border-color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+input, select { background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 3px 6px; font-family: monospace; font-size: 11px; border-radius: 2px; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Toolbar */
+#toolbar { display: flex; gap: 4px; padding: 4px 8px; background: var(--surface); border-bottom: 1px solid var(--border); align-items: center; flex-wrap: wrap; min-height: 36px; }
+#toolbar .group { display: flex; gap: 2px; align-items: center; }
+#toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+#status { color: var(--muted); margin-left: auto; white-space: nowrap; }
+#status .connected { color: var(--success); }
+#status .disconnected { color: var(--accent); }
+#cmd-status { margin-left: 8px; font-weight: bold; }
+#cmd-status.idle { color: var(--success); }
+#cmd-status.running { color: var(--warn); }
+#cmd-status.error { color: var(--accent); }
+
+/* Main layout */
+#main { display: flex; flex: 1; overflow: hidden; }
+
+/* Viewer area */
+#viewer-area { flex: 1; position: relative; display: flex; align-items: center; justify-content: center; }
+/* Keep the viewer square to match the 640x640 frame capture aspect; pixel
+   targeting resolves clicks in captured-frame pixel space. */
+#viewer-frame { width: 640px; height: 640px; border: none; background: #000; flex-shrink: 0; }
+#viewport-overlay { position: absolute; width: 640px; height: 640px; z-index: 5; }
+#target-preview { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.8); padding: 6px 10px; border-radius: 4px; font-size: 11px; max-width: 260px; pointer-events: none; z-index: 10; }
+#target-preview .label { color: var(--muted); }
+
+/* Sidebar */
+#sidebar { width: 320px; display: flex; flex-direction: column; border-left: 1px solid var(--border); overflow: hidden; }
+.panel { border-bottom: 1px solid var(--border); display: flex; flex-direction: column; }
+.panel-header { padding: 4px 8px; background: var(--surface); cursor: pointer; display: flex; justify-content: space-between; align-items: center; user-select: none; font-weight: bold; }
+.panel-body { overflow-y: auto; padding: 4px; }
+.panel-body.collapsed { display: none; }
+
+/* Hotbar */
+#hotbar-grid { display: grid; grid-template-columns: repeat(9, 1fr); gap: 2px; }
+.hotbar-slot { background: var(--surface); border: 1px solid var(--border); padding: 2px; text-align: center; cursor: pointer; font-size: 9px; min-height: 36px; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+.hotbar-slot:hover { border-color: var(--accent); }
+.hotbar-slot.selected { border-color: var(--success); background: rgba(76,175,80,0.15); }
+.hotbar-slot .slot-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+
+/* Inventory items */
+#inventory-list { display: flex; flex-direction: column; gap: 1px; }
+.inv-item { display: flex; gap: 4px; padding: 2px 4px; background: var(--surface); border: 1px solid var(--border); cursor: pointer; align-items: center; }
+.inv-item:hover { border-color: var(--accent); }
+.inv-item .inv-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inv-item .inv-count { color: var(--muted); min-width: 20px; text-align: right; }
+.inv-item .inv-action { font-size: 10px; }
+
+/* Crafting */
+#crafting-grid-area { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 4px; }
+#crafting-grid { display: grid; gap: 2px; }
+#crafting-grid.grid-2x2 { grid-template-columns: repeat(2, 48px); }
+#crafting-grid.grid-3x3 { grid-template-columns: repeat(3, 42px); }
+.crafting-slot { width: 48px; height: 48px; background: var(--surface); border: 1px solid var(--border); display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; font-size: 8px; padding: 2px; }
+.crafting-slot:hover { border-color: var(--accent); }
+.crafting-slot.filled { border-color: var(--warn); }
+.crafting-arrow { font-size: 20px; color: var(--muted); padding-top: 12px; }
+#craft-output { width: 56px; height: 56px; background: var(--surface); border: 2px solid var(--success); display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 9px; }
+.crafting-actions { display: flex; gap: 2px; flex-wrap: wrap; margin-top: 4px; }
+#selected-item { color: var(--warn); font-size: 10px; padding: 2px 4px; }
+
+/* Chat */
+#chat-messages { max-height: 120px; overflow-y: auto; font-size: 11px; }
+#chat-messages div { padding: 1px 0; }
+#chat-input-row { display: flex; gap: 4px; margin-top: 4px; }
+#chat-input { flex: 1; }
+
+/* Action log */
+#action-log { max-height: 140px; overflow-y: auto; font-size: 10px; }
+#action-log .log-entry { padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+#action-log .log-info { color: var(--text); }
+#action-log .log-warn { color: var(--warn); }
+#action-log .log-error { color: var(--accent); }
+
+/* Fine control */
+#fine-control-panel { padding: 4px; }
+#fine-control-panel .fc-row { display: flex; gap: 2px; justify-content: center; margin-bottom: 2px; }
+#fine-control-panel .fc-settings { display: flex; gap: 8px; align-items: center; justify-content: center; margin-top: 4px; }
+#fine-control-panel .fc-settings label { display: flex; align-items: center; gap: 4px; }
+
+/* Confirm dialog */
+#confirm-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+#confirm-overlay.visible { display: flex; }
+#confirm-box { background: var(--surface); border: 1px solid var(--border); padding: 16px; border-radius: 6px; max-width: 360px; }
+#confirm-box .confirm-title { font-weight: bold; margin-bottom: 8px; font-size: 14px; }
+#confirm-box .confirm-detail { color: var(--muted); margin-bottom: 12px; }
+#confirm-box .confirm-actions { display: flex; gap: 8px; justify-content: flex-end; }
+#confirm-box .confirm-actions button.confirm-yes { background: var(--success); border-color: var(--success); }
+#confirm-box .confirm-actions button.confirm-no { background: var(--accent); border-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<!-- Toolbar -->
+<div id="toolbar">
+  <div class="group" id="mode-group">
+    <button data-mode="look" title="Look at clicked target">Look</button>
+    <button data-mode="walk" title="Walk to clicked target">Walk</button>
+    <button data-mode="mine" title="Mine clicked block" class="destructive">Mine</button>
+    <button data-mode="place" title="Place held item on clicked face" class="destructive">Place</button>
+    <button data-mode="use" title="Use/interact with clicked block">Use</button>
+    <button data-mode="inspect" title="Inspect clicked block">Inspect</button>
+    <button data-mode="fine" title="Toggle fine control panel">Fine Ctrl</button>
+  </div>
+  <div class="sep"></div>
+  <button id="stop-btn" title="Stop current command" style="background:#c0392b;border-color:#c0392b;">&#9632; Stop</button>
+  <div class="sep"></div>
+  <div class="group">
+    <label style="color:var(--muted);font-size:10px;">
+      <input type="checkbox" id="confirm-toggle" checked> Confirm destructive
+    </label>
+  </div>
+  <span id="status">Connecting...</span>
+  <span id="cmd-status" class="idle">idle</span>
+</div>
+
+<!-- Main area -->
+<div id="main">
+  <!-- Viewer -->
+  <div id="viewer-area">
+    <iframe id="viewer-frame" src="" title="prismarine-viewer"></iframe>
+    <div id="viewport-overlay"></div>
+    <div id="target-preview">
+      <div><span class="label">Block:</span> <span id="tp-block">-</span></div>
+      <div><span class="label">Pos:</span> <span id="tp-pos">-</span></div>
+      <div><span class="label">Face:</span> <span id="tp-face">-</span></div>
+      <div><span class="label">Dist:</span> <span id="tp-dist">-</span></div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div id="sidebar">
+    <!-- State panel -->
+    <div class="panel" id="panel-state">
+      <div class="panel-header" onclick="togglePanel('panel-state')">State <span>&#9662;</span></div>
+      <div class="panel-body" id="state-body">
+        <div><span class="label">Pos:</span> <span id="st-pos">-</span></div>
+        <div><span class="label">Yaw/Pitch:</span> <span id="st-angles">-</span></div>
+        <div><span class="label">HP:</span> <span id="st-health">-</span> <span class="label">Food:</span> <span id="st-food">-</span></div>
+        <div><span class="label">Held:</span> <span id="st-held">-</span></div>
+        <div><span class="label">Dim:</span> <span id="st-dim">-</span></div>
+      </div>
+    </div>
+
+    <!-- Inventory panel -->
+    <div class="panel" id="panel-inventory" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+      <div class="panel-header" onclick="togglePanel('panel-inventory')">Inventory <span>&#9662;</span></div>
+      <div class="panel-body" id="inventory-body" style="flex:1;overflow-y:auto;">
+        <div id="hotbar-grid"></div>
+        <div style="margin-top:4px;font-size:10px;color:var(--muted);">Main Inventory</div>
+        <div id="inventory-list"></div>
+      </div>
+    </div>
+
+    <!-- Crafting panel -->
+    <div class="panel" id="panel-crafting">
+      <div class="panel-header" onclick="togglePanel('panel-crafting')">Crafting <span>&#9662;</span></div>
+      <div class="panel-body" id="crafting-body">
+        <div id="selected-item">Selected: click inventory item</div>
+        <div id="crafting-grid-area">
+          <div id="crafting-grid" class="grid-2x2"></div>
+          <div class="crafting-arrow">&rarr;</div>
+          <div id="craft-output">?</div>
+        </div>
+        <div class="crafting-actions">
+          <button onclick="craftingOpenInventory()">Open Inv</button>
+          <button onclick="craftingOpenTable()">Open Table</button>
+          <button onclick="craftingSetGrid()">Set Grid</button>
+          <button onclick="craftingTakeOutput()">Take Output</button>
+          <button onclick="craftingClearGrid()">Clear Grid</button>
+          <button onclick="craftingCloseWindow()">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chat panel -->
+    <div class="panel" id="panel-chat">
+      <div class="panel-header" onclick="togglePanel('panel-chat')">Chat <span>&#9662;</span></div>
+      <div class="panel-body" id="chat-body">
+        <div id="chat-messages"></div>
+        <div id="chat-input-row">
+          <input id="chat-input" placeholder="Type message..." onkeydown="if(event.key==='Enter')sendChat()">
+          <button onclick="sendChat()">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Action log panel -->
+    <div class="panel" id="panel-log">
+      <div class="panel-header" onclick="togglePanel('panel-log')">Action Log <span>&#9662;</span></div>
+      <div class="panel-body" id="log-body">
+        <div id="action-log"></div>
+      </div>
+    </div>
+
+    <!-- Fine control panel -->
+    <div class="panel" id="panel-fine">
+      <div class="panel-header" onclick="togglePanel('panel-fine')">Fine Control <span>&#9662;</span></div>
+      <div class="panel-body" id="fine-control-panel">
+        <div class="fc-row">
+          <button onclick="fineSend({up:true})">Up</button>
+        </div>
+        <div class="fc-row">
+          <button onclick="fineSend({left:true})">Left</button>
+          <button onclick="fineSend({forward:true})">Fwd</button>
+          <button onclick="fineSend({right:true})">Right</button>
+        </div>
+        <div class="fc-row">
+          <button onclick="fineSend({down:true})">Dn</button>
+        </div>
+        <div class="fc-row">
+          <button onclick="fineSend({back:true})">Back</button>
+          <button onclick="fineSend({jump:true})">Jump</button>
+        </div>
+        <div class="fc-row">
+          <button onclick="fineSend({sneak:true})">Sneak</button>
+          <button onclick="fineSend({sprint:true})">Sprint</button>
+        </div>
+        <div class="fc-row">
+          <button onclick="fineSend({yaw:-15})">&larr;15&deg;</button>
+          <button onclick="fineSend({yaw:-30})">&larr;30&deg;</button>
+          <button onclick="fineSend({yaw:30})">&rarr;30&deg;</button>
+          <button onclick="fineSend({yaw:15})">&rarr;15&deg;</button>
+        </div>
+        <div class="fc-row">
+          <button onclick="fineSend({pitch:-15})">&darr;15&deg;</button>
+          <button onclick="fineSend({pitch:-30})">&darr;30&deg;</button>
+          <button onclick="fineSend({pitch:30})">&uarr;30&deg;</button>
+          <button onclick="fineSend({pitch:15})">&uarr;15&deg;</button>
+        </div>
+        <div class="fc-row">
+          <button onclick="fineStop()" style="background:#c0392b;">Stop</button>
+        </div>
+        <div class="fc-settings">
+          <label>ms: <select id="fc-duration" onchange="window._fcDuration=+this.value">
+            <option value="100">100</option>
+            <option value="250">250</option>
+            <option value="500" selected>500</option>
+            <option value="1000">1000</option>
+            <option value="2000">2000</option>
+            <option value="3000">3000</option>
+          </select></label>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm dialog -->
+<div id="confirm-overlay">
+  <div id="confirm-box">
+    <div class="confirm-title" id="confirm-title">Confirm Action</div>
+    <div class="confirm-detail" id="confirm-detail"></div>
+    <div class="confirm-actions">
+      <button class="confirm-no" onclick="cancelCommand()">Cancel</button>
+      <button class="confirm-yes" onclick="executePendingCommand()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ===== Configuration =====
+const DEFAULT_VIEWER_PORT = 3001;
+const HOST = location.host;
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + HOST + '/ws';
+const API_URL = location.origin;
+let VIEWER_URL = 'http://' + location.hostname + ':' + DEFAULT_VIEWER_PORT;
+
+// ===== State =====
+let currentMode = 'look';
+let ws = null;
+let wsReconnectTimer = null;
+let botState = null;
+let inventoryState = null;
+let pendingCommand = null;
+let pendingResolve = null;
+let lastTarget = null;
+let gridItems = [];
+let craftingGridSize = 2; // 2 or 3
+let selectedItem = null;
+let commandBusy = false;
+window._fcDuration = 500;
+
+// ===== WebSocket =====
+function connectWebSocket() {
+  if (ws && ws.readyState <= 1) return;
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    setStatus('Connected', true);
+    logEntry('info', 'WebSocket connected');
+  };
+  ws.onclose = () => {
+    setStatus('Disconnected', false);
+    logEntry('warn', 'WebSocket disconnected, reconnecting...');
+    wsReconnectTimer = setTimeout(connectWebSocket, 2000);
+  };
+  ws.onerror = (e) => {
+    logEntry('error', 'WebSocket error');
+  };
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      handleWsMessage(msg);
+    } catch (err) {
+      logEntry('error', 'WS parse error: ' + err.message);
+    }
+  };
+}
+
+function handleWsMessage(msg) {
+  switch (msg.type) {
+    case 'state':
+      botState = msg.data;
+      updateStateDisplay();
+      break;
+    case 'log':
+      logEntry(msg.level || 'info', msg.message);
+      break;
+    case 'chat':
+      addChatMessage(msg.username || 'Server', msg.message);
+      break;
+    case 'command_started':
+      commandBusy = true;
+      updateCmdStatus('running', msg.command);
+      logEntry('info', 'CMD START: ' + msg.command + ' (' + msg.commandId + ')');
+      break;
+    case 'command_finished':
+      commandBusy = false;
+      updateCmdStatus('idle', '');
+      logEntry('info', 'CMD OK: ' + msg.command + ' - ' + JSON.stringify(msg.data));
+      refreshInventory();
+      break;
+    case 'command_failed':
+      commandBusy = false;
+      updateCmdStatus('error', msg.command);
+      logEntry('error', 'CMD FAIL: ' + msg.command + ' - ' + msg.reason + ': ' + msg.message);
+      break;
+    case 'command_cancelled':
+      commandBusy = false;
+      updateCmdStatus('idle', '');
+      logEntry('warn', 'CMD CANCELLED: ' + msg.command);
+      break;
+    case 'crafting_window_changed':
+      handleCraftingWindowChanged(msg.windowType);
+      break;
+  }
+}
+
+function setStatus(text, connected) {
+  const el = document.getElementById('status');
+  el.innerHTML = '<span class="' + (connected ? 'connected' : 'disconnected') + '">' + text + '</span>';
+}
+
+function updateCmdStatus(status, command) {
+  const el = document.getElementById('cmd-status');
+  el.className = status;
+  el.textContent = command ? status + ': ' + command : status;
+}
+
+// ===== State display =====
+function updateStateDisplay() {
+  if (!botState) return;
+  const p = botState.position;
+  document.getElementById('st-pos').textContent = p ? [p.x.toFixed(1), p.y.toFixed(1), p.z.toFixed(1)].join(' ') : '-';
+  document.getElementById('st-angles').textContent = botState.yawDegrees != null && botState.pitchDegrees != null
+    ? botState.yawDegrees.toFixed(1) + '°/' + botState.pitchDegrees.toFixed(1) + '°' + (botState.facing ? ' (' + botState.facing + ')' : '')
+    : '-';
+  document.getElementById('st-health').textContent = botState.health != null ? botState.health : '-';
+  document.getElementById('st-food').textContent = botState.food != null ? botState.food : '-';
+  document.getElementById('st-held').textContent = botState.heldItem ? botState.heldItem.name + ' x' + botState.heldItem.count : '-';
+  document.getElementById('st-dim').textContent = botState.dimension || '-';
+}
+
+// ===== Inventory =====
+async function refreshInventory() {
+  try {
+    const res = await fetch(API_URL + '/api/inventory');
+    if (res.ok) {
+      inventoryState = await res.json();
+      renderInventory();
+    }
+  } catch (e) { /* ignore - bot may not be ready */ }
+}
+
+function renderInventory() {
+  if (!inventoryState) return;
+  // Hotbar
+  const hotbarEl = document.getElementById('hotbar-grid');
+  hotbarEl.innerHTML = '';
+  for (let i = 0; i < 9; i++) {
+    const slot = document.createElement('div');
+    slot.className = 'hotbar-slot' + (i === (inventoryState.selectedHotbarSlot ?? 0) ? ' selected' : '');
+    const item = inventoryState.hotbar.find(h => h.slot === 36 + i);
+    slot.innerHTML = '<span style="font-size:9px">' + i + '</span>'
+      + (item ? '<span class="slot-name">' + item.name.substring(0, 12) + '</span><span style="color:var(--muted)">x' + item.count + '</span>' : '');
+    slot.title = item ? item.name + ' (slot ' + item.slot + ')' : 'Empty';
+    slot.onclick = () => { if (item) selectInventoryItem(item); selectHotbar(i); };
+    hotbarEl.appendChild(slot);
+  }
+
+  // Main inventory
+  const listEl = document.getElementById('inventory-list');
+  listEl.innerHTML = '';
+  for (const item of inventoryState.main) {
+    const row = document.createElement('div');
+    row.className = 'inv-item';
+    row.innerHTML = '<span class="inv-name" title="' + item.name + '">' + item.name + '</span>'
+      + '<span class="inv-count">x' + item.count + '</span>'
+      + '<button class="inv-action" onclick="event.stopPropagation();equipItem(\'' + item.name + '\')">Equip</button>';
+    row.onclick = () => selectInventoryItem(item);
+    listEl.appendChild(row);
+  }
+
+  // Update held item display
+  if (inventoryState.heldItem) {
+    document.getElementById('st-held').textContent = inventoryState.heldItem.name + ' x' + inventoryState.heldItem.count;
+  }
+}
+
+async function selectHotbar(slot) {
+  try {
+    const res = await fetch(API_URL + '/api/hotbar/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hotbarIndex: slot })
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Hotbar select: ' + data.message);
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', 'Hotbar select failed: ' + e.message);
+  }
+}
+
+async function equipItem(itemName) {
+  try {
+    const res = await fetch(API_URL + '/api/inventory/equip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ itemName })
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Equip: ' + data.message);
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', 'Equip failed: ' + e.message);
+  }
+}
+
+function selectInventoryItem(item) {
+  selectedItem = item;
+  document.getElementById('selected-item').textContent = 'Selected: ' + item.name + ' x' + item.count;
+}
+
+// ===== Mode controls =====
+document.getElementById('mode-group').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-mode]');
+  if (!btn) return;
+  const mode = btn.dataset.mode;
+  if (mode === 'fine') {
+    togglePanel('panel-fine');
+    return;
+  }
+  currentMode = mode;
+  document.querySelectorAll('#mode-group button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  logEntry('info', 'Mode: ' + mode);
+});
+
+// ===== Stop =====
+document.getElementById('stop-btn').addEventListener('click', async () => {
+  try {
+    const res = await fetch(API_URL + '/api/command/stop', { method: 'POST' });
+    const data = await res.json();
+    commandBusy = false;
+    updateCmdStatus('idle', '');
+    logEntry('warn', 'Stop: ' + data.message);
+  } catch (e) {
+    logEntry('error', 'Stop failed: ' + e.message);
+  }
+});
+
+// ===== Viewer click handling =====
+const viewportOverlay = document.getElementById('viewport-overlay');
+viewportOverlay.addEventListener('contextmenu', (e) => e.preventDefault());
+viewportOverlay.addEventListener('click', async (e) => {
+  const rect = viewportOverlay.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+
+  // Try to resolve pixel through backend targeting
+  const target = await resolvePixel(x, y, rect.width, rect.height);
+  if (target) {
+    lastTarget = target;
+    updateTargetPreview(target);
+    dispatchCommand(currentMode, target);
+  } else {
+    logEntry('warn', 'Could not resolve pixel target at (' + x + ',' + y + ')');
+  }
+});
+
+async function resolvePixel(x, y, overlayWidth, overlayHeight) {
+  // First capture a frame
+  try {
+    const captureRes = await fetch(API_URL + '/api/frame/capture', { method: 'POST' });
+    const captureData = await captureRes.json();
+    if (!captureData.ok) {
+      logEntry('warn', 'Frame capture failed (' + captureRes.status + '): ' + captureData.message);
+      return null;
+    }
+    logEntry('info', 'Frame captured: ' + captureData.frameId);
+
+    // Scale overlay CSS pixels into captured-frame pixel space
+    const frameWidth = captureData.metadata && captureData.metadata.width ? captureData.metadata.width : overlayWidth;
+    const frameHeight = captureData.metadata && captureData.metadata.height ? captureData.metadata.height : overlayHeight;
+    const fx = Math.round(x * frameWidth / overlayWidth);
+    const fy = Math.round(y * frameHeight / overlayHeight);
+
+    // Resolve pixel on captured frame
+    const resolveBody = JSON.stringify({ frameId: captureData.frameId, x: fx, y: fy, maxDistance: 60 });
+    const resolveRes = await fetch(API_URL + '/api/targeting/resolve-pixel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: resolveBody
+    });
+    const resolveData = await resolveRes.json();
+    if (resolveRes.status !== 200) {
+      logEntry('error', 'Resolve-pixel ' + resolveRes.status + ': ' + JSON.stringify(resolveData));
+      return null;
+    }
+    if (resolveData.ok) {
+      return {
+        position: resolveData.block || resolveData.target,
+        name: resolveData.blockName || resolveData.name,
+        face: resolveData.face,
+        distance: resolveData.distance,
+        frameId: captureData.frameId
+      };
+    }
+    logEntry('warn', 'Pixel resolve: ' + resolveData.message);
+    return null;
+  } catch (e) {
+    logEntry('error', 'Target resolution failed: ' + e.message);
+    return null;
+  }
+}
+
+function updateTargetPreview(target) {
+  document.getElementById('tp-block').textContent = target.name || '-';
+  const p = target.position;
+  document.getElementById('tp-pos').textContent = p ? [p.x, p.y, p.z].join(' ') : '-';
+  document.getElementById('tp-face').textContent = target.face ? [target.face.x, target.face.y, target.face.z].join(' ') : '-';
+  document.getElementById('tp-dist').textContent = target.distance != null ? target.distance.toFixed(1) : '-';
+}
+
+// ===== Command dispatch =====
+async function dispatchCommand(mode, target) {
+  const destructive = ['mine', 'place'].includes(mode);
+  const needsConfirm = destructive && document.getElementById('confirm-toggle').checked;
+
+  const cmdInfo = getCommandPayload(mode, target);
+  if (!cmdInfo) {
+    logEntry('error', 'Unknown mode: ' + mode);
+    return;
+  }
+
+  if (needsConfirm) {
+    showConfirm(mode, target, cmdInfo);
+    return;
+  }
+
+  await sendCommand(cmdInfo);
+}
+
+function getCommandPayload(mode, target) {
+  const p = target.position;
+  switch (mode) {
+    case 'look':
+      return { url: '/api/command/look-at', body: { target: p }, name: 'look-at' };
+    case 'walk':
+      return { url: '/api/command/walk-to', body: { target: p, tolerance: 1.5 }, name: 'walk-to' };
+    case 'mine':
+      return { url: '/api/command/mine-block', body: { block: p, walkIntoRange: true }, name: 'mine-block' };
+    case 'place':
+      return { url: '/api/command/place-block', body: { referenceBlock: p, face: target.face || { x: 0, y: 1, z: 0 }, walkIntoRange: true }, name: 'place-block' };
+    case 'use':
+      return { url: '/api/command/use-block', body: { block: p, walkIntoRange: true }, name: 'use-block' };
+    case 'inspect':
+      return { url: '/api/command/inspect', body: { block: p }, name: 'inspect' };
+    default:
+      return null;
+  }
+}
+
+async function sendCommand(cmdInfo) {
+  if (commandBusy) {
+    logEntry('warn', 'Command busy, rejecting: ' + cmdInfo.name);
+    return;
+  }
+  try {
+    const res = await fetch(API_URL + cmdInfo.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cmdInfo.body)
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', cmdInfo.name + ': ' + (data.message || JSON.stringify(data)));
+    if (res.status === 409) {
+      logEntry('warn', 'Command conflict: another command is running');
+    }
+    if (cmdInfo.name === 'inspect' && data.ok) {
+      updateTargetPreview({
+        name: data.blockName || data.name || '-',
+        position: data.block || data.position || { x: 0, y: 0, z: 0 },
+        face: data.face || null,
+        distance: data.distance || 0
+      });
+    }
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', cmdInfo.name + ' failed: ' + e.message);
+  }
+}
+
+// ===== Confirm dialog =====
+function showConfirm(mode, target, cmdInfo) {
+  pendingCommand = cmdInfo;
+  document.getElementById('confirm-title').textContent = 'Confirm: ' + mode;
+  const p = target.position;
+  document.getElementById('confirm-detail').textContent =
+    mode + ' block ' + (target.name || 'unknown') + ' at [' + (p ? p.x + ',' + p.y + ',' + p.z : '?') + ']';
+  document.getElementById('confirm-overlay').classList.add('visible');
+}
+
+function cancelCommand() {
+  pendingCommand = null;
+  document.getElementById('confirm-overlay').classList.remove('visible');
+}
+
+function executePendingCommand() {
+  const cmd = pendingCommand;
+  pendingCommand = null;
+  document.getElementById('confirm-overlay').classList.remove('visible');
+  if (cmd) sendCommand(cmd);
+}
+
+// ===== Chat =====
+function addChatMessage(username, message) {
+  const el = document.getElementById('chat-messages');
+  const div = document.createElement('div');
+  div.innerHTML = '<span style="color:var(--warn)">' + username + '</span>: ' + message;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  try {
+    const res = await fetch(API_URL + '/api/chat/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      addChatMessage('Me', text);
+    } else {
+      logEntry('error', 'Chat send failed: ' + data.message);
+    }
+  } catch (e) {
+    logEntry('error', 'Chat send error: ' + e.message);
+  }
+}
+
+// ===== Action log =====
+function logEntry(level, message) {
+  const el = document.getElementById('action-log');
+  const div = document.createElement('div');
+  div.className = 'log-entry log-' + (level || 'info');
+  const time = new Date().toLocaleTimeString();
+  div.innerHTML = '<span style="color:var(--muted)">[' + time + ']</span> ' + message;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  // Keep log size bounded
+  while (el.children.length > 200) {
+    el.removeChild(el.firstChild);
+  }
+}
+
+// ===== Crafting =====
+function handleCraftingWindowChanged(windowType) {
+  if (windowType === 'crafting_table') {
+    craftingGridSize = 3;
+    gridItems = new Array(9).fill(null);
+    renderCraftingGrid();
+    logEntry('info', 'Crafting table window opened (3x3 grid)');
+  } else if (windowType === 'furnace') {
+    logEntry('info', 'Furnace window opened');
+  } else if (windowType === null) {
+    // Window closed — reset to inventory crafting
+    craftingGridSize = 2;
+    gridItems = new Array(4).fill(null);
+    renderCraftingGrid();
+    logEntry('info', 'Crafting window closed (2x2 grid)');
+  }
+}
+
+function initCraftingGrid() {
+  gridItems = new Array(4).fill(null);
+  renderCraftingGrid();
+}
+
+function renderCraftingGrid() {
+  const grid = document.getElementById('crafting-grid');
+  grid.className = craftingGridSize === 3 ? 'grid-3x3' : 'grid-2x2';
+  const size = craftingGridSize * craftingGridSize;
+  grid.innerHTML = '';
+  const displayItems = gridItems.slice(0, size);
+  for (let i = 0; i < size; i++) {
+    const slot = document.createElement('div');
+    slot.className = 'crafting-slot' + (displayItems[i] ? ' filled' : '');
+    if (displayItems[i]) {
+      slot.innerHTML = '<span>' + displayItems[i].itemName.substring(0, 10) + '</span><span style="color:var(--muted)">x' + displayItems[i].count + '</span>';
+    } else {
+      slot.innerHTML = '<span style="color:var(--muted)">+</span>';
+    }
+    slot.onclick = () => setCraftingSlot(i);
+    slot.oncontextmenu = (e) => { e.preventDefault(); clearCraftingSlot(i); };
+    grid.appendChild(slot);
+  }
+
+  // Update output display
+  const output = document.getElementById('craft-output');
+  output.innerHTML = '?';
+}
+
+function setCraftingSlot(index) {
+  if (!selectedItem) {
+    logEntry('warn', 'No item selected. Click an inventory item first.');
+    return;
+  }
+  const size = craftingGridSize * craftingGridSize;
+  if (index >= size) return;
+  if (gridItems.length < size) gridItems.length = size;
+  gridItems[index] = { itemName: selectedItem.name, count: 1 };
+  renderCraftingGrid();
+}
+
+function clearCraftingSlot(index) {
+  gridItems[index] = null;
+  renderCraftingGrid();
+}
+
+async function craftingSetGrid() {
+  const filled = gridItems.filter(Boolean);
+  if (filled.length === 0) {
+    logEntry('warn', 'Crafting grid is empty');
+    return;
+  }
+  try {
+    const res = await fetch(API_URL + '/api/crafting/set-grid', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grid: filled })
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Set grid: ' + data.message);
+    if (data.ok && data.output) {
+      document.getElementById('craft-output').innerHTML =
+        '<span>' + data.output.name.substring(0, 10) + '</span><span>x' + data.output.count + '</span>';
+    }
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', 'Set grid failed: ' + e.message);
+  }
+}
+
+async function craftingTakeOutput() {
+  try {
+    const res = await fetch(API_URL + '/api/crafting/take-output', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Take output: ' + data.message);
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', 'Take output failed: ' + e.message);
+  }
+}
+
+async function craftingClearGrid() {
+  try {
+    const res = await fetch(API_URL + '/api/crafting/clear-grid', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Clear grid: ' + data.message);
+    gridItems = new Array(craftingGridSize * craftingGridSize).fill(null);
+    renderCraftingGrid();
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', 'Clear grid failed: ' + e.message);
+  }
+}
+
+async function craftingOpenInventory() {
+  try {
+    const res = await fetch(API_URL + '/api/crafting/open-inventory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Open inventory: ' + data.message);
+    craftingGridSize = 2;
+    gridItems = new Array(4).fill(null);
+    renderCraftingGrid();
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', 'Open inventory failed: ' + e.message);
+  }
+}
+
+async function craftingOpenTable() {
+  try {
+    const res = await fetch(API_URL + '/api/crafting/open-crafting-table', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ maxDistance: 5 })
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Open table: ' + data.message);
+    if (data.ok) {
+      craftingGridSize = 3;
+      gridItems = new Array(9).fill(null);
+      renderCraftingGrid();
+    }
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', 'Open table failed: ' + e.message);
+  }
+}
+
+async function craftingCloseWindow() {
+  try {
+    const res = await fetch(API_URL + '/api/crafting/close-window', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Close window: ' + data.message);
+    // Reset grid to 2x2 (inventory crafting) when window is closed
+    craftingGridSize = 2;
+    gridItems = new Array(4).fill(null);
+    renderCraftingGrid();
+    refreshInventory();
+  } catch (e) {
+    logEntry('error', 'Close window failed: ' + e.message);
+  }
+}
+
+// ===== Fine control =====
+async function fineSend(action) {
+  if (commandBusy) return;
+
+  // Handle look rotation (yaw/pitch)
+  if (action.yaw !== undefined || action.pitch !== undefined) {
+    try {
+      const res = await fetch(API_URL + '/api/command/rotate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          yaw: action.yaw || 0,
+          pitch: action.pitch || 0
+        })
+      });
+      const data = await res.json();
+      logEntry(data.ok ? 'info' : 'error', 'Rotate: ' + (data.message || JSON.stringify(data)));
+    } catch (e) {
+      logEntry('error', 'Rotate failed: ' + e.message);
+    }
+    return;
+  }
+
+  const controls = {};
+  const duration = window._fcDuration;
+
+  if (action.forward) controls.forward = true;
+  if (action.back) controls.back = true;
+  if (action.left) controls.left = true;
+  if (action.right) controls.right = true;
+  if (action.jump) controls.jump = true;
+  if (action.sneak) controls.sneak = true;
+  if (action.sprint) controls.sprint = true;
+
+  if (action.up) { controls.forward = true; controls.jump = true; }
+  if (action.down) { controls.back = true; }
+
+  try {
+    const res = await fetch(API_URL + '/api/command/fine-control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ controls, durationMs: duration })
+    });
+    const data = await res.json();
+    logEntry(data.ok ? 'info' : 'error', 'Fine control: ' + (data.message || JSON.stringify(data)));
+  } catch (e) {
+    logEntry('error', 'Fine control failed: ' + e.message);
+  }
+}
+
+async function fineStop() {
+  try {
+    await fetch(API_URL + '/api/command/stop', { method: 'POST' });
+    commandBusy = false;
+    updateCmdStatus('idle', '');
+    logEntry('warn', 'Fine control stopped');
+  } catch (e) {
+    logEntry('error', 'Fine stop failed: ' + e.message);
+  }
+}
+
+// ===== Panel toggle =====
+function togglePanel(panelId) {
+  const body = document.querySelector('#' + panelId + ' .panel-body');
+  body.classList.toggle('collapsed');
+}
+
+// ===== Init =====
+function init() {
+  // Set initial mode
+  currentMode = 'look';
+  document.querySelector('[data-mode="look"]').classList.add('active');
+
+  // Init crafting grid
+  initCraftingGrid();
+
+  // Connect WebSocket
+  connectWebSocket();
+
+  // Periodic inventory refresh
+  setInterval(refreshInventory, 3000);
+
+  // Fetch health to resolve viewer URL, then state
+  fetch(API_URL + '/api/health')
+    .then(r => r.json())
+    .then(health => {
+      if (health.viewer && health.viewer.url) {
+        VIEWER_URL = health.viewer.url;
+      }
+      document.getElementById('viewer-frame').src = VIEWER_URL;
+    })
+    .catch(() => {
+      document.getElementById('viewer-frame').src = VIEWER_URL;
+    });
+
+  // Try initial state fetch
+  fetch(API_URL + '/api/state')
+    .then(r => r.json())
+    .then(data => {
+      botState = data;
+      updateStateDisplay();
+      if (data.connected) {
+        setStatus('Connected', true);
+        // Sync orientation on connect so tracked yaw/pitch matches bot.entity
+        fetch(API_URL + '/api/command/sync-orientation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        })
+        .then(r => r.json())
+        .then(data => {
+          if (data.ok) {
+            logEntry('info', 'Orientation synced: yaw=' + data.yaw.toFixed(1) + ' pitch=' + data.pitch.toFixed(1));
+          }
+        })
+        .catch(() => {}); // Non-critical
+      } else {
+        setStatus('Bot not spawned', false);
+      }
+    })
+    .catch(() => logEntry('error', 'Initial state fetch failed'));
+
+  // Refresh inventory on load
+  setTimeout(refreshInventory, 2000);
+}
+
+
+init();
+</script>
+</body>
+</html>

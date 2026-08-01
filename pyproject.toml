@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pm-minecraft-mcp"
+version = "0.1.0"
+description = "A self-contained Mineflayer Minecraft body and MCP server"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastmcp==3.4.4",
+    "pydantic>=2.9,<3",
+    "requests>=2.32,<3",
+    "ruamel-yaml>=0.18,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"mcp/minecraft_mcp.py" = ["E501"]
