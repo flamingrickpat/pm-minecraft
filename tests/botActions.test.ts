@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Vec3 } from "vec3";
-import { createPhysicalCommandActions, summarizeNavigation } from "../src/bot/actions.js";
+import { configureNavigationMovements, createPhysicalCommandActions, summarizeNavigation } from "../src/bot/actions.js";
 
 describe("navigation diagnostics", () => {
   it("reports route shape and planned world modifications", () => {
@@ -32,6 +32,63 @@ describe("navigation diagnostics", () => {
       false
     );
     expect(report.diagnosis).toContain("staircase or tunnel");
+  });
+
+  it("reports walk-only limits without suggesting destructive recovery", () => {
+    const report = summarizeNavigation(
+      { status: "noPath", path: [] },
+      { x: 0, y: 64, z: 0 },
+      { x: 0, y: 66, z: 0 },
+      false,
+      "walk_only"
+    );
+
+    expect(report).toMatchObject({ profile: "walk_only" });
+    expect(report.diagnosis).toContain("no existing ascent");
+    expect(report.diagnosis).not.toContain("staircase");
+  });
+
+  it("configures walk-only movement without destructive pathfinder capabilities", () => {
+    const movements = {
+      canDig: true,
+      allow1by1towers: true,
+      allowParkour: true,
+      scafoldingBlocks: [1, 2],
+      maxDropDown: 4,
+      infiniteLiquidDropdownDistance: true
+    };
+
+    const configured = configureNavigationMovements(movements as never, "walk_only");
+
+    expect(configured).toMatchObject({
+      canDig: false,
+      allow1by1towers: false,
+      allowParkour: false,
+      scafoldingBlocks: [],
+      maxDropDown: 1,
+      infiniteLiquidDropdownDistance: false
+    });
+  });
+
+  it("preserves adaptive movement defaults", () => {
+    const movements = {
+      canDig: true,
+      allow1by1towers: true,
+      allowParkour: true,
+      scafoldingBlocks: [1, 2],
+      maxDropDown: 4,
+      infiniteLiquidDropdownDistance: true
+    };
+
+    expect(configureNavigationMovements(movements as never, "adaptive")).toBe(movements);
+    expect(movements).toEqual({
+      canDig: true,
+      allow1by1towers: true,
+      allowParkour: true,
+      scafoldingBlocks: [1, 2],
+      maxDropDown: 4,
+      infiniteLiquidDropdownDistance: true
+    });
   });
 });
 

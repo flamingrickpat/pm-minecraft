@@ -2,7 +2,7 @@ import type { Bot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { CommandResult } from "../commands/commandQueue.js";
-import type { FindBlockInput, JumpPlaceBlockInput, MineBlockInput, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
+import type { FindBlockInput, JumpPlaceBlockInput, MineBlockInput, NavigationProfile, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
 import { isVisibleFromHead } from "../perception/visibility.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
@@ -17,7 +17,7 @@ export type PathfinderUpdate = {
 };
 
 export interface NavigationReport {
-  profile: "adaptive";
+  profile: NavigationProfile;
   pathStatus: string;
   pathNodes: number;
   ascents: number;
@@ -152,9 +152,9 @@ export function createPhysicalCommandActions(bot: Bot): PhysicalCommandActions {
       // or when the UI needs to re-establish the baseline orientation.
       syncTrackedFromEntity();
     },
-    walkTo: async ({ target, tolerance }) => {
+    walkTo: async ({ target, tolerance, profile = "adaptive" }) => {
       try {
-        const navigation = await gotoNear(bot, target, tolerance);
+        const navigation = await gotoNear(bot, target, tolerance, profile);
         return { ok: true, message: "Reached target.", data: { status: "reached", position: vector(bot.entity.position), target, navigation } };
       } catch (error) {
         return {
@@ -573,7 +573,12 @@ export function installPathfinder(bot: Bot): void {
   }
 }
 
-async function gotoNear(bot: Bot, target: Vector3, tolerance: number): Promise<NavigationReport> {
+async function gotoNear(
+  bot: Bot,
+  target: Vector3,
+  tolerance: number,
+  profile: NavigationProfile = "adaptive"
+): Promise<NavigationReport> {
   const pathfinderBot = bot as Bot & {
     pathfinder?: {
       goto(goal: PathfinderGoal): Promise<void>;
@@ -606,16 +611,14 @@ async function gotoNear(bot: Bot, target: Vector3, tolerance: number): Promise<N
     }
   }, 500);
 
-  // Preserve mineflayer-pathfinder's proven adaptive defaults: it may dig,
-  // place blocks/tower, take ordinary steps, parkour, and drop up to four blocks.
-  pathfinderBot.pathfinder.setMovements(new Movements(bot));
+  pathfinderBot.pathfinder.setMovements(configureNavigationMovements(new Movements(bot), profile));
   try {
     await pathfinderBot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, tolerance));
     const position = bot.entity.position;
     const dx = Math.floor(target.x) - Math.floor(position.x);
     const dy = Math.floor(target.y) - Math.floor(position.y);
     const dz = Math.floor(target.z) - Math.floor(position.z);
-    const report = summarizeNavigation(update, start, target, stalled);
+    const report = summarizeNavigation(update, start, target, stalled, profile);
     if ((dx * dx + dy * dy + dz * dz) > tolerance * tolerance) {
       throw new NavigationFailure(
         `Pathfinder stopped without reaching goal: position ${JSON.stringify(vector(position))}, ` +
@@ -628,7 +631,7 @@ async function gotoNear(bot: Bot, target: Vector3, tolerance: number): Promise<N
     if (error instanceof NavigationFailure) {
       throw error;
     }
-    const report = summarizeNavigation(update, start, target, stalled);
+    const report = summarizeNavigation(update, start, target, stalled, profile);
     throw new NavigationFailure(`${errorMessage(error)} ${report.diagnosis}`, report);
   } finally {
     clearInterval(progressTimer);
@@ -636,7 +639,28 @@ async function gotoNear(bot: Bot, target: Vector3, tolerance: number): Promise<N
   }
 }
 
-export function summarizeNavigation(update: PathfinderUpdate, start: Vector3, target: Vector3, stalled: boolean): NavigationReport {
+export function configureNavigationMovements(
+  movements: InstanceType<typeof Movements>,
+  profile: NavigationProfile
+): InstanceType<typeof Movements> {
+  if (profile === "walk_only") {
+    movements.canDig = false;
+    movements.allow1by1towers = false;
+    movements.allowParkour = false;
+    movements.scafoldingBlocks = [];
+    movements.maxDropDown = 1;
+    movements.infiniteLiquidDropdownDistance = false;
+  }
+  return movements;
+}
+
+export function summarizeNavigation(
+  update: PathfinderUpdate,
+  start: Vector3,
+  target: Vector3,
+  stalled: boolean,
+  profile: NavigationProfile = "adaptive"
+): NavigationReport {
   let ascents = 0;
   let drops = 0;
   let blocksToBreak = 0;
@@ -650,22 +674,26 @@ export function summarizeNavigation(update: PathfinderUpdate, start: Vector3, ta
     previous = move;
   }
   const verticalDelta = target.y - start.y;
-  let diagnosis = "adaptive route completed";
+  let diagnosis = `${profile} route completed`;
   if (stalled) {
     diagnosis = "route found, but the character made no physical progress for 6 seconds";
   } else if (update.status === "noPath" && verticalDelta > 1) {
-    diagnosis = "adaptive pathfinding found no ascent; a deliberate staircase or tunnel may be required";
-  } else if (update.status === "noPath" && verticalDelta < -4) {
-    diagnosis = "adaptive pathfinding found no descent; the required drop may exceed four blocks";
+    diagnosis = profile === "walk_only"
+      ? "walk-only pathfinding found no existing ascent within the movement limits"
+      : "adaptive pathfinding found no ascent; a deliberate staircase or tunnel may be required";
+  } else if (update.status === "noPath" && verticalDelta < (profile === "walk_only" ? -1 : -4)) {
+    diagnosis = `${profile} pathfinding found no descent; the required drop exceeds the profile limit`;
   } else if (update.status === "noPath") {
-    diagnosis = "no route exists through the currently loaded terrain, even with digging and block placement enabled";
+    diagnosis = profile === "walk_only"
+      ? "no route exists through loaded walkable terrain without digging, placing, parkour, or a drop over one block"
+      : "no route exists through the currently loaded terrain, even with digging and block placement enabled";
   } else if (update.status === "timeout") {
     diagnosis = "path search exhausted its computation budget";
   } else if (update.status !== "success") {
     diagnosis = `pathfinder ended with status ${update.status}`;
   }
   return {
-    profile: "adaptive",
+    profile,
     pathStatus: update.status,
     pathNodes: update.path.length,
     ascents,

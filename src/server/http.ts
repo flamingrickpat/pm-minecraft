@@ -1200,7 +1200,7 @@ function parseLook(body: Record<string, unknown>): Parsed<{ yaw: number; pitch: 
   return { ok: true, value: { yaw, pitch } };
 }
 
-function parseWalkTo(body: Record<string, unknown>): Parsed<{ target: Vector3; tolerance: number }> {
+function parseWalkTo(body: Record<string, unknown>): Parsed<{ target: Vector3; tolerance: number; profile: "adaptive" | "walk_only" }> {
   const target = parseVector(body.target, "target", false);
   if (!target.ok) {
     return target;
@@ -1209,7 +1209,11 @@ function parseWalkTo(body: Record<string, unknown>): Parsed<{ target: Vector3; t
   if (!tolerance.ok) {
     return tolerance;
   }
-  return { ok: true, value: { target: target.value, tolerance: tolerance.value } };
+  const profile = body.profile ?? "adaptive";
+  if (profile !== "adaptive" && profile !== "walk_only") {
+    return { ok: false, error: "invalid_navigation_profile", message: "profile must be adaptive or walk_only." };
+  }
+  return { ok: true, value: { target: target.value, tolerance: tolerance.value, profile } };
 }
 
 function parseMineBlock(body: Record<string, unknown>): Parsed<{ block: Vector3; walkIntoRange: boolean }> {

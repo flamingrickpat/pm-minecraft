@@ -91,6 +91,21 @@ different observation when it cannot see the target. For long-range planning,
 set `require_visible: false`; the result is a loaded-world location only and
 must still be reached and visibly verified before mining.
 
+## Navigation profiles
+
+`minecraft_walk_to` uses the `adaptive` profile by default. This profile keeps
+the existing behavior. It can dig, place scaffold blocks, use towers, use
+parkour, and drop as many as four blocks to reach the target.
+
+Set `profile: walk_only` when the route must not change blocks. This profile
+disables digging, scaffold placement, towers, and parkour. It also limits drops
+to one block and disables unlimited liquid drops. The command fails if no such
+route exists.
+
+`walk_only` does not guarantee that inventory stays unchanged. The character
+can still pick up an item that is on the route. Compare before-state and
+after-state inventory when that postcondition is required.
+
 ## Cool stuff
 
 Here is the WebUI where you can manually control the character or look at how the coding agent uses the MCP.

@@ -7,7 +7,10 @@ export interface Vector3 {
 export interface WalkToInput {
   target: Vector3;
   tolerance: number;
+  profile?: NavigationProfile;
 }
+
+export type NavigationProfile = "adaptive" | "walk_only";
 
 export interface BlockCommandOptions {
   walkIntoRange: boolean;

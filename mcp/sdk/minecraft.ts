@@ -4,6 +4,8 @@ export interface Vector3 {
   z: number;
 }
 
+export type NavigationProfile = "adaptive" | "walk_only";
+
 export interface InventoryItem {
   name: string;
   count: number;
@@ -72,7 +74,7 @@ export interface MinecraftContext {
   call(action: string, parameters?: Record<string, unknown>, timeoutSeconds?: number): Promise<MinecraftResponse>;
   observe(): Promise<MinecraftObservation>;
   findBlock(blockName: string, maxDistance?: number): Promise<MinecraftResponse>;
-  walkTo(target: Vector3, tolerance?: number, timeoutSeconds?: number): Promise<MinecraftResponse>;
+  walkTo(target: Vector3, tolerance?: number, timeoutSeconds?: number, profile?: NavigationProfile): Promise<MinecraftResponse>;
   mineBlock(block: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
   placeBlock(referenceBlock: Vector3, face: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
   useBlock(block: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;

@@ -156,6 +156,35 @@ describe("physical command HTTP routes", () => {
     });
   });
 
+  it("routes the non-destructive walk-only profile", async () => {
+    await withCommandServer(async ({ port, actions }) => {
+      const response = await post(port, "/api/command/walk-to", {
+        target: { x: 2, y: 64, z: 2 },
+        profile: "walk_only"
+      });
+
+      expect(response.status).toBe(200);
+      expect(actions.walkTo).toHaveBeenCalledWith({
+        target: { x: 2, y: 64, z: 2 },
+        tolerance: 1.5,
+        profile: "walk_only"
+      });
+    });
+  });
+
+  it("rejects unknown navigation profiles before queueing an action", async () => {
+    await withCommandServer(async ({ port, actions }) => {
+      const response = await post(port, "/api/command/walk-to", {
+        target: { x: 2, y: 64, z: 2 },
+        profile: "creative_flight"
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: "invalid_navigation_profile" });
+      expect(actions.walkTo).not.toHaveBeenCalled();
+    });
+  });
+
   it("exposes read-only inspect without acquiring the physical command slot", async () => {
     await withCommandServer(async ({ port, actions }) => {
       let finishWalk!: () => void;

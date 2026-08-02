@@ -399,6 +399,7 @@ class BodyApi:
         "walk_to": {
             "target": {"x": "number", "y": "number", "z": "number"},
             "tolerance": "positive number",
+            "profile": "adaptive|walk_only; adaptive preserves the existing destructive-capable pathfinder default",
         },
         "mine_block": {
             "block": {"x": "integer", "y": "integer", "z": "integer"},
@@ -2570,13 +2571,18 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         y: float,
         z: float,
         tolerance: float = 1.5,
+        profile: Literal["adaptive", "walk_only"] = "adaptive",
         timeout_seconds: float = 60,
         include_image: bool = False,
     ) -> ToolResult:
-        """Walk using state-based adaptive pathfinding, including steps, safe drops, digging, block placement, and parkour. Returns route diagnostics."""
+        """Walk with adaptive pathfinding by default. Use walk_only to forbid digging, block placement, towers, parkour, and drops over one block."""
         return await runtime.call_tool(
             "walk_to",
-            {"target": {"x": x, "y": y, "z": z}, "tolerance": tolerance},
+            {
+                "target": {"x": x, "y": y, "z": z},
+                "tolerance": tolerance,
+                "profile": profile,
+            },
             timeout_seconds,
             include_image,
         )
