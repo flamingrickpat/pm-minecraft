@@ -42,6 +42,7 @@ I have never modded Minecraft manually, what works for me:
     - CompleteConfig
     - Mod Menu
     - Multiplayer Server Pause (Forge)
+    - item-pickup-range by wenhao (/setPickupRange 5)
 - Make Survival World, Cheats Enabled, Peaceful
 - Enter and "Open to LAN" on Port 12345
 
