@@ -35,7 +35,6 @@ MATERIAL_ACTIONS = frozenset(
         "craft_item",
         "execute_typescript",
         "fine_control",
-        "fine_control_mine",
         "find_block",
         "mine_block",
         "pillar_up",
@@ -60,12 +59,26 @@ def material_action_key(
     action: str,
     parameters: dict[str, Any],
 ) -> str:
-    if action != "fine_control":
+    """Return the identity used to count repeated no-progress attempts.
+
+    The circuit breaker applies to an identical material operation, not every
+    invocation of a tool.  A new target or other argument is a new attempt and
+    must therefore begin with its own no-gain count.
+    """
+    if action not in MATERIAL_ACTIONS:
         return action
-    controls = parameters.get("controls")
-    if isinstance(controls, dict) and controls.get("mine") is True:
-        return "fine_control_mine"
-    return action
+    serialized_parameters = json.dumps(
+        parameters,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"{action}\x1f{serialized_parameters}"
+
+
+def material_action_name(action_key: str) -> str:
+    """Extract the user-facing tool name from a material attempt key."""
+    return action_key.partition("\x1f")[0]
 
 
 def navigation_cell(
@@ -839,7 +852,7 @@ class MinecraftMcpRuntime:
 
     def _material_action_blocked(self, action: str) -> bool:
         return (
-            action in MATERIAL_ACTIONS
+            material_action_name(action) in MATERIAL_ACTIONS
             and self.material_no_gain_by_action.get(action, 0)
             >= MATERIAL_NO_GAIN_REASSESSMENT_THRESHOLD
         )
@@ -941,12 +954,13 @@ class MinecraftMcpRuntime:
 
     def _progress_signal(
         self,
-        action: str,
+        action_key: str,
         delta: dict[str, Any],
         *,
         progress_observed: bool | None = None,
         relevant_inventory_items: set[str] | None = None,
     ) -> dict[str, Any] | None:
+        action = material_action_name(action_key)
         if action not in MATERIAL_ACTIONS:
             walked_to_new_material_context = (
                 action == "walk_to"
@@ -995,7 +1009,7 @@ class MinecraftMcpRuntime:
                 )
         if progress_observed:
             if action == "find_block":
-                self._reset_action_progress(action)
+                self._reset_action_progress(action_key)
             else:
                 self._reset_material_progress()
             return MaterialProgressSignal(
@@ -1014,10 +1028,10 @@ class MinecraftMcpRuntime:
 
         self.material_no_gain_streak += 1
         same_action_count = (
-            self.material_no_gain_by_action.get(action, 0) + 1
+            self.material_no_gain_by_action.get(action_key, 0) + 1
         )
-        self.material_no_gain_by_action[action] = same_action_count
-        self.material_relevant_items_by_action[action] = relevant_items
+        self.material_no_gain_by_action[action_key] = same_action_count
+        self.material_relevant_items_by_action[action_key] = relevant_items
         return MaterialProgressSignal(
             kind="material_no_gain",
             action=action,
@@ -1031,17 +1045,18 @@ class MinecraftMcpRuntime:
             ),
         ).model_dump(mode="json", by_alias=True)
 
-    def _blocked_progress_signal(self, action: str) -> dict[str, Any]:
+    def _blocked_progress_signal(self, action_key: str) -> dict[str, Any]:
+        action = material_action_name(action_key)
         return MaterialProgressSignal(
             kind="material_action_blocked",
             action=action,
             consecutive_no_gain_count=self.material_no_gain_streak,
             same_action_no_gain_count=self.material_no_gain_by_action[
-                action
+                action_key
             ],
             inventory_changes={},
             relevant_inventory_items=(
-                self.material_relevant_items_by_action.get(action, [])
+                self.material_relevant_items_by_action.get(action_key, [])
             ),
             requires_reassessment=True,
         ).model_dump(mode="json", by_alias=True)
@@ -1302,6 +1317,12 @@ class MinecraftMcpRuntime:
             raise ValueError("timeout_seconds must be positive")
         async with self.lock:
             self.assert_character_active()
+            if action == "fine_control":
+                frame_id = parameters.pop("visualCheckFrameId", None)
+                if not isinstance(frame_id, str) or frame_id not in self.recent_visual_frames:
+                    raise ValueError(
+                        "fine_control requires visualCheckFrameId from a fresh minecraft_observe(include_image=true) call"
+                    )
             progress_action = material_action_key(action, parameters)
             preloaded_before: dict[str, Any] | None = None
             if self._material_action_blocked(progress_action):
@@ -1324,7 +1345,7 @@ class MinecraftMcpRuntime:
                 else:
                     snapshot = await self.snapshot(include_image)
                     if (
-                        progress_action == "walk_to"
+                        material_action_name(progress_action) == "walk_to"
                         and self._claim_no_frontier_recovery_walk(
                             snapshot["observation"],
                             parameters,
@@ -1341,12 +1362,6 @@ class MinecraftMcpRuntime:
                             progress_action=progress_action,
                             target_assessment=target_assessment,
                         )
-            if action == "fine_control":
-                frame_id = parameters.pop("visualCheckFrameId", None)
-                if not isinstance(frame_id, str) or frame_id not in self.recent_visual_frames:
-                    raise ValueError(
-                        "fine_control requires visualCheckFrameId from a fresh minecraft_observe(include_image=true) call"
-                    )
             before = preloaded_before or await self.snapshot(False)
             if action == "walk_to":
                 self._align_observed_navigation_waypoint(
@@ -1436,7 +1451,7 @@ class MinecraftMcpRuntime:
         )
         summary = f"{action}: {result.get('message', envelope['status'])}."
         if (
-            progress_action in MATERIAL_ACTIONS
+            material_action_name(progress_action) in MATERIAL_ACTIONS
             and progress_signal is not None
         ):
             inventory_changes = envelope["stateDelta"]["inventoryChanges"]
@@ -2550,10 +2565,10 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     async def minecraft_find_block(
         block_name: str,
         max_distance: int = 64,
-        require_visible: bool = True,
         include_image: bool = False,
     ) -> ToolResult:
         """Find an exact block; visibility is required by default for realistic perception."""
+        require_visible = True
         return await runtime.call_tool(
             "find_block",
             {
@@ -2570,12 +2585,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         x: float,
         y: float,
         z: float,
-        tolerance: float = 1.5,
-        profile: Literal["adaptive", "walk_only"] = "adaptive",
+        tolerance: float = 3.0,
         timeout_seconds: float = 60,
         include_image: bool = False,
     ) -> ToolResult:
         """Walk with adaptive pathfinding by default. Use walk_only to forbid digging, block placement, towers, parkour, and drops over one block."""
+        profile = "walk_only"
         return await runtime.call_tool(
             "walk_to",
             {
