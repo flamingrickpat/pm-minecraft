@@ -14,6 +14,8 @@ import type { MinecraftMessage } from "./chatInbox.js";
  * fails when: never fatally; sections that cannot be read from the live bot degrade to null/empty.
  * domain: consumed by agents to verify command effects (compare before/after snapshots).
  * invariant: angles are degrees (yaw [0,360) counterclockwise from north, pitch positive up); positions are absolute world coordinates.
+ * invariant: every non-integer coordinate, distance, and angle is rounded to one decimal — sub-decimeter precision
+ * carries no decision value for an agent and only inflates the state it has to read.
  */
 export interface LLMStateSnapshot {
   capturedAt: string;
@@ -64,6 +66,7 @@ export interface LLMStateSnapshot {
       nearest: { x: number; y: number; z: number };
       distance: number;
       canHarvestWithHeldItem: boolean | null;
+      /** Tools that yield drops, cheapest to obtain first, so the first entry is the one worth crafting. */
       harvestToolOptions: string[];
     }>;
     localAirspace: {
@@ -99,6 +102,10 @@ const AIR_BLOCKS = new Set(["air", "cave_air", "void_air"]);
 const MAX_NEARBY_BLOCK_KINDS = 48;
 const MAX_NEARBY_ENTITIES = 20;
 const NEARBY_ENTITY_RADIUS = 16;
+/** Decimals kept for every coordinate, distance, and angle in this snapshot. */
+const DECIMALS = 1;
+/** Harvest tool materials ordered by survival acquisition cost, cheapest first. */
+const HARVEST_TOOL_MATERIALS = ["wooden", "stone", "iron", "golden", "diamond", "netherite"];
 
 interface NavigationWaypoint {
   position: { x: number; y: number; z: number };
@@ -225,7 +232,7 @@ function scanLocalAirspace(
       y: position.y,
       z: position.z
     },
-    distance: round(center.distanceTo(position), 2),
+    distance: round(center.distanceTo(position), DECIMALS),
     clearanceBlocksAboveHead: clearanceAt(position),
     openHorizontalNeighbors: openHorizontalNeighbors(position)
   });
@@ -367,12 +374,12 @@ function buildPlayer(bot: Bot): LLMStateSnapshot["player"] {
   const raw = bot as Bot & { foodSaturation?: number; oxygenLevel?: number; experience?: { level?: number }; game?: { gameMode?: string } };
   return {
     username: bot.username ?? null,
-    position: entity?.position ? roundVec(entity.position, 2) : null,
+    position: entity?.position ? roundVec(entity.position, DECIMALS) : null,
     blockPosition: entity?.position ? roundVec(entity.position.floored(), 0) : null,
     yawDegrees,
-    pitchDegrees: typeof entity?.pitch === "number" ? round(entity.pitch * 180 / Math.PI, 1) : null,
+    pitchDegrees: typeof entity?.pitch === "number" ? round(entity.pitch * 180 / Math.PI, DECIMALS) : null,
     facing: yawDegrees !== null ? compassFacing(yawDegrees) : null,
-    velocity: entity?.velocity ? roundVec(entity.velocity, 3) : null,
+    velocity: entity?.velocity ? roundVec(entity.velocity, DECIMALS) : null,
     onGround: typeof entity?.onGround === "boolean" ? entity.onGround : null,
     health: numberOrNull(bot.health),
     food: numberOrNull(bot.food),
@@ -499,7 +506,7 @@ function scanNearbyBlocks(
       name: entry.name,
       count: entry.count,
       nearest: { x: entry.nearest.x, y: entry.nearest.y, z: entry.nearest.z },
-      distance: round(entry.distance, 2),
+      distance: round(entry.distance, DECIMALS),
       canHarvestWithHeldItem: entry.canHarvestWithHeldItem,
       harvestToolOptions: entry.harvestToolOptions
     }));
@@ -526,7 +533,18 @@ function harvestToolOptions(
     .filter(([, allowed]) => allowed)
     .map(([itemId]) => registry?.items?.[Number(itemId)]?.name)
     .filter((name): name is string => typeof name === "string")
-    .sort();
+    .sort((left, right) => (
+      harvestToolCost(left) - harvestToolCost(right)
+      || left.localeCompare(right)
+    ));
+}
+
+/** Rank a harvest tool by how expensive its material is to obtain in survival. */
+function harvestToolCost(itemName: string): number {
+  const material = HARVEST_TOOL_MATERIALS.findIndex(
+    (candidate) => itemName.startsWith(`${candidate}_`)
+  );
+  return material === -1 ? HARVEST_TOOL_MATERIALS.length : material;
 }
 
 function scanNearbyEntities(bot: Bot, center: Vec3): LLMStateSnapshot["surroundings"]["nearbyEntities"] {
@@ -544,8 +562,8 @@ function scanNearbyEntities(bot: Bot, center: Vec3): LLMStateSnapshot["surroundi
       results.push({
         name: raw.username ?? raw.name ?? raw.displayName ?? "unknown",
         kind: raw.type ?? "unknown",
-        position: roundVec(entity.position, 2),
-        distance: round(distance, 2)
+        position: roundVec(entity.position, DECIMALS),
+        distance: round(distance, DECIMALS)
       });
     }
   } catch {
@@ -591,7 +609,7 @@ function round(value: number, digits: number): number {
 
 function normalizeYaw(degrees: number): number {
   // The trailing modulo keeps values that round up to 360.0 at 0.
-  return round(((degrees % 360) + 360) % 360, 1) % 360;
+  return round(((degrees % 360) + 360) % 360, DECIMALS) % 360;
 }
 
 function numberOrNull(value: unknown): number | null {

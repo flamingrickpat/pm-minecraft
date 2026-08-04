@@ -67,6 +67,12 @@ The initializer creates the agent workspace, `memory/minecraft/`, `drafts/`,
 web UI, Prismarine viewer, and MCP URLs. For multiple characters, use unique
 `-WebPort`, `-ViewerPort`, and `-McpPort` values.
 
+Every `deploy/drafts/*.ts` example is copied into the workspace's `drafts/` and
+listed in its `AGENTS.md`. They run as-is through
+`minecraft_execute_typescript`, so the agent can execute one directly or copy
+its guard-and-verify shape into a new draft. Add an example to `deploy/drafts/`
+to ship it with every new character.
+
 Stop an instance with:
 
 ```powershell
@@ -91,6 +97,25 @@ character's head. An agent must explore, move to a better viewpoint, or use a
 different observation when it cannot see the target. For long-range planning,
 set `require_visible: false`; the result is a loaded-world location only and
 must still be reached and visibly verified before mining.
+
+## Model-visible state
+
+Every tool result carries a compact view of the after-state, and the full
+snapshot is written to `artifacts/minecraft/state` instead of into the context
+window. The compaction rules:
+
+- Coordinates, distances, and angles carry one decimal.
+- A `nearbyBlocks` entry reports `canHarvestWithHeldItem` and
+  `needsHarvestTool` only when the held item cannot harvest it;
+  `needsHarvestTool` is the cheapest tool that works.
+- `localAirspace.openBlocksByDirection` gives open blocks per compass
+  direction, and `boundaryDetail` lists only the boundaries that are not an
+  ordinary wall (a missing direction means solid feet and head).
+- `localAirspace.navigation` waypoints are `{x,y,z,clearance,openNeighbors}`
+  cells that can be passed straight to `walk_to`.
+
+After the first call the results are deltas against the previous compact state;
+`minecraft_observe(full_state=true)` resets that baseline.
 
 ## Navigation profiles
 

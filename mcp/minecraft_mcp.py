@@ -29,6 +29,11 @@ TEMPLATE_DIR = MCP_DIR / "templates"
 RUNNER_PATH = MCP_DIR / "ts_runner.ts"
 COLLECT_BLOCKS_PRIMITIVE = MCP_DIR / "primitives" / "collect_blocks.ts"
 MAX_TYPESCRIPT_TIMEOUT_SECONDS = 90.0
+# Caps on the model-visible state. The full snapshot stays on disk under
+# artifacts/minecraft/state; these bound what every tool result has to carry.
+COMPACT_NEARBY_BLOCK_KINDS = 12
+COMPACT_NEARBY_ENTITIES = 8
+COMPACT_FRONTIER_WAYPOINTS = 4
 MATERIAL_ACTIONS = frozenset(
     {
         "collect_blocks",
@@ -2087,6 +2092,106 @@ def screenshot_reference(frame: Any) -> dict[str, Any] | None:
     )
 
 
+def compact_waypoint(waypoint: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a navigation waypoint to the fields that pick a destination.
+
+    The nested position object and the distance are dropped: the coordinates are
+    what a walk_to call needs, and the distance only restates them against a
+    player position the same state already carries.
+    """
+    position = waypoint.get("position")
+    if not isinstance(position, dict):
+        position = {}
+    return {
+        "x": position.get("x"),
+        "y": position.get("y"),
+        "z": position.get("z"),
+        "clearance": waypoint.get("clearanceBlocksAboveHead"),
+        "openNeighbors": waypoint.get("openHorizontalNeighbors"),
+    }
+
+
+def compact_navigation(navigation: dict[str, Any]) -> dict[str, Any]:
+    frontier = navigation.get("frontierWaypoints")
+    elevation = navigation.get("elevationRange")
+    if not isinstance(elevation, dict):
+        elevation = {}
+    compact: dict[str, Any] = {
+        "reachableStandableCells": navigation.get("reachableStandableCells"),
+        "elevationDeltaRange": [
+            elevation.get("minimumDelta"),
+            elevation.get("maximumDelta"),
+        ],
+    }
+    for role, key in (
+        ("highest", "highestWaypoint"),
+        ("maxClearance", "maxClearanceWaypoint"),
+        ("furthest", "furthestWaypoint"),
+    ):
+        waypoint = navigation.get(key)
+        if isinstance(waypoint, dict):
+            compact[role] = compact_waypoint(waypoint)
+    compact["frontier"] = [
+        compact_waypoint(waypoint)
+        for waypoint in (frontier if isinstance(frontier, list) else [])[
+            :COMPACT_FRONTIER_WAYPOINTS
+        ]
+        if isinstance(waypoint, dict)
+    ]
+    return compact
+
+
+def compact_local_airspace(airspace: Any) -> dict[str, Any]:
+    """Restate the airspace scan without the parts an agent can already infer.
+
+    Every direction's `delta` repeats its compass name, and an ordinary wall
+    repeats the open-block count that already stops there.  Only the count per
+    direction, the boundaries that are *not* an ordinary wall, and the reachable
+    waypoints change a decision.  `boundaryDetail` stays present even when empty
+    so a delta can report that a boundary disappeared.
+    """
+    if not isinstance(airspace, dict):
+        airspace = {}
+    open_blocks: dict[str, Any] = {}
+    boundaries: dict[str, str] = {}
+    openings = airspace.get("horizontalOpenings")
+    for opening in openings if isinstance(openings, list) else []:
+        direction = opening.get("direction")
+        if not isinstance(direction, str):
+            continue
+        open_blocks[direction] = opening.get("openBlocks")
+        boundary = opening.get("firstBlockedBy")
+        if isinstance(boundary, dict) and (
+            boundary.get("feet") != "solid" or boundary.get("head") != "solid"
+        ):
+            boundaries[direction] = (
+                f"feet={boundary.get('feet')},head={boundary.get('head')}"
+            )
+    navigation = airspace.get("navigationSummary")
+    return {
+        "scanRadius": airspace.get("scanRadius", 0),
+        "clearanceBlocksAboveHead": airspace.get("clearanceBlocksAboveHead", 0),
+        "openBlocksByDirection": open_blocks,
+        "boundaryDetail": boundaries,
+        "navigation": compact_navigation(
+            navigation if isinstance(navigation, dict) else {}
+        ),
+    }
+
+
+def compact_nearby_block(block: dict[str, Any]) -> dict[str, Any]:
+    """Keep harvest guidance only where the held item is not already enough."""
+    compact = {
+        key: block.get(key) for key in ("name", "count", "nearest", "distance")
+    }
+    if block.get("canHarvestWithHeldItem") is False:
+        compact["canHarvestWithHeldItem"] = False
+        options = block.get("harvestToolOptions")
+        if isinstance(options, list) and options:
+            compact["needsHarvestTool"] = options[0]
+    return compact
+
+
 def compact_observation(observation: dict[str, Any]) -> dict[str, Any]:
     player = observation["player"]
     world = observation["world"]
@@ -2135,30 +2240,17 @@ def compact_observation(observation: dict[str, Any]) -> dict[str, Any]:
             key: surroundings.get(key) for key in ("blockAtFeet", "blockBelowFeet", "blockAtHead")
         },
         "nearbyBlocks": [
-            {
-                key: block.get(key)
-                for key in (
-                    "name",
-                    "count",
-                    "nearest",
-                    "distance",
-                    "canHarvestWithHeldItem",
-                    "harvestToolOptions",
-                )
-            }
-            for block in surroundings.get("nearbyBlocks", [])[:12]
+            compact_nearby_block(block)
+            for block in surroundings.get("nearbyBlocks", [])[
+                :COMPACT_NEARBY_BLOCK_KINDS
+            ]
         ],
-        "localAirspace": surroundings.get(
-            "localAirspace",
-            {
-                "scanRadius": 0,
-                "clearanceBlocksAboveHead": 0,
-                "horizontalOpenings": [],
-            },
-        ),
+        "localAirspace": compact_local_airspace(surroundings.get("localAirspace")),
         "nearbyEntities": [
             {key: entity.get(key) for key in ("name", "kind", "position", "distance")}
-            for entity in surroundings.get("nearbyEntities", [])[:8]
+            for entity in surroundings.get("nearbyEntities", [])[
+                :COMPACT_NEARBY_ENTITIES
+            ]
         ],
     }
 
@@ -2228,14 +2320,29 @@ def model_state_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str
     return delta
 
 
+def reportable_run_status(run_status: Any) -> Any:
+    """Repeat the run status only when it is not the ordinary active state.
+
+    An active character is the precondition of every tool call, so restating it
+    after each action tells an agent nothing.  A retirement must still arrive
+    with the action that observed it.
+    """
+    if isinstance(run_status, dict) and run_status.get("status") == "active":
+        return None
+    return run_status
+
+
 def public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    run_status = reportable_run_status(envelope.get("runStatus"))
     if "observation" in envelope:
-        return {
+        observed = {
             "stateId": envelope.get("stateId"),
             "stateRef": envelope.get("stateRef"),
             "screenshot": screenshot_reference(envelope.get("frame")),
-            "runStatus": envelope.get("runStatus"),
         }
+        if run_status is not None:
+            observed["runStatus"] = run_status
+        return observed
     result = {
         key: without_image_bytes(envelope[key])
         for key in (
@@ -2255,7 +2362,6 @@ def public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
             "heartbeats",
             "cleanup",
             "logDirectory",
-            "runStatus",
             "progressSignal",
             "actualEffect",
             "deathObserved",
@@ -2273,6 +2379,8 @@ def public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
         )
         if key in envelope
     }
+    if run_status is not None:
+        result["runStatus"] = run_status
     result["screenshotAfter"] = screenshot_reference(envelope.get("frameAfter"))
     return result
 
@@ -2499,7 +2607,13 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
             f"and run them with minecraft_execute_typescript. Each skill is limited to {runtime.config.max_skill_characters} characters; "
             "compose short skills instead of building monoliths. Record durable world facts with minecraft_remember. "
             "Never use progression-changing console commands or operator powers. Never claim success without checking returned state and inventory. "
-            "Revise failed skills in place and retry from actual state. Retire only a cheated, teleported, operator-modified, or genuinely broken character."
+            "Revise failed skills in place and retry from actual state. Retire only a cheated, teleported, operator-modified, or genuinely broken character. "
+            "Returned state is compact: coordinates, distances, and angles carry one decimal; "
+            "a nearbyBlocks entry names canHarvestWithHeldItem and needsHarvestTool only when the held item cannot harvest it; "
+            "localAirspace.openBlocksByDirection is open blocks per compass direction and boundaryDetail lists only boundaries that are not an ordinary wall; "
+            "localAirspace.navigation waypoints are standable {x,y,z,clearance,openNeighbors} cells you can pass straight to walk_to; "
+            "runStatus is reported only once this character is no longer active. "
+            f"Full uncompacted snapshots stay on disk under {runtime.config.player_log_dir / 'state'}."
         ),
         mask_error_details=False,
     )

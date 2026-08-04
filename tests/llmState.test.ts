@@ -47,7 +47,7 @@ describe("buildLLMState", () => {
         name: "stone",
         count: 1,
         nearest: { x: 1, y: 64, z: 0 },
-        distance: 1.66,
+        distance: 1.7,
         canHarvestWithHeldItem: false,
         harvestToolOptions: ["wooden_pickaxe"]
       }
@@ -71,6 +71,51 @@ describe("buildLLMState", () => {
         }
       ])
     });
+  });
+
+  it("orders harvest tool options by acquisition cost so the first one is worth crafting", () => {
+    const ore = {
+      name: "iron_ore",
+      position: new Vec3(1, 64, 0),
+      canHarvest: vi.fn(() => false),
+      harvestTools: { "278": true, "274": true, "257": true, "285": true }
+    };
+    const bot = {
+      username: "spamuel_test",
+      version: "1.19.4",
+      entity: {
+        position: new Vec3(0, 64, 0),
+        velocity: new Vec3(0, 0, 0),
+        yaw: 0,
+        pitch: 0,
+        onGround: true
+      },
+      inventory: { slots: new Array(45).fill(null) },
+      heldItem: null,
+      quickBarSlot: 0,
+      registry: {
+        items: {
+          257: { name: "iron_pickaxe" },
+          274: { name: "stone_pickaxe" },
+          278: { name: "diamond_pickaxe" },
+          285: { name: "golden_pickaxe" }
+        }
+      },
+      entities: {},
+      canSeeBlock: vi.fn(() => true),
+      blockAt: vi.fn((position: Vec3) => (
+        position.equals(ore.position) ? ore : { name: "air", position }
+      ))
+    } as unknown as Bot;
+
+    const state = buildLLMState(bot, { nearbyBlockRadius: 1 });
+
+    expect(state.surroundings.nearbyBlocks[0]?.harvestToolOptions).toEqual([
+      "stone_pickaxe",
+      "iron_pickaxe",
+      "golden_pickaxe",
+      "diamond_pickaxe"
+    ]);
   });
 
   it("summarizes reachable standable waypoints without prescribing a route", () => {
