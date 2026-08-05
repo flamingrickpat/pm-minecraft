@@ -64,8 +64,11 @@ const MAX_DOMINANT_COLOR_FRACTION = 0.85;
 export const BROWSER_LAUNCH_ARGUMENTS = [
   "--no-sandbox",
   "--disable-dev-shm-usage",
-  "--use-gl=swiftshader",
-  "--enable-unsafe-swiftshader",
+  "--use-gl=angle",
+  "--use-angle=d3d11",
+  "--ignore-gpu-blocklist",
+  "--use-cmd-decoder=passthrough",
+  "--enable-gpu",
   "--enable-extensions",
 ] as const;
 export const BROWSER_EXTENSIONS_ENABLED = true;
@@ -75,7 +78,7 @@ export function createBrowserFrameImageCapture(options: BrowserFrameImageCapture
   const height = options.height ?? 640;
   const maxRetries = options.maxRetries ?? 3;
   const retryDelayMs = options.retryDelayMs ?? 2000;
-  const deviceScaleFactor = options.deviceScaleFactor ?? 2;
+  const deviceScaleFactor = options.deviceScaleFactor ?? 1;
   const fovDegrees = options.fovDegrees ?? 80;
 
   // One browser/page is kept alive across captures. A cold Chrome launch plus

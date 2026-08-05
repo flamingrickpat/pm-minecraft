@@ -8,7 +8,9 @@ describe("parseRuntimeConfig", () => {
         host: "127.0.0.1",
         port: 55608,
         username: "turnbased-bot",
-        viewDistance: 12
+        viewDistance: 12,
+        mineVisibilityIgnoreDistance: 3,
+        walkToMaxDistance: 16
       },
       web: {
         host: "127.0.0.1",

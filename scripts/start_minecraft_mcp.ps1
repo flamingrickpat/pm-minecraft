@@ -16,8 +16,12 @@ param(
     [int]$ViewerPort = 3007,
     [string]$McpHost = "127.0.0.1",
     [int]$McpPort = 8765,
-    [int]$ViewDistance = 12,
+    [int]$ViewDistance = 24,
     [int]$MaxSkillCharacters = 50000,
+    [float]$MineVisibilityIgnoreDistance = 3.0,
+    [float]$WalkToMaxDistance = 512.0,
+    [float]$SkillTimeoutSeconds = 90.0,
+    [switch]$EnableAntiStallGuard,
     [switch]$NoImages,
     [switch]$Foreground
 )
@@ -72,8 +76,12 @@ $arguments = @(
     "--artifact-root", $artifactRoot, "--web-host", $WebHost,
     "--web-port", $WebPort, "--viewer-port", $ViewerPort,
     "--mcp-host", $McpHost, "--mcp-port", $McpPort,
-    "--max-skill-characters", $MaxSkillCharacters, "--view-distance", $ViewDistance
+    "--max-skill-characters", $MaxSkillCharacters, "--view-distance", $ViewDistance,
+    "--mine-visibility-ignore-distance", $MineVisibilityIgnoreDistance,
+    "--walk-to-max-distance", $WalkToMaxDistance,
+    "--skill-timeout-seconds", $SkillTimeoutSeconds
 )
+if ($EnableAntiStallGuard) { $arguments += "--enable-anti-stall-guard" }
 if ($NoImages) { $arguments += "--no-images" }
 
 New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null

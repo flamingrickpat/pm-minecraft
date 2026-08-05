@@ -95,6 +95,8 @@ export interface LLMStateSnapshot {
     };
     /** Entities within 16 blocks, sorted by distance. */
     nearbyEntities: Array<{ name: string; kind: string; position: { x: number; y: number; z: number }; distance: number }>;
+    /** Nearby water/lava the player would hear (danger source + direction). */
+    hazards: Array<{ type: "water" | "lava"; direction: string | null; distance: number; nearest: { x: number; y: number; z: number } | null }>;
   };
 }
 
@@ -102,6 +104,8 @@ const AIR_BLOCKS = new Set(["air", "cave_air", "void_air"]);
 const MAX_NEARBY_BLOCK_KINDS = 48;
 const MAX_NEARBY_ENTITIES = 20;
 const NEARBY_ENTITY_RADIUS = 16;
+/** Hazard scan radius: how far the bot can plausibly hear lava or water. */
+const HAZARD_SCAN_RADIUS = 12;
 /** Decimals kept for every coordinate, distance, and angle in this snapshot. */
 const DECIMALS = 1;
 /** Harvest tool materials ordered by survival acquisition cost, cheapest first. */
@@ -131,6 +135,7 @@ export function buildLLMState(bot: Bot, options: { nearbyBlockRadius?: number; m
       blockAtHead: position ? blockNameAt(bot, position.floored().offset(0, 1, 0)) : null,
       nearbyBlockRadius: radius,
       nearbyBlocks: position ? scanNearbyBlocks(bot, position, radius) : [],
+      hazards: position ? scanHazards(bot, position) : [],
       localAirspace: position
         ? scanLocalAirspace(bot, position, radius)
         : {
@@ -588,6 +593,76 @@ function biomeAtPlayer(bot: Bot): string | null {
   } catch {
     return null;
   }
+}
+
+function scanHazards(bot: Bot, center: Vec3): LLMStateSnapshot["surroundings"]["hazards"] {
+  const closest = new Map<string, { type: "water" | "lava"; nearest: Vec3; distance: number }>();
+  const origin = center.floored();
+  try {
+    for (let dx = -HAZARD_SCAN_RADIUS; dx <= HAZARD_SCAN_RADIUS; dx++) {
+      for (let dy = -HAZARD_SCAN_RADIUS; dy <= HAZARD_SCAN_RADIUS; dy++) {
+        for (let dz = -HAZARD_SCAN_RADIUS; dz <= HAZARD_SCAN_RADIUS; dz++) {
+          const pos = origin.offset(dx, dy, dz);
+          if (pos.distanceTo(center) > HAZARD_SCAN_RADIUS) {
+            continue;
+          }
+          const block = blockAtUnloaded(bot, pos);
+          if (!block) {
+            continue;
+          }
+          const type = hazardType(block.name);
+          if (!type) {
+            continue;
+          }
+          const distance = center.distanceTo(pos.offset(0.5, 0.5, 0.5));
+          const entry = closest.get(type);
+          if (!entry || distance < entry.distance) {
+            closest.set(type, { type, nearest: pos, distance });
+          }
+        }
+      }
+    }
+  } catch {
+    // Unloaded chunks mid-scan: report what was found so far
+  }
+  return [...closest.values()]
+    .sort((a, b) => a.distance - b.distance)
+    .map((entry) => ({
+      type: entry.type,
+      direction: directionTo(center, entry.nearest),
+      distance: round(entry.distance, DECIMALS),
+      nearest: { x: entry.nearest.x, y: entry.nearest.y, z: entry.nearest.z }
+    }));
+}
+
+function blockAtUnloaded(bot: Bot, pos: Vec3): { name: string } | null {
+  try {
+    return bot.blockAt(pos, false);
+  } catch {
+    return null;
+  }
+}
+
+function hazardType(name: string): "water" | "lava" | null {
+  if (name === "lava" || name === "flowing_lava") {
+    return "lava";
+  }
+  if (name === "water" || name === "flowing_water") {
+    return "water";
+  }
+  return null;
+}
+
+function directionTo(from: Vec3, to: Vec3): string | null {
+  // Convert a world offset into the same mineflayer yaw frame compassFacing reads.
+  const dx = to.x - from.x;
+  const dz = to.z - from.z;
+  const hypotenuse = Math.hypot(dx, dz);
+  if (hypotenuse < 1e-6) {
+    return null;
+  }
+  const yawDegrees = (Math.atan2(-dx, -dz) * 180 / Math.PI + 360) % 360;
+  return compassFacing(yawDegrees);
 }
 
 function blockNameAt(bot: Bot, pos: Vec3): string | null {

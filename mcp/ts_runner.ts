@@ -1,4 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import type {
   MinecraftContext,
@@ -68,7 +69,20 @@ function parseArguments(argv: string[]): RunnerArguments {
 
 function createContext(bodyUrl: string): MinecraftContext {
   const visualFrames = new Map<string, number>();
+  // Cooperative cancellation: when the parent wants to kill/stop this skill it
+  // writes a marker file at MINECRAFT_CANCEL_PATH. Every API call (and sleep)
+  // checks it and throws, so a skill loop between calls breaks out cleanly
+  // (and can still write its result) instead of relying only on a hard kill.
+  const cancelPath = process.env.MINECRAFT_CANCEL_PATH;
+  const cancelledError = new Error("Skill cancelled by an external kill/stop signal");
+  cancelledError.name = "SkillCancelledError";
+  function assertNotCancelled(): void {
+    if (cancelPath && existsSync(cancelPath)) {
+      throw cancelledError;
+    }
+  }
   const call = async (action: string, parameters: Record<string, unknown> = {}, timeoutSeconds = 30): Promise<MinecraftResponse> => {
+    assertNotCancelled();
     const route = routes[action];
     if (!route) {
       throw new Error(`Unknown Minecraft action ${JSON.stringify(action)}. Available: ${Object.keys(routes).sort().join(", ")}`);
@@ -130,7 +144,29 @@ function createContext(bodyUrl: string): MinecraftContext {
     rotate: (yaw, pitch = 0) => call("rotate", { yaw, pitch }, 10),
     stop: () => call("stop", {}, 10),
     chat: (text) => call("chat", { text }, 10),
-    sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+    sleep: (milliseconds) => new Promise((resolve, reject) => {
+      const start = Date.now();
+      const cancelled = () => {
+        if (cancelPath && existsSync(cancelPath)) {
+          reject(cancelledError);
+          return true;
+        }
+        return false;
+      };
+      if (cancelled()) return;
+      if (!cancelPath) {
+        setTimeout(() => resolve(), milliseconds);
+        return;
+      }
+      const timer = setInterval(() => {
+        if (Date.now() - start >= milliseconds) {
+          clearInterval(timer);
+          resolve();
+        } else if (cancelled()) {
+          clearInterval(timer);
+        }
+      }, 50);
+    })
   };
 }
 

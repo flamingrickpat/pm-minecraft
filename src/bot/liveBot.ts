@@ -136,7 +136,10 @@ export function createLiveBot(config: RuntimeConfig["minecraft"], emit: (event: 
     bot,
     status,
     commands: createCommandControls(bot, emit),
-    actions: createPhysicalCommandActions(bot),
+    actions: createPhysicalCommandActions(bot, {
+      mineVisibilityIgnoreDistance: config.mineVisibilityIgnoreDistance,
+      walkToMaxDistance: config.walkToMaxDistance
+    }),
     getState: () => createBotStateSnapshot(bot, status),
     getMessages: () => chatInbox.messages(),
     sendChat: async (text: string) => {

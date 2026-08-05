@@ -46,6 +46,8 @@ export interface MinecraftObservation {
       count: number;
       nearest: Vector3;
       distance: number;
+      canHarvestWithHeldItem?: boolean | null;
+      harvestToolOptions?: string[];
     }>;
     nearbyEntities: Array<{
       name: string;

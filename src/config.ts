@@ -10,7 +10,13 @@
  * invariant: downstream runtime code receives validated values and never reparses environment variables.
  */
 export interface RuntimeConfig {
-  minecraft: { host: string; port: number; username: string; viewDistance?: number };
+  minecraft: {
+    host: string; port: number; username: string; viewDistance?: number;
+    /** mine_block skips its head-line-of-sight gate for targets within this many blocks (tunneling). */
+    mineVisibilityIgnoreDistance: number;
+    /** walk_to rejects targets farther than this many blocks; split long routes into hops. */
+    walkToMaxDistance: number;
+  };
   web: { host: string; port: number };
   viewer: { enabled: boolean; port: number; firstPerson: boolean; viewDistance?: number; captureWidth: number; captureHeight: number; deviceScaleFactor: number; fovDegrees: number };
   command: { timeoutMs: number; maxFineControlDurationMs: number; stateBroadcastIntervalMs: number };
@@ -24,7 +30,17 @@ export function parseRuntimeConfig(env: NodeJS.ProcessEnv): RuntimeConfig {
       host: textValue(env.MINECRAFT_HOST, "127.0.0.1", "MINECRAFT_HOST"),
       port: intValue(env.MINECRAFT_PORT, 55608, "MINECRAFT_PORT"),
       username: textValue(env.MINECRAFT_USERNAME, "turnbased-bot", "MINECRAFT_USERNAME"),
-      viewDistance: intValue(env.MINECRAFT_VIEW_DISTANCE, 12, "MINECRAFT_VIEW_DISTANCE")
+      viewDistance: intValue(env.MINECRAFT_VIEW_DISTANCE, 12, "MINECRAFT_VIEW_DISTANCE"),
+      mineVisibilityIgnoreDistance: floatValue(
+        env.MINECRAFT_MINE_VISIBILITY_IGNORE_DISTANCE,
+        3.0,
+        "MINECRAFT_MINE_VISIBILITY_IGNORE_DISTANCE"
+      ),
+      walkToMaxDistance: floatValue(
+        env.MINECRAFT_WALK_TO_MAX_DISTANCE,
+        16.0,
+        "MINECRAFT_WALK_TO_MAX_DISTANCE"
+      )
     },
     web: {
       host: textValue(env.WEB_HOST, "127.0.0.1", "WEB_HOST"),
@@ -37,7 +53,7 @@ export function parseRuntimeConfig(env: NodeJS.ProcessEnv): RuntimeConfig {
       viewDistance: intValue(env.VIEWER_VIEW_DISTANCE, 12, "VIEWER_VIEW_DISTANCE"),
       captureWidth: intValue(env.VIEWER_CAPTURE_WIDTH, 640, "VIEWER_CAPTURE_WIDTH"),
       captureHeight: intValue(env.VIEWER_CAPTURE_HEIGHT, 640, "VIEWER_CAPTURE_HEIGHT"),
-      deviceScaleFactor: intValue(env.VIEWER_DEVICE_SCALE_FACTOR, 2, "VIEWER_DEVICE_SCALE_FACTOR"),
+      deviceScaleFactor: intValue(env.VIEWER_DEVICE_SCALE_FACTOR, 1, "VIEWER_DEVICE_SCALE_FACTOR"),
       fovDegrees: intValue(env.VIEWER_FOV_DEGREES, 80, "VIEWER_FOV_DEGREES")
     },
     command: {
@@ -93,4 +109,15 @@ function boolValue(value: string | undefined, defaultValue: boolean, name: strin
     return false;
   }
   throw new Error(`${name} must be a boolean`);
+}
+
+function floatValue(value: string | undefined, defaultValue: number, name: string): number {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative number`);
+  }
+  return parsed;
 }

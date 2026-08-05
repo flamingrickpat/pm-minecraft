@@ -86,7 +86,16 @@ interface BlockLike {
   canHarvest?(heldItemType: number | null): boolean;
 }
 
-export function createPhysicalCommandActions(bot: Bot): PhysicalCommandActions {
+export function createPhysicalCommandActions(
+  bot: Bot,
+  options: {
+    mineVisibilityIgnoreDistance: number;
+    walkToMaxDistance: number;
+  } = {
+    mineVisibilityIgnoreDistance: 3.0,
+    walkToMaxDistance: 512.0
+  }
+): PhysicalCommandActions {
   // Track intended yaw/pitch so getOrientation() is not affected by server
   // position corrections that overwrite bot.entity.yaw/pitch.
   //
@@ -153,6 +162,31 @@ export function createPhysicalCommandActions(bot: Bot): PhysicalCommandActions {
       syncTrackedFromEntity();
     },
     walkTo: async ({ target, tolerance, profile = "adaptive" }) => {
+      // Cap a single route to one chunk so a failed call is cheap to
+      // diagnose and long journeys are split into explicit hops.
+      const startPosition = bot.entity.position;
+      const horizontalDistance = Math.hypot(
+        target.x - startPosition.x,
+        target.z - startPosition.z
+      );
+      if (horizontalDistance > options.walkToMaxDistance) {
+        return {
+          ok: false,
+          reason: "target_too_far",
+          message: (
+            `walk_to target is ${horizontalDistance.toFixed(1)} blocks away horizontally, ` +
+            `exceeding the ${options.walkToMaxDistance}-block limit. Split the route into shorter hops ` +
+            `(alignment is one chunk long).`
+          ),
+          data: {
+            status: "too_far",
+            position: vector(startPosition),
+            target,
+            horizontalDistance: Math.round(horizontalDistance * 10) / 10,
+            maxDistance: options.walkToMaxDistance
+          }
+        };
+      }
       try {
         const navigation = await gotoNear(bot, target, tolerance, profile);
         return { ok: true, message: "Reached target.", data: { status: "reached", position: vector(bot.entity.position), target, navigation } };
@@ -211,7 +245,17 @@ export function createPhysicalCommandActions(bot: Bot): PhysicalCommandActions {
         if (!visibleTarget || visibleTarget.name === "air") {
           return failed("block_not_found", "Target block no longer exists after walking into range.", { block: target });
         }
-        if (!isVisibleFromHead(bot, visibleTarget as Parameters<Bot["canSeeBlock"]>[0])) {
+        // Head-line-of-sight is normally required for realistic perception, but
+        // in a 1-wide shaft the feet-level block directly ahead is not visible
+        // from the head. Within the configured tunnel distance we skip the gate
+        // so the bot can mine straight ahead (playtest finding 2c).
+        const withinTunnelRange =
+          bot.entity.position.distanceTo(visibleTarget.position) <=
+          options.mineVisibilityIgnoreDistance;
+        if (
+          !isVisibleFromHead(bot, visibleTarget as Parameters<Bot["canSeeBlock"]>[0])
+          && !withinTunnelRange
+        ) {
           return failed("block_not_visible", "Target block is no longer visible from the player's head after walking into range.", {
             block: target,
             blockName: visibleTarget.name
@@ -421,6 +465,21 @@ export function createPhysicalCommandActions(bot: Bot): PhysicalCommandActions {
           position: vector(bot.entity.position)
         });
       }
+      const heldItem = heldItemSnapshot(bot.heldItem);
+      if (!heldItem) {
+        return failed(
+          "pillar_up_needs_placeable_block",
+          "pillar_up requires a placeable solid block in hand (e.g. cobblestone or dirt), but your hand is empty. Equip a solid block first.",
+          { position: vector(bot.entity.position), heldItem }
+        );
+      }
+      if (!isPlaceableSolidBlock(bot, heldItem.name)) {
+        return failed(
+          "pillar_up_needs_placeable_block",
+          `pillar_up requires a placeable solid block in hand; the held item '${heldItem.name}' is not a placeable block. Equip a solid block like cobblestone or dirt first.`,
+          { position: vector(bot.entity.position), heldItem }
+        );
+      }
       const start = bot.entity.position.clone();
       const placedPosition = start.floored();
       const referenceBlock = placedPosition.offset(0, -1, 0);
@@ -440,10 +499,11 @@ export function createPhysicalCommandActions(bot: Bot): PhysicalCommandActions {
       ) {
         return failed(
           "pillar_headroom_blocked",
-          "Cannot pillar because the landing position has no headroom.",
+          "Cannot pillar because the landing position has no headroom; clear the block(s) above your head before ascending.",
           {
             blockedHeadPosition: vector(landingHeadPosition),
-            blockedBy: landingHeadBlock.name
+            blockedBy: landingHeadBlock.name,
+            needsHeadroomAbove: true
           }
         );
       }
@@ -571,6 +631,14 @@ export function installPathfinder(bot: Bot): void {
   if (!current.pathfinder) {
     current.loadPlugin(pathfinder);
   }
+  // Give the A* search a much larger total compute budget. The library default
+  // (5000ms) is too small for complex mountain terrain and far goals, which is
+  // what produced the "path search exhausted its computation budget" failures.
+  const pf = (bot as unknown as { pathfinder?: { thinkTimeout: number; tickTimeout: number } }).pathfinder;
+  if (pf) {
+    pf.thinkTimeout = 40000;
+    pf.tickTimeout = 40;
+  }
 }
 
 async function gotoNear(
@@ -605,21 +673,66 @@ async function gotoNear(
     if (position.distanceTo(lastPosition) >= 0.2) {
       lastPosition = position.clone();
       lastProgressAt = Date.now();
-    } else if (pathfinderBot.pathfinder?.isMoving() && Date.now() - lastProgressAt >= 6_000) {
+    } else if (pathfinderBot.pathfinder?.isMoving() && Date.now() - lastProgressAt >= 40_000) {
       stalled = true;
       pathfinderBot.pathfinder.stop();
     }
   }, 500);
 
   pathfinderBot.pathfinder.setMovements(configureNavigationMovements(new Movements(bot), profile));
+  // Use a GoalXZ so terrain height is auto-chosen: overworld travel should aim
+  // at a horizontal position and let the pathfinder pick whichever standable Y
+  // is reachable, instead of failing because the exact target Y doesn't match.
+  const goal = new goals.GoalNearXZ(target.x, target.z, tolerance);
+  // Dynamic goal (dynamic=true): the pathfinder re-paths and requests chunks as
+  // it travels, so a goal far beyond the initially-loaded area is reachable in
+  // one long walk instead of many hard one-chunk hops. This is what makes
+  // long-distance overland travel (e.g. village hunting) work.
+  pathfinderBot.pathfinder.setGoal(goal, true);
   try {
-    await pathfinderBot.pathfinder.goto(new goals.GoalNear(target.x, target.y, target.z, tolerance));
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const fail = (name: string, message: string): Error => {
+        const err = new Error(message);
+        (err as Error & { name: string }).name = name;
+        return err;
+      };
+      const finish = (err?: Error): void => {
+        if (settled) return;
+        settled = true;
+        bot.removeListener("goal_reached", onReached);
+        bot.removeListener("path_update", onUpdate);
+        bot.removeListener("goal_updated", onChanged);
+        bot.removeListener("path_stop", onStopped);
+        setTimeout(() => (err ? reject(err) : resolve()), 0);
+      };
+      const onReached = (): void => finish();
+      const onUpdate = (value: PathfinderUpdate): void => {
+        update = value;
+        if (value.status === "noPath") {
+          finish(fail("NoPath", "No path to the goal!"));
+        } else if (value.status === "timeout") {
+          finish(fail("Timeout", "Took too long to decide path to goal!"));
+        }
+      };
+      const onChanged = (changed: unknown): void => {
+        if (changed !== goal) {
+          finish(fail("GoalChanged", "The goal was changed before it could be completed!"));
+        }
+      };
+      const onStopped = (): void => {
+        finish(fail("PathStopped", "Path was stopped before it could be completed!"));
+      };
+      bot.on("goal_reached", onReached);
+      bot.on("path_update", onUpdate);
+      bot.on("goal_updated", onChanged);
+      bot.on("path_stop", onStopped);
+    });
     const position = bot.entity.position;
-    const dx = Math.floor(target.x) - Math.floor(position.x);
-    const dy = Math.floor(target.y) - Math.floor(position.y);
-    const dz = Math.floor(target.z) - Math.floor(position.z);
+    const dx = target.x - position.x;
+    const dz = target.z - position.z;
     const report = summarizeNavigation(update, start, target, stalled, profile);
-    if ((dx * dx + dy * dy + dz * dz) > tolerance * tolerance) {
+    if (dx * dx + dz * dz > tolerance * tolerance) {
       throw new NavigationFailure(
         `Pathfinder stopped without reaching goal: position ${JSON.stringify(vector(position))}, ` +
         `target ${JSON.stringify(target)}, tolerance ${tolerance}. ${report.diagnosis}`,
@@ -797,6 +910,15 @@ function heldItemSnapshot(item: { name?: string; count?: number } | null | undef
     return null;
   }
   return { name: item.name, count: item.count };
+}
+
+function isPlaceableSolidBlock(bot: Bot, itemName: string): boolean {
+  const registry = (bot as Bot & { registry?: { blocksByName?: Record<string, { boundingBox?: string }> } }).registry;
+  const blockType = registry?.blocksByName?.[itemName];
+  if (!blockType) {
+    return false;
+  }
+  return blockType.boundingBox === "block";
 }
 
 function verifyPlacedHeldItem(

@@ -52,7 +52,7 @@ function healthInput() {
   return {
     startedAt: new Date("2026-07-18T20:00:00.000Z"),
     config: {
-      minecraft: { host: "127.0.0.1", port: 12345, username: "mcp-test" },
+      minecraft: { host: "127.0.0.1", port: 12345, username: "mcp-test", mineVisibilityIgnoreDistance: 3, walkToMaxDistance: 16 },
       web: { host: "127.0.0.1", port: 3000 },
       viewer: { enabled: true, port: 3007, firstPerson: true, captureWidth: 640, captureHeight: 640, deviceScaleFactor: 2, fovDegrees: 80 },
       command: { timeoutMs: 30000, maxFineControlDurationMs: 3000, stateBroadcastIntervalMs: 500 },

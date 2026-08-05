@@ -1,6 +1,7 @@
 import { type MinecraftContext, type Vector3, type SkillEntrypoint } from "../lib/minecraft";
 
 const AIR = new Set(["air", "cave_air", "void_air"]);
+const HAZARD = new Set(["water", "flowing_water", "lava", "flowing_lava", "bedrock"]);
 
 interface Input {
   steps?: number;
@@ -16,6 +17,9 @@ async function nameAt(context: MinecraftContext, block: Vector3): Promise<string
 async function mineCell(context: MinecraftContext, block: Vector3, label: string): Promise<boolean> {
   const name = await nameAt(context, block);
   if (AIR.has(name)) return false;
+  // Face the cell so digging a head/feet cell outside the current view doesn't
+  // fail with "Block not in view".
+  await context.call("look_at", { target: block }, 5);
   const res = await context.call("mine_block", { block, walk_into_range: false }, 25);
   if (res.ok !== true) throw new Error(`${label} ${JSON.stringify(block)}: ${res.message}`);
   await context.sleep(250);
@@ -43,10 +47,14 @@ const run: SkillEntrypoint = async (context: MinecraftContext, rawInput: unknown
     const nextFeet: Vector3 = { x: foot.x + delta.x, y: foot.y, z: foot.z + delta.z };
     const nextHead: Vector3 = { x: nextFeet.x, y: nextFeet.y + 1, z: nextFeet.z };
 
-    // Stop if we've broken into open air (a cave / surface).
+    // Stop if we've broken into open air (a cave / surface) or if the next
+    // cell is a hazard (water/lava/bedrock): never dig into a liquid.
     const [hf, hh] = await Promise.all([nameAt(context, nextFeet), nameAt(context, nextHead)]);
     if (AIR.has(hf) && AIR.has(hh)) {
       return { start, end: (await context.observe()).player.blockPosition, brokenIntoOpen: true, mined };
+    }
+    if (HAZARD.has(hf) || HAZARD.has(hh)) {
+      return { start, end: (await context.observe()).player.blockPosition, hazardAhead: hf !== "air" ? hf : hh, hazardCell: nextFeet, mined };
     }
 
     // Mine head cell (eye-level) first, then feet cell.

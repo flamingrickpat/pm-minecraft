@@ -22,7 +22,7 @@ describe("runMain", () => {
   it("constructs the runtime without opening the web or Minecraft connection", async () => {
     const runtime = createRuntime({
       config: {
-        minecraft: { host: "127.0.0.1", port: 1, username: "dry-bot" },
+        minecraft: { host: "127.0.0.1", port: 1, username: "dry-bot", mineVisibilityIgnoreDistance: 3, walkToMaxDistance: 16 },
         web: { host: "127.0.0.1", port: 1 },
         viewer: { enabled: false, port: 3001, firstPerson: true, captureWidth: 640, captureHeight: 640, deviceScaleFactor: 2, fovDegrees: 80 },
         command: { timeoutMs: 250, maxFineControlDurationMs: 3000, stateBroadcastIntervalMs: 500 },

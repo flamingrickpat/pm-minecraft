@@ -29,6 +29,7 @@ TEMPLATE_DIR = MCP_DIR / "templates"
 RUNNER_PATH = MCP_DIR / "ts_runner.ts"
 COLLECT_BLOCKS_PRIMITIVE = MCP_DIR / "primitives" / "collect_blocks.ts"
 MAX_TYPESCRIPT_TIMEOUT_SECONDS = 90.0
+DEFAULT_SKILL_TIMEOUT_SECONDS = MAX_TYPESCRIPT_TIMEOUT_SECONDS
 # Caps on the model-visible state. The full snapshot stays on disk under
 # artifacts/minecraft/state; these bound what every tool result has to carry.
 COMPACT_NEARBY_BLOCK_KINDS = 12
@@ -49,6 +50,19 @@ MATERIAL_ACTIONS = frozenset(
     }
 )
 MATERIAL_NO_GAIN_REASSESSMENT_THRESHOLD = 2
+# The anti-stall circuit breaker is OFF by default and only armed when the
+# operator passes --enable-anti-stall-guard. It was a relic of older, weaker
+# models that retried identical no-gain operations in a loop; modern agents
+# stall for unrelated reasons and the guard keyed to a single "relevant item"
+# wrongly blocked unrelated skill ops (see playtest findings 2b).
+DEFAULT_ANTI_STALL_GUARD = False
+# mine_block relaxes its head-line-of-sight gate for targets this close so a
+# bot can tunnel forward from a 1-wide shaft without first mining the head
+# cell (playtest finding 2c).
+DEFAULT_MINE_VISIBILITY_IGNORE_DISTANCE = 3.0
+# walk_to is deliberately capped at one chunk (16 blocks) so a failed call is
+# cheap to diagnose; longer routes are split into hops by the caller.
+DEFAULT_WALK_TO_MAX_DISTANCE = 512.0
 MATERIAL_ATTEMPT_FAILURE_REASONS = frozenset(
     {
         "dig_failed",
@@ -191,6 +205,10 @@ class ServerConfig(BaseModel):
     viewer_scale: int = Field(ge=1)
     viewer_fov: int = Field(ge=1)
     view_distance: int = Field(ge=1)
+    anti_stall_guard: bool = False
+    mine_visibility_ignore_distance: float = Field(default=3.0, ge=0)
+    walk_to_max_distance: float = Field(default=16.0, gt=0)
+    skill_timeout_seconds: float = Field(default=90.0, ge=1)
 
     @model_validator(mode="after")
     def validate_instance_binding(self) -> ServerConfig:
@@ -750,6 +768,12 @@ class BodySupervisor:
                 "ACTION_LOG_ENABLED": "true",
                 "ACTION_LOG_DIR": str(self.config.player_log_dir / "body-actions"),
                 "MINECRAFT_BODY_LOG_DIR": str(self.config.player_log_dir),
+                "MINECRAFT_MINE_VISIBILITY_IGNORE_DISTANCE": str(
+                    self.config.mine_visibility_ignore_distance
+                ),
+                "MINECRAFT_WALK_TO_MAX_DISTANCE": str(
+                    self.config.walk_to_max_distance
+                ),
             }
         )
         npm = "npm.cmd" if os.name == "nt" else "npm"
@@ -844,6 +868,9 @@ class MinecraftMcpRuntime:
             tuple[tuple[int, int, int], tuple[int, int, int]]
         ] = set()
         self.lock = asyncio.Lock()
+        self.active_skill: asyncio.subprocess.Process | None = None
+        self.active_skill_info: dict[str, Any] | None = None
+        self.skill_timeout_seconds = float(config.skill_timeout_seconds)
 
     def _reset_material_progress(self) -> None:
         self.material_no_gain_streak = 0
@@ -856,6 +883,8 @@ class MinecraftMcpRuntime:
         self.material_relevant_items_by_action.pop(action, None)
 
     def _material_action_blocked(self, action: str) -> bool:
+        if not self.config.anti_stall_guard:
+            return False
         return (
             material_action_name(action) in MATERIAL_ACTIONS
             and self.material_no_gain_by_action.get(action, 0)
@@ -1045,7 +1074,8 @@ class MinecraftMcpRuntime:
             inventory_changes=inventory_changes,
             relevant_inventory_items=relevant_items,
             requires_reassessment=(
-                same_action_count
+                self.config.anti_stall_guard
+                and same_action_count
                 >= MATERIAL_NO_GAIN_REASSESSMENT_THRESHOLD
             ),
         ).model_dump(mode="json", by_alias=True)
@@ -1100,6 +1130,19 @@ class MinecraftMcpRuntime:
             encoding="utf-8",
         )
 
+    def set_skill_timeout(self, seconds: float, minimum: float = 1.0, maximum: float = 3600.0) -> float:
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or seconds < minimum
+            or seconds > maximum
+        ):
+            raise ValueError(
+                f"skill timeout must be a number within {minimum:g}..{maximum:g} seconds"
+            )
+        self.skill_timeout_seconds = float(seconds)
+        return self.skill_timeout_seconds
+
     def assert_character_active(self) -> None:
         status = self.run_status()
         if status["status"] != "active":
@@ -1120,10 +1163,15 @@ class MinecraftMcpRuntime:
         observation = self.api.observe()
         self.inspect_survival_provenance(observation)
         self.home.write_character(observation)
-        should_capture = self.config.capture_images and (
-            True if include_image is None else include_image
-        )
-        frame = self.api.capture_frame() if should_capture else None
+        # A screenshot is captured (and written to artifacts/.../screenshots)
+        # for every state, regardless of include_image, so there is a
+        # complete on-disk visual history to fall back on later. include_image
+        # only controls whether the pixel bytes are also attached to this
+        # tool call's response - the disk write always happens.
+        frame = self.api.capture_frame() if self.config.capture_images else None
+        want_image_in_response = include_image is not False
+        if isinstance(frame, dict) and frame.get("ok") is not False and not want_image_in_response:
+            frame = {key: value for key, value in frame.items() if key != "pngBase64"}
         frame_id = frame_identifier(frame)
         if frame_id is not None:
             self.recent_visual_frames[frame_id] = time.monotonic()
@@ -1639,11 +1687,11 @@ class MinecraftMcpRuntime:
     ) -> ToolResult:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
-        if timeout_seconds > MAX_TYPESCRIPT_TIMEOUT_SECONDS:
+        if timeout_seconds > self.skill_timeout_seconds:
             raise ValueError(
                 "timeout_seconds must be at most "
-                f"{MAX_TYPESCRIPT_TIMEOUT_SECONDS:g} so a skill cannot "
-                "outlive its MCP caller"
+                f"{self.skill_timeout_seconds:g} (the configured skill timeout; "
+                "raise it with minecraft_set_skill_timeout)"
             )
         if heartbeat_seconds <= 0:
             raise ValueError("heartbeat_seconds must be positive")
@@ -1697,7 +1745,10 @@ class MinecraftMcpRuntime:
                         snapshot,
                     )
             self.register_skill_version(skill_path)
-            return await self._execute_typescript_locked(
+        # The long subprocess wait must NOT hold the runtime lock: releasing it
+        # here lets minecraft_stop / minecraft_kill_skill acquire the lock and
+        # terminate a runaway skill instead of deadlocking behind it.
+        return await self._execute_typescript_locked(
                 skill_path,
                 arguments,
                 timeout_seconds,
@@ -1752,6 +1803,7 @@ class MinecraftMcpRuntime:
                 "MINECRAFT_AGENT_HOME": str(self.home.root),
                 "MINECRAFT_USERNAME": self.config.username,
                 "MINECRAFT_EXECUTION_ID": execution_id,
+                "MINECRAFT_CANCEL_PATH": str(run_dir / "cancel"),
             }
         )
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
@@ -1765,6 +1817,16 @@ class MinecraftMcpRuntime:
         )
         stdout_task = asyncio.create_task(process.stdout.read())
         stderr_task = asyncio.create_task(process.stderr.read())
+        # Terminate any stale skill (e.g. an orphaned runner from a previously
+        # timed-out call) before this one takes over the physical avatar.
+        if self.active_skill is not None:
+            await self.kill_skill()
+        self.active_skill = process
+        self.active_skill_info = {
+            "executionId": execution_id,
+            "skillPath": str(skill_path),
+            "runDir": str(run_dir),
+        }
         started = time.monotonic()
         heartbeats: list[dict[str, Any]] = []
         timed_out = False
@@ -1803,7 +1865,7 @@ class MinecraftMcpRuntime:
             if current_task is not None:
                 while current_task.cancelling():
                     current_task.uncancel()
-            cleanup = await self._terminate_execution(process)
+            cleanup = await self._terminate_execution(process, run_dir)
             stdout_bytes, stderr_bytes = await asyncio.gather(
                 stdout_task,
                 stderr_task,
@@ -1847,11 +1909,13 @@ class MinecraftMcpRuntime:
                 run_dir / "heartbeats.yaml",
                 {"heartbeats": heartbeats},
             )
+            self.active_skill = None
+            self.active_skill_info = None
             raise
 
         cleanup: dict[str, Any]
         if timed_out:
-            cleanup = await self._terminate_execution(process)
+            cleanup = await self._terminate_execution(process, run_dir)
         else:
             await process.wait()
             state = await asyncio.to_thread(self.api.state)
@@ -1944,6 +2008,8 @@ class MinecraftMcpRuntime:
             run_dir / "heartbeats.yaml",
             {"heartbeats": heartbeats},
         )
+        self.active_skill = None
+        self.active_skill_info = None
         if timed_out:
             summary = f"{skill_path.name} timed out after {timeout_seconds}s and was terminated."
         elif ok:
@@ -1994,7 +2060,56 @@ class MinecraftMcpRuntime:
                 )
         return self.tool_result(envelope, summary)
 
-    async def _terminate_execution(self, process: asyncio.subprocess.Process) -> dict[str, Any]:
+    async def kill_skill(self) -> dict[str, Any]:
+        """Terminate the currently running skill subprocess (and its in-flight command).
+
+        Returns a small report so the caller can tell whether a stale skill
+        actually existed and was killed. Safe to call when no skill is running.
+        """
+        process = self.active_skill
+        if process is None:
+            return {
+                "killed": False,
+                "processTerminated": False,
+                "reason": "no_active_skill",
+            }
+        info = self.active_skill_info or {}
+        if process.returncode is not None:
+            self.active_skill = None
+            self.active_skill_info = None
+            return {
+                "killed": False,
+                "processTerminated": True,
+                "reason": "already_exited",
+                "processExitCode": process.returncode,
+                **info,
+            }
+        run_dir = Path(info.get("runDir")) if info.get("runDir") else None
+        cleanup = await self._terminate_execution(process, run_dir)
+        self.active_skill = None
+        self.active_skill_info = None
+        return {
+            "killed": True,
+            "processTerminated": True,
+            "reason": "killed",
+            "cleanup": cleanup,
+            **info,
+        }
+
+    async def _terminate_execution(self, process: asyncio.subprocess.Process, run_dir: Path | None = None) -> dict[str, Any]:
+        # 1) Cooperative cancellation: drop the marker the skill checks between
+        #    API calls, and give it a moment to break out and write a clean
+        #    result. Only escalate to a hard kill if it stays alive.
+        if run_dir is not None and process.returncode is None:
+            try:
+                (run_dir / "cancel").write_text("cancel\r\n", encoding="utf-8")
+            except OSError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        # 2) Hard kill only if the skill is still running.
         if process.returncode is None:
             if os.name == "nt":
                 completed = await asyncio.to_thread(
@@ -2073,6 +2188,12 @@ def frame_identifier(frame: Any) -> str | None:
 def screenshot_reference(frame: Any) -> dict[str, Any] | None:
     if not isinstance(frame, dict):
         return None
+    if frame.get("ok") is False:
+        # A requested capture that actually failed (viewer/bot not ready, no
+        # browser executable, etc.) must be distinguishable from a capture
+        # that was never requested (screenshot_reference returns None for
+        # that case) - otherwise the failure is silently invisible to the agent.
+        return {"error": frame.get("error", "capture_failed"), "message": frame.get("message")}
     metadata = frame.get("metadata") if isinstance(frame.get("metadata"), dict) else frame
     return without_image_bytes(
         {
@@ -2211,6 +2332,7 @@ def compact_observation(observation: dict[str, Any]) -> dict[str, Any]:
                 "facing",
                 "health",
                 "food",
+                "foodSaturation",
                 "oxygenLevel",
                 "experienceLevel",
                 "gameMode",
@@ -2252,6 +2374,7 @@ def compact_observation(observation: dict[str, Any]) -> dict[str, Any]:
                 :COMPACT_NEARBY_ENTITIES
             ]
         ],
+        "hazards": surroundings.get("hazards", []),
     }
 
 
@@ -2270,7 +2393,6 @@ def model_state_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str
         delta["chat"] = {"unreadMessages": unread_messages}
 
     for section in (
-        "player",
         "world",
         "blocksAtPlayer",
         "localAirspace",
@@ -2283,13 +2405,45 @@ def model_state_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str
         if changed:
             delta[section] = changed
 
+    # The player section always carries the vital fields (position and
+    # health/satiety) even when unchanged, so an agent never has to guess
+    # coordinates from a timestamp or re-derive its own vitals from a delta.
+    player_changed = {
+        key: value
+        for key, value in after_compact["player"].items()
+        if before_compact["player"].get(key) != value
+    }
+    player_always = {
+        key: after_compact["player"].get(key)
+        for key in (
+            "position",
+            "blockPosition",
+            "health",
+            "food",
+            "foodSaturation",
+            "yawDegrees",
+            "pitchDegrees",
+            "facing",
+        )
+        if key in after_compact["player"]
+    }
+    player_delta = {**player_always, **player_changed}
+    if player_delta:
+        delta["player"] = player_delta
+
+    # Nearby water/lava is a sound cue the bot must always get, so it is
+    # reported on every state/delta, not only when it changes (the bot hears
+    # lava and water even when standing still).
+    delta["hazards"] = after_compact.get("hazards", [])
+
     before_inventory = before_compact["inventory"]
     after_inventory = after_compact["inventory"]
-    inventory_delta = {
-        key: after_inventory.get(key)
-        for key in ("heldItem", "armor", "emptySlots")
-        if before_inventory.get(key) != after_inventory.get(key)
-    }
+    # heldItem is always reported so the agent sees exactly which tool the
+    # character is holding after every action (see playtest finding 4).
+    inventory_delta = {"heldItem": after_inventory.get("heldItem")}
+    for key in ("armor", "emptySlots"):
+        if before_inventory.get(key) != after_inventory.get(key):
+            inventory_delta[key] = after_inventory.get(key)
     before_items = before_inventory["items"]
     after_items = after_inventory["items"]
     item_changes = {
@@ -2642,7 +2796,7 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
                 },
                 "y_min|y_max|health_min|position_changed_min": {"kind": "y_min", "value": 64},
                 "held_item": {"kind": "held_item", "item": "stone_pickaxe"},
-                "composition": {
+                "all (compose any postconditions)": {
                     "all": [
                         {"kind": "inventory_min", "item": "iron_pickaxe", "count": 1},
                         {"kind": "health_min", "value": 1},
@@ -2651,8 +2805,13 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
             },
             "skillPolicy": {
                 "maxCharacters": runtime.config.max_skill_characters,
+                "maxTimeoutSeconds": runtime.skill_timeout_seconds,
                 "acceptedExtensions": [".ts", ".mts", ".cts"],
                 "compositionPreferred": True,
+            },
+            "timeouts": {
+                "skillTimeoutSeconds": runtime.skill_timeout_seconds,
+                "hint": "Use minecraft_set_skill_timeout to raise/lower the max skill duration to match your client's requestTimeoutMs; keep it below your agent harness's request timeout or long skills will run server-side past your client window.",
             },
             "runStatus": runtime.run_status(),
             "health": health,
@@ -2660,9 +2819,9 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
 
     @mcp.tool
     async def minecraft_observe(
-        include_image: bool = False, full_state: bool = False
+        include_image: bool = True, full_state: bool = False
     ) -> ToolResult:
-        """Get fresh state. Results are deltas after the first call; set full_state to reset the model-visible baseline."""
+        """Get fresh state, including a screenshot by default so the agent can see the world. Results are deltas after the first call; set full_state to reset the model-visible baseline. A screenshot is always captured and saved to disk regardless; include_image=False only skips attaching it to this response, to save context when only state is needed."""
         return await runtime.observe_tool(include_image, full_state)
 
     @mcp.tool
@@ -2681,7 +2840,7 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         max_distance: int = 64,
         include_image: bool = False,
     ) -> ToolResult:
-        """Find an exact block; visibility is required by default for realistic perception."""
+        """Find the nearest instance of an exact block. It ONLY returns blocks with an unobstructed head-ray line of sight (requireVisible is hard-locked to true — no x-ray; walled/underground targets return block_not_found), so you must explore or get a better viewpoint first. Returns a single nearest result; """
         require_visible = True
         return await runtime.call_tool(
             "find_block",
@@ -2699,12 +2858,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         x: float,
         y: float,
         z: float,
-        tolerance: float = 3.0,
+        tolerance: float = 1.0,
+        profile: Literal["adaptive", "walk_only"] = "adaptive",
         timeout_seconds: float = 60,
         include_image: bool = False,
     ) -> ToolResult:
-        """Walk with adaptive pathfinding by default. Use walk_only to forbid digging, block placement, towers, parkour, and drops over one block."""
-        profile = "walk_only"
+        """Walk to a point (flat x, y, z coordinates, NOT a position/block object). Adaptive by default: it may dig, place scaffold, tower, parkour, or drop up to four blocks to reach the target, and stops within `tolerance` blocks. Set profile="walk_only" to forbid changing blocks (digging, placement, towers, parkour, drops over one block). tolerance defaults to 1 so the body gets adjacent (needed to reach pickups/placements); raise it only for long noisy hops."""
         return await runtime.call_tool(
             "walk_to",
             {
@@ -2725,7 +2884,7 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         timeout_seconds: float = 60,
         include_image: bool = False,
     ) -> ToolResult:
-        """Mine the block at exact world coordinates and verify the resulting block change."""
+        """Mine the block at exact world coordinates (flat x, y, z, NOT a block dict) and verify the resulting block change. Set walk_into_range=False only when the target is already in front of you and within reach; otherwise leave it true so the body walks adjacent (and can collect the drop). Correct-tool harvesting is enforced."""
         return await runtime.call_tool(
             "mine_block",
             {"block": {"x": x, "y": y, "z": z}, "walkIntoRange": walk_into_range},
@@ -2745,11 +2904,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         count: int,
         ctx: Context,
         max_distance: int = 48,
-        timeout_seconds: float = 300,
+        timeout_seconds: float | None = None,
     ) -> ToolResult:
         """Repeatedly find and mine an exact block until after-state proves the requested inventory delta. Uses only this body's ordinary find/mine primitives, not collectblock."""
         if count <= 0:
             raise ValueError("count must be positive")
+        effective_timeout = timeout_seconds if timeout_seconds is not None else runtime.skill_timeout_seconds
         return await runtime.execute_typescript(
             str(COLLECT_BLOCKS_PRIMITIVE),
             {
@@ -2758,7 +2918,7 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
                 "count": count,
                 "maxDistance": max_distance,
             },
-            timeout_seconds,
+            effective_timeout,
             15,
             ctx,
             {"kind": "inventory_delta_min", "item": item_name, "count": count},
@@ -2818,9 +2978,53 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         )
 
     @mcp.tool
-    async def minecraft_stop(include_image: bool = False) -> ToolResult:
-        """Stop the active Mineflayer command and clear pathfinding and movement controls."""
+    async def minecraft_kill_command(include_image: bool = False) -> ToolResult:
+        """Stop only the currently running physical Mineflayer command (pathfinding/digging/controls). Leaves a running skill process alive."""
         return await runtime.call_tool("stop", {}, 10, include_image)
+
+    @mcp.tool
+    async def minecraft_kill_skill() -> dict[str, Any]:
+        """Terminate the running TypeScript skill process (and, necessarily, whatever command it was issuing). No-op when no skill is running."""
+        async with runtime.lock:
+            result = await runtime.kill_skill()
+        return {
+            "ok": result["killed"],
+            "killed": result["killed"],
+            "reason": result.get("reason"),
+            "skillPath": result.get("skillPath"),
+            "executionId": result.get("executionId"),
+            "processTerminated": result.get("processTerminated", False),
+            "runStatus": runtime.run_status(),
+        }
+
+    @mcp.tool
+    async def minecraft_stop(include_image: bool = False) -> ToolResult:
+        """Stop the active Mineflayer command AND terminate any running skill process (kills both). Use for an emergency halt."""
+        command = await runtime.call_tool("stop", {}, 10, include_image)
+        async with runtime.lock:
+            skill = await runtime.kill_skill()
+        structured = command.structured_content
+        if isinstance(structured, dict):
+            structured = dict(structured)
+            structured["killSkill"] = {
+                "killed": skill["killed"],
+                "reason": skill.get("reason"),
+                "skillPath": skill.get("skillPath"),
+                "processTerminated": skill.get("processTerminated", False),
+            }
+        summary = (
+            "stop: active command halted"
+            + (
+                " and running skill terminated."
+                if skill["killed"]
+                else (
+                    f" (no skill was running: {skill.get('reason')})."
+                    if skill.get("reason") != "no_active_skill"
+                    else "."
+                )
+            )
+        )
+        return ToolResult(content=command.content, structured_content=structured)
 
     @mcp.tool
     async def minecraft_execute_typescript(
@@ -2828,15 +3032,20 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         ctx: Context,
         postcondition: PostconditionSpec,
         arguments: dict[str, Any] | None = None,
-        timeout_seconds: float = MAX_TYPESCRIPT_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
         heartbeat_seconds: float = 15,
         include_image: bool = False,
     ) -> ToolResult:
-        """Execute a local TypeScript skill. Normal exit is success only when the mandatory after-state postcondition also passes."""
+        """Execute a local TypeScript skill in drafts/ or skills/. Normal exit counts as success only if the mandatory after-state `postcondition` also passes.
+
+        postcondition kinds (pick ONE): inventory_min{item,count}, inventory_delta_min{item,count}, held_item{item}, y_min/y_max/health_min/position_changed_min{value}, distance_max{target:{x,y,z},value}. To compose several, pass a single object with only an `all` array (NO kind key): {"all":[{...},{...}]}.
+
+        Runs up to timeout_seconds (default = the server's skillTimeoutSeconds; raise with minecraft_set_skill_timeout) in its own subprocess and returns a heartbeat every heartbeat_seconds. If it completes, Returns the result; if the caller times out first the skill keeps running server-side (call minecraft_observe to track, minecraft_stop/minecraft_kill_skill to halt it). Keep skillTimeoutSeconds at or below your client's requestTimeoutMs."""
+        effective_timeout = timeout_seconds if timeout_seconds is not None else runtime.skill_timeout_seconds
         return await runtime.execute_typescript(
             path,
             arguments or {},
-            timeout_seconds,
+            effective_timeout,
             heartbeat_seconds,
             ctx,
             postcondition.as_dict(),
@@ -2865,6 +3074,17 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
                 observation,
             ),
             "stateUpdate": runtime.model_state_update(observation),
+        }
+
+    @mcp.tool
+    async def minecraft_set_skill_timeout(seconds: float) -> dict[str, Any]:
+        """Set the maximum allowed skill/collect_blocks duration (1..3600 s) for this server instance, so you can match it to your client's requestTimeoutMs. Long skills that run past your client's request window will be terminated server-side at their own timeout; minecraft_stop / minecraft_kill_skill halt them sooner (cooperative kill-signal + hard kill)."""
+        async with runtime.lock:
+            new = runtime.set_skill_timeout(seconds)
+        return {
+            "ok": True,
+            "skillTimeoutSeconds": new,
+            "runStatus": runtime.run_status(),
         }
 
     @mcp.tool
@@ -2925,9 +3145,32 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--mcp-port", type=int, default=8765)
     parser.add_argument("--startup-timeout-seconds", type=float, default=60)
     parser.add_argument("--max-skill-characters", type=int, default=50000)
-    parser.add_argument("--viewer-scale", type=int, default=2)
+    parser.add_argument("--viewer-scale", type=int, default=1)
     parser.add_argument("--viewer-fov", type=int, default=80)
     parser.add_argument("--view-distance", type=int, default=12)
+    parser.add_argument(
+        "--enable-anti-stall-guard",
+        action="store_true",
+        help="Opt in to the repeated-no-gain circuit breaker (default off; blocked material actions are disabled unless this is set).",
+    )
+    parser.add_argument(
+        "--mine-visibility-ignore-distance",
+        type=float,
+        default=DEFAULT_MINE_VISIBILITY_IGNORE_DISTANCE,
+        help="mine_block skips its head-line-of-sight gate for targets within this many blocks (default 3, for tunneling).",
+    )
+    parser.add_argument(
+        "--walk-to-max-distance",
+        type=float,
+        default=DEFAULT_WALK_TO_MAX_DISTANCE,
+        help="Reject walk_to targets farther than this many blocks (default 16, one chunk).",
+    )
+    parser.add_argument(
+        "--skill-timeout-seconds",
+        type=float,
+        default=DEFAULT_SKILL_TIMEOUT_SECONDS,
+        help=f"Maximum duration in seconds for a skill / collect_blocks run; agent can raise/lower it later with minecraft_set_skill_timeout (default {DEFAULT_SKILL_TIMEOUT_SECONDS:g}).",
+    )
     parser.add_argument(
         "--no-images",
         action="store_true",
@@ -2951,6 +3194,10 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         viewer_scale=args.viewer_scale,
         viewer_fov=args.viewer_fov,
         view_distance=args.view_distance,
+        anti_stall_guard=args.enable_anti_stall_guard,
+        mine_visibility_ignore_distance=args.mine_visibility_ignore_distance,
+        walk_to_max_distance=args.walk_to_max_distance,
+        skill_timeout_seconds=args.skill_timeout_seconds,
     )
 
 

@@ -1,6 +1,7 @@
 import { itemCount, type MinecraftContext, type Vector3, type SkillEntrypoint } from "../lib/minecraft";
 
 const AIR = new Set(["air", "cave_air", "void_air"]);
+const HAZARD = new Set(["water", "flowing_water", "lava", "flowing_lava", "bedrock"]);
 const ORE_TARGETS = ["iron_ore", "deepslate_iron_ore"];
 const targetItem = "raw_iron";
 const want = 3;
@@ -12,6 +13,9 @@ async function nameAt(context: MinecraftContext, block: Vector3): Promise<string
 }
 
 async function mineCell(context: MinecraftContext, block: Vector3, label: string): Promise<void> {
+  // Face the cell first so digging a head/feet cell outside the current view
+  // doesn't fail with "Block not in view".
+  await context.call("look_at", { target: block }, 5);
   const res = await context.call("mine_block", { block, walk_into_range: false }, 25);
   if (res.ok !== true) throw new Error(`${label} ${JSON.stringify(block)}: ${res.message}`);
   // Let the physical action settle before the next one.
@@ -61,6 +65,19 @@ const run: SkillEntrypoint = async (context: MinecraftContext, rawInput: unknown
     const nextHead: Vector3 = { x: nextFeet.x, y: nextFeet.y + 1, z: nextFeet.z };
     const feetName = await nameAt(context, nextFeet);
     const headName = await nameAt(context, nextHead);
+    // Never dig into a liquid or bedrock: stop cleanly instead of stranding the.
+    // bot in an aquifer or lava (hazard guard).
+    if (HAZARD.has(feetName) || HAZARD.has(headName)) {
+      return {
+        targetItem,
+        rawGot: itemCount(await context.observe(), targetItem),
+        steps,
+        done: false,
+        reason: "hazard_forward",
+        hazard: feetName !== "air" ? feetName : headName,
+        hazardCell: nextFeet,
+      };
+    }
     // Mine the head cell first (eye-level, line-of-sight), then the feet cell below it.
     if (!AIR.has(headName)) await mineCell(context, nextHead, "tunnel head");
     if (!AIR.has(feetName)) await mineCell(context, nextFeet, "tunnel feet");

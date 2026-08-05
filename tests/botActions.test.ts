@@ -113,23 +113,46 @@ describe("physical bot actions", () => {
     expect(findBlock).toHaveBeenCalledWith(expect.objectContaining({ useExtraInfo: expect.any(Function) }));
   });
 
-  it("rejects mining a loaded but head-ray-hidden block", async () => {
-    const target = block("iron_ore", new Vec3(0, 94, -2));
+  it("rejects mining a loaded but head-ray-hidden block beyond tunnel reach", async () => {
+    // Outside the 3-block tunnel-ignore distance, the head-line-of-sight gate
+    // still applies.
+    const target = block("iron_ore", new Vec3(6, 96, -6));
     const dig = vi.fn(async () => undefined);
     const bot = fakeBot({
       heldItem: null,
-      blocks: { "0,94,-2": target },
+      blocks: { "6,96,-6": target },
       canSeeBlock: () => false,
       dig
     });
 
     const result = await createPhysicalCommandActions(bot).mineBlock({
-      block: { x: 0, y: 94, z: -2 },
+      block: { x: 6, y: 96, z: -6 },
       walkIntoRange: false
     });
 
     expect(result).toMatchObject({ ok: false, reason: "block_not_visible" });
     expect(dig).not.toHaveBeenCalled();
+  });
+
+  it("mines a head-ray-hidden block within the 3-block tunnel-ignore distance", async () => {
+    // A 1-wide shaft's adjacent feet-level block is not visible from the head;
+    // within the tunnel distance the gate is skipped so the bot can tunnel.
+    const target = block("stone", new Vec3(0, 94, -3));
+    const dig = vi.fn(async () => undefined);
+    const bot = fakeBot({
+      heldItem: null,
+      blocks: { "0,94,-3": target },
+      canSeeBlock: () => false,
+      dig
+    });
+
+    const result = await createPhysicalCommandActions(bot).mineBlock({
+      block: { x: 0, y: 94, z: -3 },
+      walkIntoRange: false
+    });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(dig).toHaveBeenCalledTimes(1);
   });
 
   it("refuses to destroy a block when the held item cannot harvest it", async () => {
@@ -366,7 +389,7 @@ function fakeBot(options: {
   dig?: ReturnType<typeof vi.fn>;
   canSeeBlock?: (candidate: ReturnType<typeof block>) => boolean;
   findBlock?: ReturnType<typeof vi.fn>;
-  registry?: { blocksByName: Record<string, { id: number }> };
+  registry?: { blocksByName: Record<string, { id: number; boundingBox?: string }> };
   yaw?: number;
   setControlState?: ReturnType<typeof vi.fn>;
 }) {
@@ -382,7 +405,13 @@ function fakeBot(options: {
     canDigBlock: () => true,
     canSeeBlock: options.canSeeBlock ?? (() => true),
     findBlock: options.findBlock,
-    registry: options.registry,
+    registry: options.registry ?? {
+      blocksByName: {
+        dirt: { id: 1, boundingBox: "block" },
+        cobblestone: { id: 2, boundingBox: "block" },
+        stone: { id: 3, boundingBox: "block" }
+      }
+    },
     lookAt: vi.fn(async () => undefined),
     dig: options.dig ?? vi.fn(async () => undefined),
     placeBlock: options.placeBlock ?? vi.fn(async () => undefined),
