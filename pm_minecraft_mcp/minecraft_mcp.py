@@ -3077,18 +3077,6 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
                 "skillPath": skill.get("skillPath"),
                 "processTerminated": skill.get("processTerminated", False),
             }
-        summary = (
-            "stop: active command halted"
-            + (
-                " and running skill terminated."
-                if skill["killed"]
-                else (
-                    f" (no skill was running: {skill.get('reason')})."
-                    if skill.get("reason") != "no_active_skill"
-                    else "."
-                )
-            )
-        )
         return ToolResult(content=command.content, structured_content=structured)
 
     @mcp.tool

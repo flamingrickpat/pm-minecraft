@@ -23,7 +23,7 @@ describe("parseRuntimeConfig", () => {
         viewDistance: 12,
         captureWidth: 640,
         captureHeight: 640,
-        deviceScaleFactor: 2,
+        deviceScaleFactor: 1,
         fovDegrees: 80
       },
       command: {
