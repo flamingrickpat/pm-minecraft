@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -21,13 +23,22 @@ from fastmcp import Context, FastMCP
 from fastmcp.tools import ToolResult
 from mcp.types import ImageContent, TextContent
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from standalone_support import atomic_write_bytes, readable_yaml_bytes
+
+from ._runtime import ensure_node_runtime, node_executable
+from .standalone_support import atomic_write_bytes, readable_yaml_bytes
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 MCP_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = MCP_DIR / "templates"
 RUNNER_PATH = MCP_DIR / "ts_runner.ts"
 COLLECT_BLOCKS_PRIMITIVE = MCP_DIR / "primitives" / "collect_blocks.ts"
+SDK_PATH = MCP_DIR / "sdk" / "minecraft.ts"
+# The body and every skill run inside the Node runtime resolved by
+# pm_minecraft_mcp._runtime.ensure_node_runtime(): the repository root in a
+# source checkout, or a per-environment bootstrapped directory in an
+# installed wheel. Children are attached to their parent through stdin pipes
+# (see BodySupervisor) and are never detached into their own process group.
+BODY_STDIN_LIFECYCLE_ENV = "MINECRAFT_STDIN_LIFECYCLE"
 MAX_TYPESCRIPT_TIMEOUT_SECONDS = 90.0
 DEFAULT_SKILL_TIMEOUT_SECONDS = MAX_TYPESCRIPT_TIMEOUT_SECONDS
 # Caps on the model-visible state. The full snapshot stays on disk under
@@ -129,24 +140,94 @@ def typescript_runner_command(
         "--result",
         str(result_path),
     ]
-    if os.name == "nt":
-        node = shutil.which("node.exe") or shutil.which("node")
-        tsx_cli = (
-            PACKAGE_DIR
-            / "node_modules"
-            / "tsx"
-            / "dist"
-            / "cli.mjs"
+    node = node_executable()
+    loader = tsx_loader_arguments(ensure_node_runtime())
+    return [node, *loader, *arguments]
+
+
+def tsx_loader_arguments(runtime_dir: Path) -> list[str]:
+    """Node flags that load the tsx TypeScript loader in-process.
+
+    The ``tsx`` CLI wrapper spawns a second process, which would break the
+    stdin-pipe lifecycle contract; passing the loader flags to node directly
+    keeps exactly one PID per runner.
+    """
+    tsx_dist = runtime_dir / "node_modules" / "tsx" / "dist"
+    preflight = tsx_dist / "preflight.cjs"
+    loader = tsx_dist / "loader.mjs"
+    if not preflight.is_file() or not loader.is_file():
+        raise FileNotFoundError(f"tsx loader not found under {tsx_dist}")
+    return ["--require", str(preflight), "--import", loader.as_uri()]
+
+
+def body_entry_command(runtime_dir: Path) -> list[str]:
+    """Command that starts the Minecraft body as a single Node process.
+
+    The TypeScript entry runs through the tsx loader directly (no tsx CLI
+    wrapper and no npm), so the stdin lifecycle pipe from the supervisor
+    controls exactly one PID. In a source checkout ``runtime_dir`` is the
+    repository root; in an installed wheel it is the bootstrapped directory.
+    """
+    node = node_executable()
+    entry = runtime_dir / "src" / "main.ts"
+    if not entry.is_file():
+        raise FileNotFoundError(f"Minecraft body entry not found: {entry}")
+    return [node, *tsx_loader_arguments(runtime_dir), str(entry)]
+
+
+def tcp_reachable(host: str, port: int, timeout_seconds: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
+def local_port_available(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", port))
+            return True
+    except OSError:
+        return False
+
+
+def check_prerequisites(config: ServerConfig, external_body: bool = False) -> None:
+    """Fail fast with a specific error before anything is spawned.
+
+    Mirrors the standalone launcher checks: initialized agent home, a
+    reachable Minecraft server, free local service ports, and a Node.js
+    executable on PATH. With ``external_body=True`` the web port is expected
+    to belong to an already-running body, so only the viewer and MCP ports
+    are required to be free.
+    """
+    AgentHome(config).validate()
+    if not tcp_reachable(config.minecraft_host, config.minecraft_port):
+        raise RuntimeError(
+            f"Minecraft server is not reachable at "
+            f"{config.minecraft_host}:{config.minecraft_port}"
         )
-        if node is None:
-            raise FileNotFoundError("Node.js executable not found")
-        if not tsx_cli.is_file():
-            raise FileNotFoundError(f"tsx CLI not found: {tsx_cli}")
-        return [node, str(tsx_cli), *arguments]
-    tsx = PACKAGE_DIR / "node_modules" / ".bin" / "tsx"
-    if not tsx.is_file():
-        raise FileNotFoundError(f"tsx executable not found: {tsx}")
-    return [str(tsx), *arguments]
+    ports = (config.viewer_port, config.mcp_port)
+    if not external_body:
+        ports = (config.web_port, *ports)
+    for port in ports:
+        if not local_port_available(port):
+            raise RuntimeError(
+                f"Local service port {port} is already owned by another process"
+            )
+    node_executable()
+
+
+def drafts_source_dir() -> Path:
+    packaged = MCP_DIR / "drafts"
+    if packaged.is_dir() and any(packaged.glob("*.ts")):
+        return packaged
+    repository = PACKAGE_DIR / "deploy" / "drafts"
+    if repository.is_dir() and any(repository.glob("*.ts")):
+        return repository
+    raise FileNotFoundError(
+        f"Example drafts not found (looked in {packaged} and {repository})"
+    )
 
 
 def utc_now() -> str:
@@ -737,6 +818,7 @@ class BodySupervisor:
         self.log_stream: Any = None
 
     def start(self) -> dict[str, Any]:
+        check_prerequisites(self.config)
         try:
             existing = self.api.health()
         except requests.RequestException:
@@ -776,19 +858,21 @@ class BodySupervisor:
                 ),
             }
         )
-        npm = "npm.cmd" if os.name == "nt" else "npm"
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        runtime_dir = ensure_node_runtime()
+        env["NODE_PATH"] = str(runtime_dir / "node_modules")
+        env[BODY_STDIN_LIFECYCLE_ENV] = "1"
+        command = body_entry_command(runtime_dir)
         self.process = subprocess.Popen(
-            [npm, "run", "dev"],
-            cwd=PACKAGE_DIR,
+            command,
+            cwd=runtime_dir,
             env=env,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            creationflags=creationflags,
         )
         self.output_thread = threading.Thread(target=self._copy_output, daemon=True)
         self.output_thread.start()
@@ -825,16 +909,19 @@ class BodySupervisor:
         if self.process is None:
             return
         if self.process.poll() is None:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-            else:
-                self.process.terminate()
-                self.process.wait(timeout=10)
+            with contextlib.suppress(OSError):
+                self.process.stdin.close()
+            try:
+                self.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired as error:
+                    raise RuntimeError(
+                        f"Minecraft body (pid {self.process.pid}) did not exit after "
+                        "stdin EOF and a hard kill"
+                    ) from error
         if self.output_thread is not None:
             self.output_thread.join(timeout=2)
         if self.log_stream is not None:
@@ -1797,6 +1884,7 @@ class MinecraftMcpRuntime:
             result_path,
         )
         env = os.environ.copy()
+        env["NODE_PATH"] = str(ensure_node_runtime() / "node_modules")
         env.update(
             {
                 "MINECRAFT_BODY_URL": self.config.body_url,
@@ -1806,14 +1894,13 @@ class MinecraftMcpRuntime:
                 "MINECRAFT_CANCEL_PATH": str(run_dir / "cancel"),
             }
         )
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=self.home.root,
             env=env,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            creationflags=creationflags,
         )
         stdout_task = asyncio.create_task(process.stdout.read())
         stderr_task = asyncio.create_task(process.stderr.read())
@@ -2101,49 +2188,27 @@ class MinecraftMcpRuntime:
         #    API calls, and give it a moment to break out and write a clean
         #    result. Only escalate to a hard kill if it stays alive.
         if run_dir is not None and process.returncode is None:
-            try:
+            with contextlib.suppress(OSError):
                 (run_dir / "cancel").write_text("cancel\r\n", encoding="utf-8")
-            except OSError:
-                pass
-            try:
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-        # 2) Hard kill only if the skill is still running.
+        # 2) Hard kill only if the skill is still running. Closing stdin ends
+        # the runner's lifecycle pipe (the runner treats EOF as cancellation);
+        # process.kill() covers runners stuck in a single long call.
         if process.returncode is None:
-            if os.name == "nt":
-                completed = await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "taskkill",
-                        "/PID",
-                        str(process.pid),
-                        "/T",
-                        "/F",
-                    ],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if completed.returncode != 0 and process.returncode is None:
-                    process.kill()
-            else:
+            if process.stdin is not None:
+                process.stdin.close()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except TimeoutError:
                 process.kill()
         try:
             await asyncio.wait_for(process.wait(), timeout=10)
-        except TimeoutError:
-            if os.name != "nt":
-                raise
-            await asyncio.to_thread(
-                subprocess.run,
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            await asyncio.wait_for(process.wait(), timeout=10)
+        except TimeoutError as error:
+            raise RuntimeError(
+                f"Skill subprocess (pid {process.pid}) did not exit after stdin EOF "
+                "and a hard kill"
+            ) from error
         stop_result = await asyncio.to_thread(
             self.api.stop_and_wait,
             10,
@@ -2738,7 +2803,7 @@ def heartbeat_from_observation(elapsed: float, observation: dict[str, Any]) -> d
     player = observation["player"]
     inventory = observation["inventory"]
     message = (
-        f"Running {round(elapsed)}s — position {player['position']}, health {player['health']}, "
+        f"Running {round(elapsed)}s â€” position {player['position']}, health {player['health']}, "
         f"food {player['food']}, held {inventory['heldItem']}"
     )
     return {
@@ -2840,7 +2905,7 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         max_distance: int = 64,
         include_image: bool = False,
     ) -> ToolResult:
-        """Find the nearest instance of an exact block. It ONLY returns blocks with an unobstructed head-ray line of sight (requireVisible is hard-locked to true — no x-ray; walled/underground targets return block_not_found), so you must explore or get a better viewpoint first. Returns a single nearest result; """
+        """Find the nearest instance of an exact block. It ONLY returns blocks with an unobstructed head-ray line of sight (requireVisible is hard-locked to true â€” no x-ray; walled/underground targets return block_not_found), so you must explore or get a better viewpoint first. Returns a single nearest result; """
         require_visible = True
         return await runtime.call_tool(
             "find_block",
@@ -3201,25 +3266,175 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
     )
 
 
-def main(argv: list[str] | None = None) -> None:
-    config = parse_args(argv)
+CHARACTER_INSTRUCTIONS_PATH = MCP_DIR / "character_instructions.txt"
+
+
+def _character_instructions(draft_list: str) -> str:
+    template = CHARACTER_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+    return template.replace("@@DRAFT_LIST@@", draft_list)
+
+
+def init_character(
+    name: str,
+    agent_root: Path | str,
+    artifact_root: Path | str,
+    minecraft_host: str = "127.0.0.1",
+    minecraft_port: int = 12345,
+    web_port: int = 3000,
+    viewer_port: int = 3007,
+    mcp_port: int = 8765,
+    mcp_request_timeout_ms: int = 200000,
+) -> Path:
+    """Initialize a character workspace, the Python port of init_character.ps1.
+
+    Creates the agent home layout, copies the TypeScript SDK and example
+    drafts, and writes AGENTS.md, .mcp.json, memory stubs, and
+    minecraft-character.json. Raises if the name is invalid, the ports
+    collide, or the agent root is not empty. Returns the agent root.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", name):
+        raise ValueError("Minecraft username must contain 1-16 letters, digits, or underscores")
+    ports = {minecraft_port, web_port, viewer_port, mcp_port}
+    if len(ports) != 4:
+        raise ValueError("Minecraft, web, viewer, and MCP ports must be distinct.")
+    root = Path(agent_root).expanduser().resolve()
+    artifacts = Path(artifact_root).expanduser().resolve()
+    if not SDK_PATH.is_file():
+        raise FileNotFoundError(f"Minecraft SDK is missing: {SDK_PATH}")
+    drafts = sorted(drafts_source_dir().glob("*.ts"))
+    if not drafts:
+        raise FileNotFoundError(f"Example drafts are missing from {drafts_source_dir()}")
+    if root.exists() and any(root.iterdir()):
+        raise ValueError(f"agent_root must be empty or not exist: {root}")
+
+    for relative in (
+        "drafts",
+        "skills",
+        "lib",
+        "memory/minecraft",
+        "artifacts/minecraft/actions",
+        "artifacts/minecraft/executions",
+        "artifacts/minecraft/screenshots",
+        "artifacts/minecraft/state",
+    ):
+        (root / relative).mkdir(parents=True, exist_ok=True)
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(SDK_PATH, root / "lib" / "minecraft.ts")
+    for draft in drafts:
+        shutil.copy2(draft, root / "drafts" / draft.name)
+    draft_list = "\n".join(f"  - drafts/{draft.name}" for draft in drafts)
+    (root / "AGENTS.md").write_text(_character_instructions(draft_list), encoding="utf-8")
+    for memory_name in ("WORLD", "PLACES", "ROUTES", "CHESTS", "FAILURES", "JOURNAL"):
+        (root / "memory" / "minecraft" / f"{memory_name}.md").write_text(
+            f"# {memory_name}\n", encoding="utf-8"
+        )
+    mcp_config = {
+        "mcpServers": {
+            "minecraft": {
+                "url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "requestTimeoutMs": mcp_request_timeout_ms,
+            }
+        }
+    }
+    (root / ".mcp.json").write_text(
+        json.dumps(mcp_config, indent=2) + "\n", encoding="utf-8"
+    )
+    character_manifest = {
+        "schema": "pm.minecraft-character.v1",
+        "name": name,
+        "minecraft": {"host": minecraft_host, "port": minecraft_port},
+        "ports": {"web": web_port, "viewer": viewer_port, "mcp": mcp_port},
+        "paths": {"agent_root": str(root), "artifact_root": str(artifacts)},
+    }
+    (root / "minecraft-character.json").write_text(
+        json.dumps(character_manifest, indent=2) + "\n", encoding="utf-8"
+    )
+    return root
+
+
+def _wait_for_external_body(config: ServerConfig, api: BodyApi) -> dict[str, Any]:
+    """Block until an externally managed body reports ready."""
+    deadline = time.monotonic() + config.startup_timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            health = api.health()
+        except requests.RequestException:
+            time.sleep(0.25)
+            continue
+        if health.get("ready") is True:
+            return health
+        last_error = health["mineflayer"]["lastError"]
+        if last_error:
+            raise RuntimeError(f"Mineflayer connection failed: {last_error}")
+        time.sleep(0.25)
+    raise TimeoutError(
+        f"Externally managed Minecraft body at {config.body_url} did not become "
+        f"ready in {config.startup_timeout_seconds}s"
+    )
+
+
+def execute_node_main_loop(config: ServerConfig) -> None:
+    """Blocking entry point that runs only the Minecraft body (Node process).
+
+    Use this in its own daemon thread when you want the body and the MCP
+    server in separate threads; pair it with
+    ``execute_python_main_loop(config, manage_body=False)``. The body is a
+    child attached through a stdin pipe: when this thread (or the whole
+    process) dies, the body receives EOF on stdin and shuts down cleanly.
+    Prerequisite failures raise immediately.
+    """
     config.player_log_dir.mkdir(parents=True, exist_ok=True)
-    server_log = (config.player_log_dir / "mcp-server.log").open("a", encoding="utf-8", buffering=1)
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-    sys.stdout = TeeTextStream(original_stdout, server_log)
-    sys.stderr = TeeTextStream(original_stderr, server_log)
-    home = AgentHome(config)
-    home.validate()
     api = BodyApi(config.body_url)
     supervisor = BodySupervisor(config, api)
     print(
-        f"Starting Minecraft character {config.username} against {config.minecraft_host}:{config.minecraft_port}",
+        f"Starting Minecraft body for character {config.username} against "
+        f"{config.minecraft_host}:{config.minecraft_port}",
         file=sys.stderr,
+        flush=True,
     )
     try:
-        health = supervisor.start()
-        print(f"Minecraft body ready: {json.dumps(health['mineflayer'])}", file=sys.stderr)
+        supervisor.start()
+        while supervisor.process is not None and supervisor.process.poll() is None:
+            time.sleep(0.5)
+        if supervisor.process is not None and supervisor.process.returncode not in (0, None):
+            raise RuntimeError(
+                f"Minecraft body exited with code {supervisor.process.returncode}"
+            )
+    finally:
+        supervisor.stop()
+
+
+def execute_python_main_loop(config: ServerConfig, manage_body: bool = True) -> None:
+    """Blocking entry point: serve the Minecraft MCP server.
+
+    Designed to run in a daemon thread of an embedding process. With
+    ``manage_body=True`` (default) the Node body is started here as a child
+    attached through a stdin pipe: when this thread (or the whole process)
+    dies, the body receives EOF on stdin and shuts down cleanly; no detached
+    processes are created anywhere. With ``manage_body=False`` the body must
+    already be running (for example via ``execute_node_main_loop`` in a
+    second daemon thread) and this call only waits for it to become ready.
+    Prerequisite failures (no Minecraft server, wrong version, ports taken,
+    missing agent home) raise immediately before anything is served.
+    """
+    config.player_log_dir.mkdir(parents=True, exist_ok=True)
+    home = AgentHome(config)
+    home.validate()
+    api = BodyApi(config.body_url)
+    supervisor = BodySupervisor(config, api) if manage_body else None
+    print(
+        f"Starting Minecraft character {config.username} against "
+        f"{config.minecraft_host}:{config.minecraft_port}",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        # With manage_body=True this thread owns the body; otherwise the
+        # companion thread running execute_node_main_loop started it and this
+        # thread only waits for it to become ready.
+        health = supervisor.start() if manage_body else _wait_for_external_body(config, api)
+        print(f"Minecraft body ready: {json.dumps(health['mineflayer'])}", file=sys.stderr, flush=True)
         mineflayer = health.get("mineflayer", {})
         if mineflayer.get("username") != config.username:
             raise RuntimeError(
@@ -3239,9 +3454,9 @@ def main(argv: list[str] | None = None) -> None:
         home.write_character(initial_observation)
         runtime = MinecraftMcpRuntime(config, api, home)
         mcp = build_mcp(runtime)
-        print(f"Agent home: {home.root}", file=sys.stderr)
-        print(f"Artifact root: {config.player_log_dir}", file=sys.stderr)
-        print(f"Minecraft MCP: {config.mcp_url}", file=sys.stderr)
+        print(f"Agent home: {home.root}", file=sys.stderr, flush=True)
+        print(f"Artifact root: {config.player_log_dir}", file=sys.stderr, flush=True)
+        print(f"Minecraft MCP: {config.mcp_url}", file=sys.stderr, flush=True)
         mcp.run(
             transport="streamable-http",
             host=config.mcp_host,
@@ -3250,12 +3465,24 @@ def main(argv: list[str] | None = None) -> None:
             show_banner=True,
         )
     finally:
-        try:
+        if supervisor is not None:
             supervisor.stop()
-        finally:
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-            server_log.close()
+
+
+def main(argv: list[str] | None = None) -> None:
+    config = parse_args(argv)
+    config.player_log_dir.mkdir(parents=True, exist_ok=True)
+    server_log = (config.player_log_dir / "mcp-server.log").open("a", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeTextStream(original_stdout, server_log)
+    sys.stderr = TeeTextStream(original_stderr, server_log)
+    try:
+        execute_python_main_loop(config)
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        server_log.close()
 
 
 if __name__ == "__main__":

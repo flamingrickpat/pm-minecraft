@@ -10,3 +10,7 @@ artifacts/
 logs/
 /uv.lock
 /.idea
+
+# Build artifacts copied into the package by hatch_build.py
+pm_minecraft_mcp/node/
+pm_minecraft_mcp/drafts/

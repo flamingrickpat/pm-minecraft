@@ -267,3 +267,144 @@ npm test
 npm run build
 .\.venv\Scripts\python.exe -m compileall mcp
 ```
+
+## Using it programmatically (pip install)
+
+`pm-minecraft` can be embedded directly into another Python project — for
+example a cognitive architecture that keeps a Minecraft character alive in
+daemon threads. No ps1 scripts, no `subprocess.Popen` of launchers, and no
+detached child processes anywhere: every Node process is attached to its
+Python parent through a **stdin lifecycle pipe**. When the parent dies —
+gracefully or hard-killed — the OS closes the pipe, Node sees EOF, and shuts
+down cleanly. Same semantics on Windows and Linux.
+
+### Install
+
+```powershell
+pip install git+https://github.com/flamingrickpat/pm-minecraft.git
+```
+
+Requirements for the target machine:
+
+- Python 3.12, and Node.js 20+ on PATH (`node` and `npm`).
+- The first time a character starts in a Python environment, the package
+  installs its Node dependency tree once into
+  `<venv>/pm-minecraft-runtime/<version>/` (runs `npm ci` under a file lock;
+  one-time, a couple of minutes). Every later start is instant. Pre-warm with
+  `pm_minecraft_mcp.ensure_node_runtime()`.
+- A reachable Minecraft Java 1.19.x server with the character in survival
+  mode (same as the standalone setup).
+
+### Entry points
+
+Everything is one typed config object plus blocking functions designed to run
+in daemon threads:
+
+- `pm_minecraft_mcp.ServerConfig(...)` — all settings: Minecraft host/port,
+  username, agent home, artifact root, web/viewer/MCP hosts+ports, startup
+  timeout, image capture, skill limits, view distance.
+- `pm_minecraft_mcp.execute_node_main_loop(config)` — runs the Minecraft body
+  (one Node process) and blocks until it exits.
+- `pm_minecraft_mcp.execute_python_main_loop(config, manage_body=True)` —
+  runs the MCP server and blocks while it serves. With the default
+  `manage_body=True` it also starts and owns the body itself (one thread is
+  enough); with `manage_body=False` it expects the body to be managed by a
+  companion `execute_node_main_loop` thread and waits for it to become ready.
+- `pm_minecraft_mcp.init_character(name, agent_root, artifact_root, ...)` —
+  Python port of `scripts/init_character.ps1`: creates the agent workspace
+  (`AGENTS.md`, `.mcp.json`, `lib/minecraft.ts`, `drafts/`, `skills/`,
+  `memory/minecraft/`). Refuses non-empty agent roots.
+- `pm_minecraft_mcp.check_prerequisites(config)` — the fail-fast checks,
+  also run automatically before anything spawns: agent home initialized,
+  Minecraft server reachable over TCP, local service ports free, `node` on
+  PATH. Each failure raises immediately with a specific message. After the
+  body joins, the negotiated version must be 1.19.x and the game mode
+  survival, otherwise the entry point raises.
+
+### Example
+
+`examples/main.py` starts a character in two daemon threads and shuts down on
+Ctrl-D:
+
+```python
+import threading
+from pathlib import Path
+
+from pm_minecraft_mcp import (
+    ServerConfig,
+    execute_node_main_loop,
+    execute_python_main_loop,
+    init_character,
+)
+
+AGENT_ROOT = Path.home() / "characters" / "Floppa"
+
+if not (AGENT_ROOT / "AGENTS.md").exists():
+    init_character(
+        name="Floppa",
+        agent_root=AGENT_ROOT,
+        artifact_root=AGENT_ROOT / "artifacts" / "minecraft",
+        minecraft_host="127.0.0.1",
+        minecraft_port=12345,
+        web_port=3000,
+        viewer_port=3007,
+        mcp_port=8765,
+    )
+
+config = ServerConfig(
+    minecraft_host="127.0.0.1",
+    minecraft_port=12345,
+    username="Floppa",
+    agent_home=AGENT_ROOT,
+    artifact_root=AGENT_ROOT / "artifacts" / "minecraft",
+    web_host="127.0.0.1",
+    web_port=3000,
+    viewer_port=3007,
+    mcp_host="127.0.0.1",
+    mcp_port=8765,
+    startup_timeout_seconds=90,
+    capture_images=True,
+    max_skill_characters=50000,
+    viewer_scale=1,
+    viewer_fov=80,
+    view_distance=24,
+)
+
+threading.Thread(target=execute_node_main_loop, args=(config,), daemon=True).start()
+threading.Thread(
+    target=execute_python_main_loop, args=(config,), kwargs={"manage_body": False}, daemon=True
+).start()
+
+try:
+    while True:
+        input()  # Ctrl-D (EOF) ends the process; children follow via stdin EOF
+except (EOFError, KeyboardInterrupt):
+    pass
+```
+
+The single-thread variant works too: one daemon thread on
+`execute_python_main_loop(config)` starts both body and MCP.
+
+### Multiple characters
+
+Use one config (unique username + unique web/viewer/MCP ports) per character
+and give each one its own pair of daemon threads. The Node runtime is shared
+read-only between all characters in the same Python environment.
+
+### Agent-side behavior is unchanged
+
+From the MCP client's perspective nothing changes: the same tool names,
+schemas, `.mcp.json` layout, and `minecraft_execute_typescript` contract. An
+agent can still write an arbitrary TypeScript draft into its workspace and
+execute it against the server; drafts run through the package's tsx runtime
+with `lib/minecraft.ts` from the character home.
+
+### Lifecycle guarantees
+
+- The body is one Node process (no npm/tsx wrapper processes); skill runs
+  are also one process each. There are no process trees to chase.
+- Children never get `CREATE_NEW_PROCESS_GROUP` and are never `taskkill`ed.
+  Shutdown is stdin-EOF first, plain `kill()` as a last resort.
+- Killing the embedding process at any moment (including `taskkill /F` or
+  `kill -9`) cannot orphan the body: the lifecycle pipe breaks and Node exits
+  within seconds.

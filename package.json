@@ -14,15 +14,15 @@
     "canvas": "^3.2.3",
     "mineflayer": "^4.29.0",
     "mineflayer-pathfinder": "^2.4.5",
+    "patch-package": "^8.0.1",
     "prismarine-viewer": "^1.33.0",
-    "puppeteer-core": "^25.1.0"
+    "puppeteer-core": "^25.1.0",
+    "tsx": "^4.20.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.0.0",
-    "patch-package": "^8.0.1",
-    "tsx": "^4.20.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"
   }

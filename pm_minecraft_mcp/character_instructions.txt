@@ -1,48 +1,3 @@
-param(
-    [Parameter(Mandatory = $true)]
-    [ValidatePattern("^[A-Za-z0-9_]{1,16}$")]
-    [string]$Name,
-    [Parameter(Mandatory = $true)]
-    [string]$AgentRoot,
-    [Parameter(Mandatory = $true)]
-    [string]$ArtifactRoot,
-    [string]$MinecraftHost = "127.0.0.1",
-    [int]$MinecraftPort = 12345,
-    [int]$WebPort = 3000,
-    [int]$ViewerPort = 3007,
-    [int]$McpPort = 8765,
-    [int]$McpRequestTimeoutMs = 200000
-)
-
-$ErrorActionPreference = "Stop"
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$root = [System.IO.Path]::GetFullPath($AgentRoot)
-$artifacts = [System.IO.Path]::GetFullPath($ArtifactRoot)
-$sdk = Join-Path $repoRoot "pm_minecraft_mcp\sdk\minecraft.ts"
-if (-not (Test-Path -LiteralPath $sdk -PathType Leaf)) { throw "Minecraft SDK is missing: $sdk" }
-$draftSource = Join-Path $repoRoot "deploy\drafts"
-if (-not (Test-Path -LiteralPath $draftSource -PathType Container)) { throw "Example drafts are missing: $draftSource" }
-$exampleDrafts = @(Get-ChildItem -LiteralPath $draftSource -Filter "*.ts" -File)
-if ($exampleDrafts.Count -eq 0) { throw "Example drafts are missing: $draftSource" }
-$ports = @($MinecraftPort, $WebPort, $ViewerPort, $McpPort)
-if (($ports | Select-Object -Unique).Count -ne 4) { throw "Minecraft, web, viewer, and MCP ports must be distinct." }
-if (Test-Path -LiteralPath $root) {
-    $existing = Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop
-    if ($existing.Count -gt 0) { throw "AgentRoot must be empty or not exist: $root" }
-}
-foreach ($relative in @("drafts", "skills", "lib", "memory\minecraft", "artifacts\minecraft\actions", "artifacts\minecraft\executions", "artifacts\minecraft\screenshots", "artifacts\minecraft\state")) {
-    New-Item -ItemType Directory -Path (Join-Path $root $relative) -Force | Out-Null
-}
-New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
-Copy-Item -LiteralPath $sdk -Destination (Join-Path $root "lib\minecraft.ts")
-# Deployed as working examples: they run as-is against this workspace's lib/minecraft.ts
-# and are the starting point for new drafts.
-foreach ($draft in $exampleDrafts) {
-    Copy-Item -LiteralPath $draft.FullName -Destination (Join-Path $root "drafts\$($draft.Name)")
-}
-
-$draftList = ($exampleDrafts | ForEach-Object { "  - drafts/$($_.Name)" }) -join "`n"
-$agentInstructions = @"
 # Minecraft character workspace
 
 This directory is the agent's writable Minecraft workspace.
@@ -52,7 +7,7 @@ This directory is the agent's writable Minecraft workspace.
 - Fresh structured state is returned by every tool call. Durable state snapshots and screenshots are under artifacts/minecraft/state and artifacts/minecraft/screenshots. Use those files and the live Web UI to navigate and verify progress.
 - For complex behavior, write a short TypeScript draft in drafts/. Import types and helpers from lib/minecraft.ts, export one async default function, then call minecraft_execute_typescript with its path and a mandatory deterministic postcondition. Inspect the fresh after-state; move a proven draft to skills/ only after it passes.
 - These drafts ship with the workspace and already run against lib/minecraft.ts. Read one before writing a new draft, execute it directly where it fits the situation, and copy its guard-and-verify shape otherwise. Some carry world-specific constants (coordinates, tool names) that must be checked against fresh state first.
-$draftList
+@@DRAFT_LIST@@
 
 Practical gameplay tips:
 - Coordinate args are FLAT for the wrapper tools: minecraft_walk_to(x,y,z,tolerance,profile) and minecraft_mine_block(x,y,z,walk_into_range) take separate x, y, z numbers, NOT a position/block object. To inspect/place/use/rotate/look, use minecraft_call with the nested action schemas from minecraft_info (e.g. {"action":"place_block","parameters":{"referenceBlock":{"x":..,"y":..,"z":..},"face":{"x":0,"y":1,"z":0}}}).
@@ -66,19 +21,3 @@ Practical gameplay tips:
 - Held-tool drift: a climb-y mine_block or pillar can leave a placeable block (dirt/cobblestone) in hand instead of your tool. ALWAYS re-equip your tool right before using it, and verify the swap (equip can report ok while the old item stays in hand).
 - minecraft_info reports the full admin/state map: action schemas, postcondition schemas, and skill policy. Re-read it whenever a tool's parameter shape is unclear.
 - Store durable world notes in memory/minecraft/. Use normal survival mechanics only: never use creative mode, /give, teleportation, or operator commands.
-"@
-$agentInstructions.Trim() + "`n" | Set-Content -LiteralPath (Join-Path $root "AGENTS.md") -Encoding UTF8
-
-foreach ($memoryName in @("WORLD", "PLACES", "ROUTES", "CHESTS", "FAILURES", "JOURNAL")) {
-    "# $memoryName`n" | Set-Content -LiteralPath (Join-Path $root "memory\minecraft\$memoryName.md") -Encoding UTF8
-}
-$mcpConfig = @{ mcpServers = @{ minecraft = @{ url = "http://127.0.0.1:$McpPort/mcp"; requestTimeoutMs = $McpRequestTimeoutMs } } } | ConvertTo-Json -Depth 4
-# Write pure UTF-8 (no BOM): Set-Content -Encoding UTF8 on Windows PowerShell 5.1
-# emits a leading BOM that breaks Pi's .mcp.json parser, so use the .NET writer.
-$mcpJsonPath = Join-Path $root ".mcp.json"
-[System.IO.File]::WriteAllText($mcpJsonPath, ($mcpConfig + "`n"), (New-Object System.Text.UTF8Encoding($false)))
-@{ schema = "pm.minecraft-character.v1"; name = $Name; minecraft = @{ host = $MinecraftHost; port = $MinecraftPort }; ports = @{ web = $WebPort; viewer = $ViewerPort; mcp = $McpPort }; paths = @{ agent_root = $root; artifact_root = $artifacts } } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $root "minecraft-character.json") -Encoding UTF8
-Write-Host "Character workspace initialized: $root"
-Write-Host "Example drafts deployed: $(($exampleDrafts | ForEach-Object { $_.Name }) -join ', ')"
-Write-Host "Artifact root: $artifacts"
-Write-Host "MCP configuration: $(Join-Path $root '.mcp.json')"

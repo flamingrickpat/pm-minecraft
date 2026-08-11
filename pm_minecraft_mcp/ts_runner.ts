@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import type {
   MinecraftContext,
@@ -177,6 +177,32 @@ function frameIdentifier(payload: Record<string, unknown>): string | null {
     ? (metadata as Record<string, unknown>).frameId as string
     : null;
 }
+
+function installStdinLifecycle(): void {
+  // Embedded mode: the Python supervisor owns the write end of our stdin
+  // pipe. When the supervisor (or its whole process) dies, the pipe ends
+  // and this runner treats it exactly like an external kill/stop signal:
+  // drop the cancel marker so the skill breaks out and writes a clean
+  // result, then force-exit if it overstays. No detached processes.
+  if (process.env.MINECRAFT_STDIN_LIFECYCLE !== "1") {
+    return;
+  }
+  process.stdin.on("end", () => {
+    const cancelPath = process.env.MINECRAFT_CANCEL_PATH;
+    if (cancelPath) {
+      try {
+        writeFileSync(cancelPath, "stdin eof\r\n");
+      } catch {
+        // Best effort: the hard exit below still bounds the lifetime.
+      }
+    }
+    setTimeout(() => process.exit(1), 15_000).unref();
+  });
+  process.stdin.on("error", () => undefined);
+  process.stdin.resume();
+}
+
+installStdinLifecycle();
 
 async function main(): Promise<void> {
   const args = parseArguments(process.argv.slice(2));

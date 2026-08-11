@@ -30,7 +30,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $agentHome = [System.IO.Path]::GetFullPath($AgentRoot)
 $artifactRoot = [System.IO.Path]::GetFullPath($ArtifactRoot)
-$server = Join-Path $repoRoot "mcp\minecraft_mcp.py"
+$module = "pm_minecraft_mcp.minecraft_mcp"
 $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
 
 function Test-TcpReachable([string]$HostName, [int]$Port, [int]$TimeoutMilliseconds = 2000) {
@@ -53,8 +53,8 @@ function Test-LocalPortAvailable([int]$Port) {
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "MCP virtual environment is missing. Run .\scripts\setup.ps1 first."
 }
-if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
-    throw "Minecraft MCP server not found: $server"
+if (-not (Test-Path -LiteralPath (Join-Path $repoRoot "pm_minecraft_mcp\minecraft_mcp.py") -PathType Leaf)) {
+    throw "Minecraft MCP server not found: pm_minecraft_mcp/minecraft_mcp.py"
 }
 foreach ($required in @("AGENTS.md", ".mcp.json", "lib\minecraft.ts", "memory\minecraft", "drafts", "skills")) {
     if (-not (Test-Path -LiteralPath (Join-Path $agentHome $required))) {
@@ -71,7 +71,7 @@ foreach ($port in @($WebPort, $ViewerPort, $McpPort)) {
 }
 
 $arguments = @(
-    $server, "--mc-host", $MinecraftHost, "--mc-port", $MinecraftPort,
+    "-m", $module, "--mc-host", $MinecraftHost, "--mc-port", $MinecraftPort,
     "--username", $Name, "--agent-home", $agentHome,
     "--artifact-root", $artifactRoot, "--web-host", $WebHost,
     "--web-port", $WebPort, "--viewer-port", $ViewerPort,
