@@ -30,7 +30,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $agentHome = [System.IO.Path]::GetFullPath($AgentRoot)
 $artifactRoot = [System.IO.Path]::GetFullPath($ArtifactRoot)
-$module = "pm_minecraft_mcp.minecraft_mcp"
+$module = "pm_minecraft_mcp"
 $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
 
 function Test-TcpReachable([string]$HostName, [int]$Port, [int]$TimeoutMilliseconds = 2000) {
