@@ -36,3 +36,7 @@ export interface JumpPlaceBlockInput extends PlaceBlockInput {}
 export interface UseBlockInput extends BlockCommandOptions {
   block: Vector3;
 }
+
+export interface AttackEntityInput extends BlockCommandOptions {
+  entityId: number;
+}

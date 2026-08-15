@@ -2,7 +2,7 @@ import type { Bot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { CommandResult } from "../commands/commandQueue.js";
-import type { FindBlockInput, JumpPlaceBlockInput, MineBlockInput, NavigationProfile, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
+import type { AttackEntityInput, FindBlockInput, JumpPlaceBlockInput, MineBlockInput, NavigationProfile, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
 import { isVisibleFromHead } from "../perception/visibility.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
@@ -40,7 +40,7 @@ class NavigationFailure extends Error {
  *
  * @remarks
  * archetype: service-provider
- * owns: look, pathfinder walk, dig, place, block activation, and block inspection calls against one live bot.
+ * owns: look, pathfinder walk, dig, place, block activation, entity attack, and block inspection calls against one live bot.
  * not own: HTTP validation, command serialization, item/tool choice, recipe choice, or autonomous recovery.
  * fails when: target chunks are unloaded, pathfinder cannot reach, Mineflayer rejects the action, or targets are out of range.
  * domain: every method performs one user-requested Minecraft action or its bounded internal walk/look sequence.
@@ -58,6 +58,7 @@ export interface PhysicalCommandActions {
   jumpPlaceBlock(input: JumpPlaceBlockInput): Promise<CommandResult>;
   pillarUp(): Promise<CommandResult>;
   useBlock(input: UseBlockInput): Promise<CommandResult>;
+  attackEntity(input: AttackEntityInput): Promise<CommandResult>;
   inspectBlock(block: Vector3): Promise<CommandResult>;
 }
 
@@ -74,6 +75,14 @@ type ActionBot = Bot & {
     }
   ): Promise<void>;
   activateBlock(block: BlockLike, direction?: Vec3, cursorPos?: Vec3): Promise<void>;
+};
+
+type EntityLike = NonNullable<Bot["entity"]> & {
+  id: number;
+  name?: string;
+  username?: string;
+  displayName?: string;
+  type?: string;
 };
 
 interface BlockLike {
@@ -279,8 +288,28 @@ export function createPhysicalCommandActions(
             }
           );
         }
-        await (bot as ActionBot).dig(visibleTarget, true, "raycast");
+        let digError: unknown = null;
+        const digPromise = (bot as ActionBot).dig(visibleTarget, true, "raycast").then(
+          () => undefined,
+          (error: unknown) => {
+            digError = error;
+          }
+        );
+        await Promise.race([
+          digPromise,
+          waitForBlockRemoved(bot, vec(target), 25_000)
+        ]);
         const after = blockAt(bot, target);
+        if (digError && after && after.name !== "air" && after.boundingBox !== "empty") {
+          throw digError;
+        }
+        if (after && after.name !== "air" && after.boundingBox !== "empty") {
+          return failed("dig_unverified", "Mineflayer returned without removing the target block.", {
+            block: target,
+            blockName: visibleTarget.name,
+            resultBlockName: after.name
+          });
+        }
 
         // Walk to the drop location to collect the item, but only when the
         // drop is out of pickup range already — pathfinder calls are slow.
@@ -565,6 +594,57 @@ export function createPhysicalCommandActions(
         return failed("use_failed", `Mineflayer use failed: ${errorMessage(error)}`, { block: target, blockName: block.name });
       }
     },
+    attackEntity: async ({ entityId, walkIntoRange }) => {
+      const resolveTarget = (): EntityLike | null => {
+        const entity = bot.entities?.[entityId] as EntityLike | undefined;
+        return entity && entity !== bot.entity && entity.position ? entity : null;
+      };
+      let target = resolveTarget();
+      if (!target) {
+        return failed("entity_not_found", "The observed entity is no longer present.", { entityId });
+      }
+      const label = target.username ?? target.name ?? target.displayName ?? `entity ${entityId}`;
+      if (bot.entity.position.distanceTo(target.position) > 4) {
+        if (!walkIntoRange) {
+          return failed("entity_out_of_range", `${label} is outside attack range.`, {
+            entityId,
+            distance: bot.entity.position.distanceTo(target.position)
+          });
+        }
+        try {
+          await gotoNear(bot, vector(target.position), 2.5, "walk_only");
+        } catch (error) {
+          return failed("entity_unreachable", `Could not reach ${label}: ${errorMessage(error)}`, { entityId });
+        }
+        target = resolveTarget();
+        if (!target) {
+          return failed("entity_not_found", `${label} moved out of the loaded world.`, { entityId });
+        }
+      }
+      const distance = bot.entity.position.distanceTo(target.position);
+      if (distance > 4) {
+        return failed("entity_out_of_range", `${label} moved outside attack range.`, { entityId, distance });
+      }
+      try {
+        const eyeTarget = target.position.offset(0, 0.8, 0);
+        await bot.lookAt(eyeTarget, false);
+        syncTrackedToTarget(eyeTarget);
+        await bot.attack(target);
+        await new Promise(resolve => setTimeout(resolve, 350));
+        return {
+          ok: true,
+          message: `Attacked ${label} once.`,
+          data: {
+            entityId,
+            name: label,
+            kind: target.type ?? "unknown",
+            targetStillPresent: resolveTarget() !== null
+          }
+        };
+      } catch (error) {
+        return failed("attack_failed", `Mineflayer attack failed: ${errorMessage(error)}`, { entityId, name: label });
+      }
+    },
     inspectBlock: async (target) => {
       const block = blockAt(bot, target);
       if (!block) {
@@ -574,6 +654,7 @@ export function createPhysicalCommandActions(
       const canHarvestWithHeldItem = typeof block.canHarvest === "function"
         ? Boolean(block.canHarvest(bot.heldItem?.type ?? null))
         : null;
+      const digTimeMs = block.diggable ? bot.digTime(block) : null;
       return {
         ok: true,
         message: "Inspected block.",
@@ -584,6 +665,7 @@ export function createPhysicalCommandActions(
           type: block.type,
           diggable: block.diggable ?? null,
           boundingBox: block.boundingBox ?? null,
+          digTimeMs: Number.isFinite(digTimeMs) ? digTimeMs : null,
           heldItem,
           canHarvestWithHeldItem
         }
@@ -624,6 +706,17 @@ async function waitForSolidBlock(bot: Bot, position: Vec3, timeoutMs: number): P
     await new Promise(resolve => setTimeout(resolve, 50));
   } while (Date.now() < deadline);
   return null;
+}
+
+async function waitForBlockRemoved(bot: Bot, position: Vec3, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const block = blockAt(bot, position);
+    if (!block || block.name === "air" || block.boundingBox === "empty") return true;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  } while (Date.now() < deadline);
+  const block = blockAt(bot, position);
+  return !block || block.name === "air" || block.boundingBox === "empty";
 }
 
 export function installPathfinder(bot: Bot): void {

@@ -263,6 +263,10 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     await handleUseBlock(request, response, options);
     return;
   }
+  if (request.method === "POST" && request.url === "/api/command/attack-entity") {
+    await queuedAction(request, response, options, "attack_entity", parseAttackEntity, (actions, input) => actions.attackEntity(input));
+    return;
+  }
   if (request.method === "POST" && request.url === "/api/command/inspect") {
     await inspectBlock(request, response, options);
     return;
@@ -1257,6 +1261,14 @@ function parseUseBlock(body: Record<string, unknown>): Parsed<{ block: Vector3; 
     return block;
   }
   return { ok: true, value: { block: block.value, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
+}
+
+function parseAttackEntity(body: Record<string, unknown>): Parsed<{ entityId: number; walkIntoRange: boolean }> {
+  const entityId = body.entityId;
+  if (!Number.isInteger(entityId) || typeof entityId !== "number" || entityId < 0) {
+    return { ok: false, error: "invalid_entity_id", message: "entityId must be a non-negative integer from a fresh observation." };
+  }
+  return { ok: true, value: { entityId, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
 }
 
 function parsePixelTarget(body: Record<string, unknown>): Parsed<{ frameId: string; x: number; y: number; maxDistance: number }> {

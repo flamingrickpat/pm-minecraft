@@ -73,6 +73,17 @@ listed in its `AGENTS.md`. They run as-is through
 its guard-and-verify shape into a new draft. Add an example to `deploy/drafts/`
 to ship it with every new character.
 
+The agent can call `minecraft_list_capabilities` before it writes a new behavior.
+If no capability fits, the agent writes a TypeScript draft from generic body actions.
+The agent runs the draft with a deterministic postcondition.
+After a successful run, `minecraft_promote_skill` copies the draft into `skills/`.
+The promotion record includes the source hash, execution ID, and postcondition.
+
+Entity observations include stable runtime IDs while each entity remains loaded.
+The generic `attack_entity` action performs one ordinary survival attack against an observed ID.
+For a kill goal, the agent must verify a survival result, such as an inventory increase.
+A skill can combine observation, movement, equipment, attacks, and verification into behaviors such as hunting.
+
 Stop an instance with:
 
 ```powershell

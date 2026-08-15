@@ -25,7 +25,7 @@ from mcp.types import ImageContent, TextContent
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ._runtime import ensure_node_runtime, node_executable
-from .standalone_support import atomic_write_bytes, readable_yaml_bytes
+from .standalone_support import atomic_write_bytes, read_readable_yaml, readable_yaml_bytes
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 MCP_DIR = Path(__file__).resolve().parent
@@ -267,6 +267,28 @@ def slug(value: str) -> str:
     return rendered
 
 
+class EventNotifications(BaseModel):
+    """Which body-state changes become report-event inbox messages.
+
+    The MCP polls/diffs the body and emits one pm.inbox.v1 report-event per
+    real change. No change, no emission. Everything downstream of the inbox
+    file is decided by agents, not by this configuration.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    poll_seconds: float = Field(default=5.0, ge=1.0)
+    death: bool = True
+    respawn: bool = True
+    disconnect: bool = True
+    chat: bool = True
+    sun_cycle: bool = True
+    oxygen: bool = True
+    damage_min_hearts: float = Field(default=1.0, ge=0.0)
+    hunger_min_points: float = Field(default=2.0, ge=0.0)
+
+
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -290,6 +312,9 @@ class ServerConfig(BaseModel):
     mine_visibility_ignore_distance: float = Field(default=3.0, ge=0)
     walk_to_max_distance: float = Field(default=16.0, gt=0)
     skill_timeout_seconds: float = Field(default=90.0, ge=1)
+    event_notifications: EventNotifications = Field(
+        default_factory=EventNotifications
+    )
 
     @model_validator(mode="after")
     def validate_instance_binding(self) -> ServerConfig:
@@ -376,11 +401,15 @@ class PostconditionSpec(BaseModel):
         "position_changed_min",
         "distance_max",
         "held_item",
+        "entity_id_absent",
+        "block_at",
     ] | None = None
     item: str | None = None
     count: int | None = None
     value: float | None = None
     target: PositionTarget | None = None
+    block: PositionTarget | None = None
+    entity_id: int | None = None
     all: list[PostconditionSpec] | None = None
 
     @model_validator(mode="after")
@@ -396,6 +425,8 @@ class PostconditionSpec(BaseModel):
                     self.count,
                     self.value,
                     self.target,
+                    self.block,
+                    self.entity_id,
                 )
             ):
                 raise ValueError(
@@ -431,6 +462,19 @@ class PostconditionSpec(BaseModel):
             if not self.item:
                 raise ValueError("held_item requires item")
             return self
+        if self.kind == "entity_id_absent":
+            if self.entity_id is None or self.entity_id < 0:
+                raise ValueError("entity_id_absent requires a non-negative entity_id")
+            return self
+        if self.kind == "block_at":
+            if self.block is None or not self.item:
+                raise ValueError("block_at requires block and item")
+            if any(
+                float(value) != int(value)
+                for value in (self.block.x, self.block.y, self.block.z)
+            ):
+                raise ValueError("block_at coordinates must be integers")
+            return self
         raise ValueError("postcondition requires kind or all")
 
     def as_dict(self) -> dict[str, Any]:
@@ -446,6 +490,19 @@ class BodyHttpError(RuntimeError):
         self.path = path
         self.status = status
         self.payload = payload
+
+
+class MinecraftBodyUnavailableError(RuntimeError):
+    """The body runtime answered, but no live player observation exists.
+
+    Typical causes: the bot is not connected to the Minecraft server, or it
+    died and has not spawned again yet. The observation endpoint returns an
+    error envelope instead of a player observation in that state.
+    """
+
+    def __init__(self, message: str, payload: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.payload = payload or {}
 
 
 class TeeTextStream:
@@ -486,6 +543,7 @@ class BodyApi:
         "jump_place_block": ("POST", "/api/command/jump-place-block"),
         "pillar_up": ("POST", "/api/command/pillar-up"),
         "use_block": ("POST", "/api/command/use-block"),
+        "attack_entity": ("POST", "/api/command/attack-entity"),
         "inspect": ("POST", "/api/command/inspect"),
         "rotate": ("POST", "/api/command/rotate"),
         "look_at": ("POST", "/api/command/look-at"),
@@ -511,7 +569,7 @@ class BodyApi:
         "find_block": {
             "blockName": "string",
             "maxDistance": "positive integer",
-            "requireVisible": "boolean; defaults true for realistic line-of-sight search",
+            "requireVisible": "must be true; line-of-sight search is enforced",
         },
         "walk_to": {
             "target": {"x": "number", "y": "number", "z": "number"},
@@ -537,6 +595,10 @@ class BodyApi:
             "block": {"x": "integer", "y": "integer", "z": "integer"},
             "walkIntoRange": "boolean",
         },
+        "attack_entity": {
+            "entityId": "non-negative integer from a fresh observation",
+            "walkIntoRange": "boolean",
+        },
         "inspect": {"block": {"x": "integer", "y": "integer", "z": "integer"}},
         "rotate": {
             "yaw": "relative degrees; positive is right",
@@ -550,7 +612,7 @@ class BodyApi:
         },
         "sync_orientation": {},
         "stop": {},
-        "hotbar_select": {"slot": "integer 0..8"},
+        "hotbar_select": {"hotbarIndex": "integer 0..8"},
         "inventory_select": {"slot": "inventory slot integer"},
         "inventory_equip": {"itemName": "exact Mineflayer item name"},
         "open_inventory": {},
@@ -587,6 +649,7 @@ class BodyApi:
         "jumpPlaceBlock": "jump_place_block",
         "pillarUp": "pillar_up",
         "useBlock": "use_block",
+        "attackEntity": "attack_entity",
         "lookAt": "look_at",
         "fineControl": "fine_control",
         "syncOrientation": "sync_orientation",
@@ -715,6 +778,13 @@ class AgentHome:
             )
 
     def write_character(self, observation: dict[str, Any]) -> None:
+        if not isinstance(observation, dict) or not isinstance(
+            observation.get("player"), dict
+        ):
+            raise ValueError(
+                "write_character requires a live observation with a player "
+                "section; got an error or disconnected payload instead"
+            )
         player = observation["player"]
         world = observation["world"]
         inventory = observation["inventory"]
@@ -958,6 +1028,9 @@ class MinecraftMcpRuntime:
         self.active_skill: asyncio.subprocess.Process | None = None
         self.active_skill_info: dict[str, Any] | None = None
         self.skill_timeout_seconds = float(config.skill_timeout_seconds)
+        # Body event detection cursor (in-memory; baselined on first sight).
+        self.event_cursor: dict[str, Any] | None = None
+        self.last_activity = time.monotonic()
 
     def _reset_material_progress(self) -> None:
         self.material_no_gain_streak = 0
@@ -1217,6 +1290,183 @@ class MinecraftMcpRuntime:
             encoding="utf-8",
         )
 
+    @property
+    def capability_catalog_path(self) -> Path:
+        return self.home.skills_dir / "capabilities.json"
+
+    def list_capabilities(self) -> dict[str, Any]:
+        """List reusable character skills and their verified promotion evidence."""
+        catalog: dict[str, Any] = {}
+        if self.capability_catalog_path.is_file():
+            try:
+                loaded = json.loads(
+                    self.capability_catalog_path.read_text(encoding="utf-8")
+                )
+                if isinstance(loaded, dict):
+                    catalog = loaded
+            except (OSError, json.JSONDecodeError):
+                catalog = {}
+        metadata_by_path = {
+            str(item.get("path")): item
+            for item in catalog.get("capabilities", [])
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+        }
+        capabilities = []
+        for path in sorted(self.home.skills_dir.glob("*.ts")):
+            relative = path.relative_to(self.home.root).as_posix()
+            metadata = metadata_by_path.get(relative, {})
+            digest = self._skill_digest(path)
+            capabilities.append(
+                {
+                    "name": metadata.get("name") or path.stem,
+                    "path": relative,
+                    "description": metadata.get("description") or "",
+                    "sha256": digest,
+                    "verifiedExecutionId": metadata.get("verifiedExecutionId"),
+                    "verifiedPostcondition": metadata.get("verifiedPostcondition"),
+                    "promotedAt": metadata.get("promotedAt"),
+                    "sourceTaskId": metadata.get("sourceTaskId"),
+                    "versionExecuted": self.skill_versions.get(str(path)) == digest,
+                }
+            )
+        return {
+            "schema": "pm.minecraft-capabilities.v1",
+            "skillsDirectory": str(self.home.skills_dir),
+            "count": len(capabilities),
+            "capabilities": capabilities,
+        }
+
+    def promote_skill(
+        self,
+        *,
+        draft_path: str,
+        name: str,
+        description: str,
+        execution_id: str,
+        source_task_id: str | None = None,
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        """Promote one draft only when a matching execution passed its postcondition."""
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", name):
+            raise ValueError(
+                "name must use 2-64 lowercase letters, digits, hyphens, or underscores"
+            )
+        rendered_description = description.strip()
+        if not rendered_description or len(rendered_description) > 500:
+            raise ValueError("description must contain 1-500 characters")
+        if not re.fullmatch(r"exec-[a-f0-9]{12}", execution_id):
+            raise ValueError("execution_id must be an MCP TypeScript execution id")
+
+        source = Path(draft_path).expanduser()
+        if not source.is_absolute():
+            source = self.home.root / source
+        source = source.resolve()
+        drafts_root = self.home.drafts_dir.resolve()
+        try:
+            source.relative_to(drafts_root)
+        except ValueError as exc:
+            raise ValueError("draft_path must be inside this character's drafts directory") from exc
+        if not source.is_file() or source.suffix.lower() not in {".ts", ".mts", ".cts"}:
+            raise FileNotFoundError(source)
+
+        run_dir = self.execution_dir / execution_id
+        input_path = run_dir / "input.yaml"
+        result_path = run_dir / "result.yaml"
+        if not input_path.is_file() or not result_path.is_file():
+            raise ValueError("execution evidence is missing")
+        execution_input = read_readable_yaml(input_path)
+        execution_result = read_readable_yaml(result_path)
+        if not isinstance(execution_input, dict) or not isinstance(execution_result, dict):
+            raise ValueError("execution evidence is invalid")
+        recorded_path = Path(str(execution_input.get("skill_path") or ""))
+        if not recorded_path.is_absolute():
+            recorded_path = self.home.root / recorded_path
+        recorded_digest = str(execution_input.get("skill_sha256") or "")
+        digest = self._skill_digest(source)
+        if recorded_path.resolve() != source or recorded_digest != digest:
+            raise ValueError("the draft changed after the named execution")
+        verification = execution_result.get("verification")
+        if (
+            execution_result.get("ok") is not True
+            or execution_result.get("status") != "succeeded"
+            or not isinstance(verification, dict)
+            or verification.get("ok") is not True
+        ):
+            raise ValueError("the named execution did not pass its postcondition")
+
+        existing: list[dict[str, Any]] = []
+        if self.capability_catalog_path.is_file():
+            try:
+                current_catalog = json.loads(
+                    self.capability_catalog_path.read_text(encoding="utf-8")
+                )
+                if isinstance(current_catalog, dict) and isinstance(
+                    current_catalog.get("capabilities"), list
+                ):
+                    existing = [
+                        item
+                        for item in current_catalog["capabilities"]
+                        if isinstance(item, dict)
+                    ]
+            except (OSError, json.JSONDecodeError):
+                existing = []
+        same_name = next(
+            (item for item in existing if item.get("name") == name), None
+        )
+        if same_name is not None and not replace:
+            raise FileExistsError(
+                f"capability already exists: {name}; pass replace=true to revise it"
+            )
+        destination = (self.home.skills_dir / f"{name}{source.suffix.lower()}").resolve()
+        if destination.exists() and not replace:
+            raise FileExistsError(
+                f"capability already exists: {destination.name}; pass replace=true to revise it"
+            )
+        shutil.copy2(source, destination)
+        entry = {
+            "name": name,
+            "path": destination.relative_to(self.home.root).as_posix(),
+            "description": rendered_description,
+            "sha256": digest,
+            "sourceDraft": source.relative_to(self.home.root).as_posix(),
+            "verifiedExecutionId": execution_id,
+            "verifiedPostcondition": execution_input.get("postcondition"),
+            "promotedAt": utc_now(),
+            "sourceTaskId": source_task_id,
+        }
+        if replace and same_name is not None:
+            old_relative = same_name.get("path")
+            if isinstance(old_relative, str):
+                old_path = (self.home.root / old_relative).resolve()
+                try:
+                    old_path.relative_to(self.home.skills_dir.resolve())
+                except ValueError:
+                    old_path = destination
+                if old_path != destination and old_path.is_file():
+                    old_path.unlink()
+        rows = [
+            item
+            for item in existing
+            if isinstance(item, dict) and item.get("name") != name
+        ]
+        rows.append(entry)
+        rows.sort(key=lambda item: str(item.get("name") or ""))
+        atomic_write_bytes(
+            self.capability_catalog_path,
+            (
+                json.dumps(
+                    {
+                        "schema": "pm.minecraft-capabilities.v1",
+                        "capabilities": rows,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        return entry
+
     def set_skill_timeout(self, seconds: float, minimum: float = 1.0, maximum: float = 3600.0) -> float:
         if (
             isinstance(seconds, bool)
@@ -1246,8 +1496,51 @@ class MinecraftMcpRuntime:
                 {"observedGameMode": game_mode, "capturedAt": observation.get("capturedAt")},
             )
 
+    def _body_unavailable_reason(
+        self, observation: dict[str, Any]
+    ) -> str:
+        """Build one diagnostic line for a missing live observation."""
+        reason = str(
+            observation.get("message")
+            or observation.get("error")
+            or "observation unavailable"
+        )
+        details: list[str] = []
+        try:
+            state = self.api.state()
+            details.append(f"connected={state.get('connected')}")
+        except Exception:
+            details.append("state endpoint unreachable")
+        try:
+            health = self.api.health()
+            mineflayer = health.get("mineflayer") if isinstance(health, dict) else None
+            if isinstance(mineflayer, dict):
+                details.append(f"spawned={mineflayer.get('spawned')}")
+                details.append(f"deathCount={mineflayer.get('deathCount')}")
+                if mineflayer.get("lastDeathAt"):
+                    details.append(f"lastDeathAt={mineflayer['lastDeathAt']}")
+        except Exception:
+            details.append("health endpoint unreachable")
+        return (
+            f"Minecraft body '{self.config.username}' cannot observe right "
+            f"now: {reason} ({'; '.join(details) if details else 'no diagnostics'}). "
+            "The body must be connected to the server and spawned before "
+            "observations or actions can run. This is an environment state, "
+            "not a script defect; do not repair drafts because of it."
+        )
+
     def _snapshot_sync(self, include_image: bool | None = None) -> dict[str, Any]:
+        self.last_activity = time.monotonic()
         observation = self.api.observe()
+        if not isinstance(observation, dict) or not isinstance(
+            observation.get("player"), dict
+        ):
+            # The body answered, but no live player exists (disconnected or
+            # dead before respawn). Fail with diagnostics instead of crashing
+            # on missing observation sections.
+            raise MinecraftBodyUnavailableError(
+                self._body_unavailable_reason(observation), observation
+            )
         self.inspect_survival_provenance(observation)
         self.home.write_character(observation)
         # A screenshot is captured (and written to artifacts/.../screenshots)
@@ -1287,6 +1580,9 @@ class MinecraftMcpRuntime:
             self.config.player_log_dir / "current_state.yaml",
             state_record,
         )
+        self._detect_and_emit_body_events(
+            observation, state_record, frame, state_path
+        )
         return {
             "observation": observation,
             "frame": frame,
@@ -1296,6 +1592,286 @@ class MinecraftMcpRuntime:
 
     async def snapshot(self, include_image: bool | None = None) -> dict[str, Any]:
         return await asyncio.to_thread(self._snapshot_sync, include_image)
+
+    # -- body event detection ------------------------------------------------ #
+    #
+    # Every snapshot (tool-driven or idle-poll-driven) diffs the body state
+    # against the previous sighting. A real value change becomes one
+    # pm.inbox.v1 report-event file in agent-home/ingress/inbox/new/. No
+    # change means no emission at all. What an event *means* is decided
+    # downstream by agents; the MCP only senses and reports.
+
+    @staticmethod
+    def _event_cursor_from(
+        mineflayer: dict[str, Any], observation: dict[str, Any]
+    ) -> dict[str, Any]:
+        player = observation.get("player") if isinstance(observation.get("player"), dict) else {}
+        world = observation.get("world") if isinstance(observation.get("world"), dict) else {}
+        chat = observation.get("chat") if isinstance(observation.get("chat"), dict) else {}
+        messages = chat.get("messages") if isinstance(chat.get("messages"), list) else []
+        return {
+            "deaths": int(mineflayer.get("deathCount") or 0),
+            "spawns": int(mineflayer.get("spawnCount") or 0),
+            "connected": bool(mineflayer.get("connected")),
+            "health": player.get("health"),
+            "food": player.get("food"),
+            "oxygen": player.get("oxygenLevel"),
+            "is_day": world.get("isDay"),
+            "chat_ids": {
+                str(message.get("id"))
+                for message in messages
+                if isinstance(message, dict) and message.get("id")
+            },
+        }
+
+    def _detect_and_emit_body_events(
+        self,
+        observation: dict[str, Any],
+        state_record: dict[str, Any] | None = None,
+        frame: dict[str, Any] | None = None,
+        state_path: Path | None = None,
+    ) -> None:
+        settings = self.config.event_notifications
+        health = self.api.health()
+        mineflayer = health.get("mineflayer") if isinstance(health, dict) else {}
+        mineflayer = mineflayer if isinstance(mineflayer, dict) else {}
+        cursor = self.event_cursor
+        fresh = self._event_cursor_from(mineflayer, observation)
+        self.event_cursor = fresh
+        if not settings.enabled or cursor is None:
+            return
+        username = self.config.username
+        events: list[dict[str, Any]] = []
+        if settings.death:
+            for _ in range(max(0, fresh["deaths"] - cursor["deaths"])):
+                events.append({
+                    "event": "death",
+                    "intent": f"{username} died in Minecraft.",
+                    "detail": {
+                        "deathCount": fresh["deaths"],
+                        "lastDeathAt": mineflayer.get("lastDeathAt"),
+                    },
+                })
+        if settings.respawn and fresh["spawns"] > cursor["spawns"]:
+            player = observation.get("player") or {}
+            events.append({
+                "event": "respawn",
+                "intent": f"{username} respawned in Minecraft.",
+                "detail": {
+                    "spawnCount": fresh["spawns"],
+                    "position": player.get("position"),
+                },
+            })
+        gauge_events = [
+            ("health", "damage", settings.damage_min_hearts * 2,
+             lambda before, after: (
+                 f"{username} took damage in Minecraft: health "
+                 f"{before} -> {after} of 20."
+             )),
+            ("food", "hunger", settings.hunger_min_points,
+             lambda before, after: (
+                 f"{username} grew hungrier in Minecraft: food "
+                 f"{before} -> {after} of 20."
+             )),
+        ]
+        if settings.oxygen:
+            gauge_events.append(
+                ("oxygen", "losing_air", 1,
+                 lambda before, after: (
+                     f"{username} is running out of air in Minecraft: "
+                     f"oxygen {before} -> {after} of 20."
+                 ))
+            )
+        for key, event_type, threshold, intent_for in gauge_events:
+            previous, current = cursor.get(key), fresh.get(key)
+            if (
+                isinstance(previous, (int, float))
+                and isinstance(current, (int, float))
+                and previous - current >= threshold
+            ):
+                events.append({
+                    "event": event_type,
+                    "intent": intent_for(previous, current),
+                    "detail": {"before": previous, "after": current},
+                })
+        if (
+            settings.sun_cycle
+            and isinstance(cursor.get("is_day"), bool)
+            and isinstance(fresh.get("is_day"), bool)
+            and cursor["is_day"] != fresh["is_day"]
+        ):
+            if fresh["is_day"]:
+                events.append({
+                    "event": "sunrise",
+                    "intent": f"The sun rises in {username}'s Minecraft world.",
+                    "detail": {"timeOfDay": (observation.get("world") or {}).get("timeOfDay")},
+                })
+            else:
+                events.append({
+                    "event": "sunset",
+                    "intent": (
+                        f"Night falls in {username}'s Minecraft world; time "
+                        "to get to safety."
+                    ),
+                    "detail": {"timeOfDay": (observation.get("world") or {}).get("timeOfDay")},
+                })
+        if settings.chat:
+            chat = observation.get("chat") if isinstance(observation.get("chat"), dict) else {}
+            messages = chat.get("messages") if isinstance(chat.get("messages"), list) else []
+            fresh_messages = [
+                message
+                for message in messages
+                if isinstance(message, dict)
+                and str(message.get("id") or "") not in cursor["chat_ids"]
+            ]
+            fresh_messages.sort(key=lambda message: str(message.get("receivedAt") or ""))
+            for message in fresh_messages:
+                text = str(message.get("text") or "").strip()
+                events.append({
+                    "event": "chat_message",
+                    "intent": (
+                        f"Someone spoke in {username}'s Minecraft world: "
+                        f"{text[:300]}"
+                    ),
+                    "detail": {
+                        "messageId": message.get("id"),
+                        "text": text,
+                        "position": message.get("position"),
+                        "receivedAt": message.get("receivedAt"),
+                    },
+                })
+        for event in events:
+            self._emit_body_episode(event, state_record, frame, state_path)
+
+    def _emit_body_episode(
+        self,
+        event: dict[str, Any],
+        state_record: dict[str, Any] | None,
+        frame: dict[str, Any] | None = None,
+        state_path: Path | None = None,
+    ) -> None:
+        """Write one report-event inbox file for one detected body event."""
+        inbox_new = self.config.agent_home / "ingress" / "inbox" / "new"
+        inbox_new.mkdir(parents=True, exist_ok=True)
+        identifier = f"inbox-{uuid4().hex}"
+        screenshot_rel: str | None = None
+        state_ref: str | None = None
+        state_id: str | None = None
+        excerpt: dict[str, Any] = {}
+        if isinstance(state_record, dict):
+            observation = state_record.get("observation") or {}
+            player = observation.get("player") if isinstance(observation.get("player"), dict) else {}
+            world = observation.get("world") if isinstance(observation.get("world"), dict) else {}
+            excerpt = {
+                "position": player.get("position"),
+                "dimension": world.get("dimension"),
+                "biome": world.get("biome"),
+                "health": player.get("health"),
+                "food": player.get("food"),
+                "isDay": world.get("isDay"),
+            }
+            state_id = state_record.get("state_id")
+            shot = state_record.get("screenshot")
+            if isinstance(shot, dict) and isinstance(shot.get("pngPath"), str):
+                screenshot_rel = shot["pngPath"]
+        if state_path is not None:
+            state_ref = state_path.relative_to(self.home.root).as_posix()
+        screenshot_abs: str | None = None
+        if screenshot_rel:
+            screenshot_abs = str((self.home.root / screenshot_rel).resolve())
+        payload = {
+            "schema": "pm.minecraft-body-episode.v1",
+            "event": event["event"],
+            "username": self.config.username,
+            "detected_at": utc_now(),
+            "intent": event["intent"],
+            "detail": event["detail"],
+            "state_id": state_id,
+            "state_ref": state_ref,
+            "screenshot": screenshot_rel,
+            "screenshot_abs": screenshot_abs,
+            "state_excerpt": excerpt,
+        }
+        value = {
+            "schema": "pm.inbox.v1",
+            "id": identifier,
+            "type": "report-event",
+            "created_at": utc_now(),
+            "source": {
+                "kind": "minecraft-body",
+                "provider": "pm-minecraft-mcp",
+                "conversation_id": "minecraft-body",
+            },
+            "task_ids": [],
+            "project_ids": [],
+            "related_input_ids": [],
+            "intent": event["intent"],
+            "interface_interpretation": (
+                "Body episode report from the Minecraft body. The structured "
+                "payload lives in extensions.body_episode, including a "
+                "screenshot path and a state snapshot reference. Decide "
+                "whether this deserves the character's attention: significant "
+                "experiences should reach the personality cycle as one "
+                "pending stimulus; minor events, or events already covered by "
+                "a live Minecraft task, may be recorded without further "
+                "action."
+            ),
+            "extensions": {"body_episode": payload},
+        }
+        write_readable_yaml(inbox_new / f"{identifier}.yaml", value)
+        print(
+            f"body event: {event['event']} -> inbox {identifier}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _idle_poll_once(self) -> None:
+        """One idle-poll step: snapshot when spawned, else watch the link.
+
+        Runs only when no tool-driven snapshot happened recently, so an
+        active task's own snapshots already carry event detection.
+        """
+        settings = self.config.event_notifications
+        if time.monotonic() - self.last_activity < settings.poll_seconds:
+            return
+        health = self.api.health()
+        mineflayer = health.get("mineflayer") if isinstance(health, dict) else {}
+        mineflayer = mineflayer if isinstance(mineflayer, dict) else {}
+        connected = bool(mineflayer.get("connected"))
+        spawned = bool(mineflayer.get("spawned"))
+        if spawned:
+            self._snapshot_sync()
+            return
+        cursor = self.event_cursor
+        if cursor is None:
+            self.event_cursor = {
+                "deaths": int(mineflayer.get("deathCount") or 0),
+                "spawns": int(mineflayer.get("spawnCount") or 0),
+                "connected": connected,
+                "health": None,
+                "food": None,
+                "oxygen": None,
+                "is_day": None,
+                "chat_ids": set(),
+            }
+            return
+        if settings.disconnect and settings.enabled and cursor.get("connected") and not connected:
+            self._emit_body_episode(
+                {
+                    "event": "disconnect",
+                    "intent": (
+                        f"{self.config.username}'s Minecraft body "
+                        "disconnected from the server."
+                    ),
+                    "detail": {
+                        "lastError": mineflayer.get("lastError"),
+                        "lastDeathAt": mineflayer.get("lastDeathAt"),
+                    },
+                },
+                None,
+                None,
+            )
+        cursor["connected"] = connected
 
     def model_state_update(
         self, observation: dict[str, Any], force_full: bool = False
@@ -2022,6 +2598,12 @@ class MinecraftMcpRuntime:
             json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
         )
         after = await self.snapshot(include_image)
+        await asyncio.to_thread(
+            add_exact_block_evidence,
+            self.api,
+            postcondition,
+            after["observation"],
+        )
         delta = state_delta(
             before["observation"],
             after["observation"],
@@ -2434,7 +3016,7 @@ def compact_observation(observation: dict[str, Any]) -> dict[str, Any]:
         ],
         "localAirspace": compact_local_airspace(surroundings.get("localAirspace")),
         "nearbyEntities": [
-            {key: entity.get(key) for key in ("name", "kind", "position", "distance")}
+            {key: entity.get(key) for key in ("id", "name", "kind", "position", "distance")}
             for entity in surroundings.get("nearbyEntities", [])[
                 :COMPACT_NEARBY_ENTITIES
             ]
@@ -2729,7 +3311,86 @@ def evaluate_postcondition_check(
         held = after["inventory"].get("heldItem")
         actual = held.get("name") if isinstance(held, dict) else None
         return {"kind": kind, "ok": actual == item, "expected": item, "actual": actual}
+    if kind == "entity_id_absent":
+        entity_id = check.get("entity_id")
+        if not isinstance(entity_id, int) or entity_id < 0:
+            raise ValueError("entity_id_absent requires entity_id:non-negative integer")
+        nearby = after.get("surroundings", {}).get("nearbyEntities", [])
+        present = any(
+            isinstance(entity, dict) and entity.get("id") == entity_id
+            for entity in nearby
+        )
+        return {
+            "kind": kind,
+            "ok": not present,
+            "entityId": entity_id,
+            "present": present,
+        }
+    if kind == "block_at":
+        block = check.get("block")
+        item = check.get("item")
+        if (
+            not isinstance(block, dict)
+            or not all(isinstance(block.get(axis), (int, float)) for axis in ("x", "y", "z"))
+            or not isinstance(item, str)
+        ):
+            raise ValueError("block_at requires block:{x,y,z} and item:string")
+        coordinate = block_coordinate_key(block)
+        evidence = after.get("postconditionBlocks", {}).get(coordinate)
+        actual = evidence.get("blockName") if isinstance(evidence, dict) else None
+        return {
+            "kind": kind,
+            "ok": actual == item,
+            "block": {axis: int(block[axis]) for axis in ("x", "y", "z")},
+            "expected": item,
+            "actual": actual,
+            "evidence": evidence,
+        }
     raise ValueError(f"unknown postcondition kind {kind!r}")
+
+
+def block_coordinate_key(block: dict[str, Any]) -> str:
+    return ",".join(str(int(block[axis])) for axis in ("x", "y", "z"))
+
+
+def postcondition_block_targets(specification: dict[str, Any]) -> list[dict[str, int]]:
+    children = specification.get("all")
+    if isinstance(children, list):
+        targets: list[dict[str, int]] = []
+        for child in children:
+            if isinstance(child, dict):
+                targets.extend(postcondition_block_targets(child))
+        return targets
+    if specification.get("kind") != "block_at":
+        return []
+    block = specification.get("block")
+    if not isinstance(block, dict) or not all(
+        isinstance(block.get(axis), (int, float)) for axis in ("x", "y", "z")
+    ):
+        return []
+    return [{axis: int(block[axis]) for axis in ("x", "y", "z")}]
+
+
+def add_exact_block_evidence(
+    api: BodyApi,
+    specification: dict[str, Any],
+    observation: dict[str, Any],
+) -> None:
+    targets = postcondition_block_targets(specification)
+    if not targets:
+        return
+    evidence: dict[str, Any] = {}
+    for block in targets:
+        key = block_coordinate_key(block)
+        if key in evidence:
+            continue
+        try:
+            result = api.call("inspect", {"block": block}, timeout_seconds=5)
+            data = result.get("data") if isinstance(result, dict) else None
+            evidence[key] = data if isinstance(data, dict) else {"error": result}
+        except (BodyHttpError, OSError, TimeoutError) as error:
+            evidence[key] = {"error": str(error)}
+    observation["postconditionBlocks"] = evidence
 
 
 def vector_distance(left: dict[str, Any], right: dict[str, Any]) -> float:
@@ -2817,9 +3478,40 @@ def heartbeat_from_observation(elapsed: float, observation: dict[str, Any]) -> d
     }
 
 
+async def _poll_body_events(runtime: MinecraftMcpRuntime) -> None:
+    """Keep sensing the body while no task is driving snapshots.
+
+    The poller shares the runtime lock with tool calls and reuses the same
+    snapshot path, so event detection has exactly one code path.
+    """
+    settings = runtime.config.event_notifications
+    while True:
+        await asyncio.sleep(settings.poll_seconds)
+        if not settings.enabled:
+            continue
+        async with runtime.lock:
+            try:
+                await asyncio.to_thread(runtime._idle_poll_once)
+            except Exception as exc:
+                print(
+                    f"body event poll skipped: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+
 def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
+    @contextlib.asynccontextmanager
+    async def _body_event_lifespan(server: FastMCP):
+        poller = asyncio.create_task(_poll_body_events(runtime))
+        try:
+            yield {}
+        finally:
+            poller.cancel()
+
     mcp = FastMCP(
         name=f"Minecraft: {runtime.config.username}",
+        lifespan=_body_event_lifespan,
         instructions=(
             f"You embody Minecraft player {runtime.config.username}. Observe before acting. "
             f"Use low-level tools while discovering a procedure, write TypeScript drafts in {runtime.home.drafts_dir}, and promote verified skills to {runtime.home.skills_dir} "
@@ -2861,6 +3553,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
                 },
                 "y_min|y_max|health_min|position_changed_min": {"kind": "y_min", "value": 64},
                 "held_item": {"kind": "held_item", "item": "stone_pickaxe"},
+                "entity_id_absent": {"kind": "entity_id_absent", "entity_id": 123},
+                "block_at": {
+                    "kind": "block_at",
+                    "block": {"x": 0, "y": 64, "z": 0},
+                    "item": "oak_planks",
+                },
                 "all (compose any postconditions)": {
                     "all": [
                         {"kind": "inventory_min", "item": "iron_pickaxe", "count": 1},
@@ -2873,7 +3571,9 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
                 "maxTimeoutSeconds": runtime.skill_timeout_seconds,
                 "acceptedExtensions": [".ts", ".mts", ".cts"],
                 "compositionPreferred": True,
+                "promotionRequiresVerifiedExecution": True,
             },
+            "capabilities": runtime.list_capabilities(),
             "timeouts": {
                 "skillTimeoutSeconds": runtime.skill_timeout_seconds,
                 "hint": "Use minecraft_set_skill_timeout to raise/lower the max skill duration to match your client's requestTimeoutMs; keep it below your agent harness's request timeout or long skills will run server-side past your client window.",
@@ -2881,6 +3581,32 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
             "runStatus": runtime.run_status(),
             "health": health,
         }
+
+    @mcp.tool
+    async def minecraft_list_capabilities() -> dict[str, Any]:
+        """List reusable TypeScript skills that belong to this character."""
+        async with runtime.lock:
+            return runtime.list_capabilities()
+
+    @mcp.tool
+    async def minecraft_promote_skill(
+        draft_path: str,
+        name: str,
+        description: str,
+        execution_id: str,
+        source_task_id: str | None = None,
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        """Promote a character draft after its named execution passed the mandatory postcondition."""
+        async with runtime.lock:
+            return runtime.promote_skill(
+                draft_path=draft_path,
+                name=name,
+                description=description,
+                execution_id=execution_id,
+                source_task_id=source_task_id,
+                replace=replace,
+            )
 
     @mcp.tool
     async def minecraft_observe(
@@ -2897,7 +3623,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         include_image: bool = False,
     ) -> ToolResult:
         """Call a named Minecraft action using the exact schema from minecraft_info. Returns authoritative after-state and delta."""
-        return await runtime.call_tool(action, parameters, timeout_seconds, include_image)
+        safe_parameters = dict(parameters)
+        if action == "find_block":
+            safe_parameters["requireVisible"] = True
+        return await runtime.call_tool(
+            action, safe_parameters, timeout_seconds, include_image
+        )
 
     @mcp.tool
     async def minecraft_find_block(
@@ -3091,7 +3822,7 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     ) -> ToolResult:
         """Execute a local TypeScript skill in drafts/ or skills/. Normal exit counts as success only if the mandatory after-state `postcondition` also passes.
 
-        postcondition kinds (pick ONE): inventory_min{item,count}, inventory_delta_min{item,count}, held_item{item}, y_min/y_max/health_min/position_changed_min{value}, distance_max{target:{x,y,z},value}. To compose several, pass a single object with only an `all` array (NO kind key): {"all":[{...},{...}]}.
+        postcondition kinds (pick ONE): inventory_min{item,count}, inventory_delta_min{item,count}, held_item{item}, entity_id_absent{entity_id}, block_at{block:{x,y,z},item}, y_min/y_max/health_min/position_changed_min{value}, distance_max{target:{x,y,z},value}. To compose several, pass a single object with only an `all` array (NO kind key): {"all":[{...},{...}]}.
 
         Runs up to timeout_seconds (default = the server's skillTimeoutSeconds; raise with minecraft_set_skill_timeout) in its own subprocess and returns a heartbeat every heartbeat_seconds. If it completes, Returns the result; if the caller times out first the skill keeps running server-side (call minecraft_observe to track, minecraft_stop/minecraft_kill_skill to halt it). Keep skillTimeoutSeconds at or below your client's requestTimeoutMs."""
         effective_timeout = timeout_seconds if timeout_seconds is not None else runtime.skill_timeout_seconds
@@ -3114,6 +3845,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
             snapshot = await runtime.snapshot(False)
         observation = snapshot["observation"]
         specification = postcondition.as_dict()
+        await asyncio.to_thread(
+            add_exact_block_evidence,
+            runtime.api,
+            specification,
+            observation,
+        )
         return {
             "stateId": snapshot["stateId"],
             "stateRef": snapshot["stateRef"],

@@ -194,6 +194,12 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
           }
           return bot.actions.useBlock(input);
         },
+        attackEntity: async (input) => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.attackEntity(input);
+        },
         inspectBlock: async (input) => {
           if (!bot || !bot.status.connected) {
             throw new Error("Bot is not connected.");

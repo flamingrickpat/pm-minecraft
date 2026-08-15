@@ -94,7 +94,7 @@ export interface LLMStateSnapshot {
       };
     };
     /** Entities within 16 blocks, sorted by distance. */
-    nearbyEntities: Array<{ name: string; kind: string; position: { x: number; y: number; z: number }; distance: number }>;
+    nearbyEntities: Array<{ id: number; name: string; kind: string; position: { x: number; y: number; z: number }; distance: number }>;
     /** Nearby water/lava the player would hear (danger source + direction). */
     hazards: Array<{ type: "water" | "lava"; direction: string | null; distance: number; nearest: { x: number; y: number; z: number } | null }>;
   };
@@ -563,8 +563,12 @@ function scanNearbyEntities(bot: Bot, center: Vec3): LLMStateSnapshot["surroundi
       if (distance > NEARBY_ENTITY_RADIUS) {
         continue;
       }
-      const raw = entity as typeof entity & { name?: string; username?: string; displayName?: string; type?: string };
+      const raw = entity as typeof entity & { id?: number; name?: string; username?: string; displayName?: string; type?: string };
+      if (!Number.isInteger(raw.id)) {
+        continue;
+      }
       results.push({
+        id: raw.id!,
         name: raw.username ?? raw.name ?? raw.displayName ?? "unknown",
         kind: raw.type ?? "unknown",
         position: roundVec(entity.position, DECIMALS),

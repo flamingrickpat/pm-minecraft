@@ -47,3 +47,9 @@ def readable_yaml_bytes(value: Any) -> bytes:
     stream = StringIO()
     yaml.dump(value, stream)
     return stream.getvalue().encode("utf-8")
+
+
+def read_readable_yaml(path: Path) -> Any:
+    """Read one YAML file with the safe loader."""
+    yaml = YAML(typ="safe")
+    return yaml.load(path.read_text(encoding="utf-8"))

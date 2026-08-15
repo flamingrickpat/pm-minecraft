@@ -27,6 +27,7 @@ const routes: Record<string, ["GET" | "POST", string]> = {
   jump_place_block: ["POST", "/api/command/jump-place-block"],
   pillar_up: ["POST", "/api/command/pillar-up"],
   use_block: ["POST", "/api/command/use-block"],
+  attack_entity: ["POST", "/api/command/attack-entity"],
   inspect: ["POST", "/api/command/inspect"],
   rotate: ["POST", "/api/command/rotate"],
   look_at: ["POST", "/api/command/look-at"],
@@ -134,6 +135,7 @@ function createContext(bodyUrl: string): MinecraftContext {
     mineBlock: (block, walkIntoRange = true, timeoutSeconds = 60) => call("mine_block", { block, walkIntoRange }, timeoutSeconds),
     placeBlock: (referenceBlock, face, walkIntoRange = true, timeoutSeconds = 60) => call("place_block", { referenceBlock, face, walkIntoRange }, timeoutSeconds),
     useBlock: (block, walkIntoRange = true, timeoutSeconds = 30) => call("use_block", { block, walkIntoRange }, timeoutSeconds),
+    attackEntity: (entityId, walkIntoRange = true, timeoutSeconds = 30) => call("attack_entity", { entityId, walkIntoRange }, timeoutSeconds),
     equip: (itemName) => call("inventory_equip", { itemName }, 15),
     craft: (itemName, repetitions = 1) => call("craft_item", { itemName, repetitions }, 60),
     smelt: (inputItemName, inputCount, fuelItemName, fuelCount = 1, timeoutSeconds = 60) => call(
@@ -242,4 +244,10 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+void main().catch((error: unknown) => {
+  const rendered = error instanceof Error
+    ? error.stack ?? `${error.name}: ${error.message}`
+    : String(error);
+  console.error(rendered);
+  process.exitCode = 1;
+});

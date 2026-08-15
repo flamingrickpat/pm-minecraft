@@ -50,7 +50,9 @@ This directory is the agent's writable Minecraft workspace.
 - Connect to the minecraft MCP server configured in .mcp.json. Start with minecraft_observe; use minecraft_find_block, minecraft_walk_to, minecraft_mine_block, minecraft_craft_item, minecraft_equip, and minecraft_call for normal survival actions.
 - Returned state is compact: coordinates, distances, and angles carry one decimal, and a nearbyBlocks entry only reports harvest eligibility when the held item cannot harvest it. Read the full uncompacted snapshot under artifacts/minecraft/state when a detail is missing.
 - Fresh structured state is returned by every tool call. Durable state snapshots and screenshots are under artifacts/minecraft/state and artifacts/minecraft/screenshots. Use those files and the live Web UI to navigate and verify progress.
-- For complex behavior, write a short TypeScript draft in drafts/. Import types and helpers from lib/minecraft.ts, export one async default function, then call minecraft_execute_typescript with its path and a mandatory deterministic postcondition. Inspect the fresh after-state; move a proven draft to skills/ only after it passes.
+- Before you write a behavior, call minecraft_list_capabilities and inspect matching skills. Use a matching skill when its assumptions fit the fresh state.
+- If no skill fits, write a short TypeScript draft in drafts/. Import types and helpers from lib/minecraft.ts, and export one async default function. Compose the generic body actions into the required behavior.
+- Run the draft with minecraft_execute_typescript and one mandatory deterministic postcondition. If the result passes and the behavior is reusable, call minecraft_promote_skill with that execution ID. The promotion tool records the evidence in skills/capabilities.json.
 - These drafts ship with the workspace and already run against lib/minecraft.ts. Read one before writing a new draft, execute it directly where it fits the situation, and copy its guard-and-verify shape otherwise. Some carry world-specific constants (coordinates, tool names) that must be checked against fresh state first.
 $draftList
 
@@ -65,6 +67,7 @@ Practical gameplay tips:
 - Drops: mine_block with walk_into_range:true puts the body adjacent so the (generous) pickup collects the drop; if you see an uncollected item entity, walk to it.
 - Held-tool drift: a climb-y mine_block or pillar can leave a placeable block (dirt/cobblestone) in hand instead of your tool. ALWAYS re-equip your tool right before using it, and verify the swap (equip can report ok while the old item stays in hand).
 - minecraft_info reports the full admin/state map: action schemas, postcondition schemas, and skill policy. Re-read it whenever a tool's parameter shape is unclear.
+- A fresh observation gives each nearby entity an id. A skill can call attackEntity(id) once per attack. The entity_id_absent postcondition proves that the entity is no longer nearby. For a kill goal, also verify an expected survival result, such as an inventory increase.
 - Store durable world notes in memory/minecraft/. Use normal survival mechanics only: never use creative mode, /give, teleportation, or operator commands.
 "@
 $agentInstructions.Trim() + "`n" | Set-Content -LiteralPath (Join-Path $root "AGENTS.md") -Encoding UTF8
