@@ -278,7 +278,7 @@ class EventNotifications(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     enabled: bool = True
-    poll_seconds: float = Field(default=5.0, ge=1.0)
+    poll_seconds: float = Field(default=60.0, ge=1.0)
     death: bool = True
     respawn: bool = True
     disconnect: bool = True
