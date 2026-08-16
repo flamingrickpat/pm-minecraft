@@ -236,7 +236,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
   if (request.method === "POST" && request.url === "/api/command/walk-to") {
-    await queuedAction(request, response, options, "walk_to", parseWalkTo, (actions, input) => actions.walkTo(input));
+    await queuedAction(request, response, options, "walk_to", parseWalkTo, (actions, input, signal) => actions.walkTo(input, signal));
     return;
   }
   if (request.method === "POST" && request.url === "/api/world/find-block") {
@@ -540,7 +540,7 @@ async function queuedAction<T>(
   options: RuntimeHttpServerOptions,
   name: string,
   parse: (body: Record<string, unknown>) => Parsed<T>,
-  run: (actions: PhysicalCommandActions, input: T) => ReturnType<PhysicalCommandActions["lookAt"]>
+  run: (actions: PhysicalCommandActions, input: T, signal?: AbortSignal) => ReturnType<PhysicalCommandActions["lookAt"]>
 ): Promise<void> {
   if (!options.commands) {
     writeJson(response, 503, {
@@ -567,7 +567,7 @@ async function queuedAction<T>(
     name,
     input: { ...input.value, source: "browser" },
     timeoutMs: commandTimeout(parsed.body),
-    run: async () => run(options.commands!.actions, input.value)
+    run: async (context) => run(options.commands!.actions, input.value, context?.signal)
   });
   if (!accepted.accepted) {
     writeJson(response, accepted.statusCode, { ok: false, error: accepted.error, message: accepted.message });

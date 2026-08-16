@@ -34,6 +34,27 @@ describe("navigation diagnostics", () => {
     expect(report.diagnosis).toContain("staircase or tunnel");
   });
 
+  it("labels an exhausted search as likely unreachable or out of loaded chunks", () => {
+    const report = summarizeNavigation(
+      { status: "timeout", path: [] },
+      { x: 0, y: 64, z: 0 },
+      { x: 40, y: 64, z: 40 },
+      false
+    );
+    expect(report.diagnosis).toContain("unreachable");
+  });
+
+  it("labels a stalled bot as likely unreachable or outside the loaded world", () => {
+    const report = summarizeNavigation(
+      { status: "partial", path: [], toBreak: [], toPlace: [] } as never,
+      { x: 0, y: 64, z: 0 },
+      { x: 16, y: 64, z: 16 },
+      true
+    );
+    expect(report.stalled).toBe(true);
+    expect(report.diagnosis).toContain("unreachable");
+  });
+
   it("reports walk-only limits without suggesting destructive recovery", () => {
     const report = summarizeNavigation(
       { status: "noPath", path: [] },

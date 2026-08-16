@@ -35,6 +35,15 @@ class NavigationFailure extends Error {
   }
 }
 
+// If the bot makes no physical progress for this long while pathfinding, the
+// search is stuck (unreachable target, walled-off area, or goal outside the
+// loaded chunks). Fail fast with a diagnosis instead of letting command_queue
+// report a bare timeout at COMMAND_TIMEOUT_MS.
+const NO_PROGRESS_TIMEOUT_MS = 8_000;
+// A path is considered "movement" for the watchdog when the bot travels at
+// least this far between 500ms polls (~1 block/s floor; walking is ~4 m/s).
+const MIN_PROGRESS_DISTANCE = 0.4;
+
 /**
  * Physical commands need real Mineflayer effects; execute explicit user actions at the bot boundary.
  *
@@ -51,7 +60,7 @@ export interface PhysicalCommandActions {
   look(input: { yaw: number; pitch: number }): Promise<CommandResult>;
   getOrientation(): { yaw: number; pitch: number };
   syncOrientation(): void;
-  walkTo(input: WalkToInput): Promise<CommandResult>;
+  walkTo(input: WalkToInput, signal?: AbortSignal): Promise<CommandResult>;
   findBlock(input: FindBlockInput): Promise<CommandResult>;
   mineBlock(input: MineBlockInput): Promise<CommandResult>;
   placeBlock(input: PlaceBlockInput): Promise<CommandResult>;
@@ -170,7 +179,7 @@ export function createPhysicalCommandActions(
       // or when the UI needs to re-establish the baseline orientation.
       syncTrackedFromEntity();
     },
-    walkTo: async ({ target, tolerance, profile = "adaptive" }) => {
+    walkTo: async ({ target, tolerance, profile = "adaptive" }, signal) => {
       // Cap a single route to one chunk so a failed call is cheap to
       // diagnose and long journeys are split into explicit hops.
       const startPosition = bot.entity.position;
@@ -197,7 +206,7 @@ export function createPhysicalCommandActions(
         };
       }
       try {
-        const navigation = await gotoNear(bot, target, tolerance, profile);
+        const navigation = await gotoNear(bot, target, tolerance, profile, signal);
         return { ok: true, message: "Reached target.", data: { status: "reached", position: vector(bot.entity.position), target, navigation } };
       } catch (error) {
         return {
@@ -719,26 +728,44 @@ async function waitForBlockRemoved(bot: Bot, position: Vec3, timeoutMs: number):
   return !block || block.name === "air" || block.boundingBox === "empty";
 }
 
-export function installPathfinder(bot: Bot): void {
+/**
+ * Install mineflayer-pathfinder with a search budget derived from the command
+ * timeout.
+ *
+ * The library default thinkTimeout (5000ms) is too small for complex mountain
+ * terrain and far goals, which produced "path search exhausted its computation
+ * budget" failures. But thinkTimeout counts *compute* time, and the A* search
+ * runs ~40ms per 50ms physics tick, so N ms of budget takes ~1.25 * N of wall
+ * clock. The budget must therefore stay below the command timeout or the
+ * pathfinder can never emit its own noPath/timeout verdict before command_queue
+ * aborts the command with a generic "Command timed out".
+ */
+export function installPathfinder(bot: Bot, searchBudgetMs = 40_000): void {
   const current = bot as Bot & { pathfinder?: unknown; loadPlugin(plugin: (bot: Bot) => void): void };
   if (!current.pathfinder) {
     current.loadPlugin(pathfinder);
   }
-  // Give the A* search a much larger total compute budget. The library default
-  // (5000ms) is too small for complex mountain terrain and far goals, which is
-  // what produced the "path search exhausted its computation budget" failures.
   const pf = (bot as unknown as { pathfinder?: { thinkTimeout: number; tickTimeout: number } }).pathfinder;
   if (pf) {
-    pf.thinkTimeout = 40000;
+    pf.thinkTimeout = Math.max(5000, searchBudgetMs);
     pf.tickTimeout = 40;
   }
+}
+
+/**
+ * Convert a wall-clock command timeout into an A* compute budget that settles
+ * *before* the queue-level timeout fires (0.8 ~= 40ms tick budget / 50ms tick).
+ */
+export function pathfindingBudgetMs(commandTimeoutMs: number): number {
+  return Math.max(5000, Math.round((commandTimeoutMs - 5000) * 0.8));
 }
 
 async function gotoNear(
   bot: Bot,
   target: Vector3,
   tolerance: number,
-  profile: NavigationProfile = "adaptive"
+  profile: NavigationProfile = "adaptive",
+  signal?: AbortSignal
 ): Promise<NavigationReport> {
   const pathfinderBot = bot as Bot & {
     pathfinder?: {
@@ -756,18 +783,56 @@ async function gotoNear(
   let update: PathfinderUpdate = { status: "searching", path: [] };
   let lastPosition = bot.entity.position.clone();
   let lastProgressAt = Date.now();
+  let lastStatus = "searching";
   let stalled = false;
+  let stopReason = "The path was stopped before it could be completed.";
   const onPathUpdate = (value: PathfinderUpdate): void => {
     update = value;
   };
+  const onPathReset = (): void => {
+    lastProgressAt = Date.now();
+  };
   bot.on("path_update", onPathUpdate);
+  bot.on("path_reset", onPathReset);
+  const onAbort = (): void => {
+    // The command queue fired (timeout or cancel). Back out of the A* search
+    // immediately and surface a diagnostic instead of standing still for the
+    // remaining budget or letting a search keep burning CPU in the background.
+    if (pathfinderBot.pathfinder) {
+      const reason = signal?.reason instanceof Error ? signal.reason.message : "Command timed out.";
+      stopReason = `${reason} Pathfinding was stopped before it could find a route; the target is likely unreachable or outside the loaded chunks.`;
+      stalled = true;
+      pathfinderBot.pathfinder.stop();
+    }
+  };
+  if (signal) {
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
   const progressTimer = setInterval(() => {
     const position = bot.entity.position;
-    if (position.distanceTo(lastPosition) >= 0.2) {
+    const moved = position.distanceTo(lastPosition);
+    // Planned world edits (digging/placing/scaffolding) are real liveness even
+    // when the bot stands still between actions, so they reset the watchdog.
+    const planningWork = update.path.some(
+      (move) => (move.toBreak?.length ?? 0) > 0 || (move.toPlace?.length ?? 0) > 0
+    );
+    if (moved >= MIN_PROGRESS_DISTANCE || update.status !== lastStatus || planningWork) {
       lastPosition = position.clone();
       lastProgressAt = Date.now();
-    } else if (pathfinderBot.pathfinder?.isMoving() && Date.now() - lastProgressAt >= 40_000) {
+      lastStatus = update.status;
+    } else if (Date.now() - lastProgressAt >= NO_PROGRESS_TIMEOUT_MS) {
+      // No route, no movement, nothing planned, and presumably nothing coming:
+      // fail fast instead of letting command_queue report a bare timeout.
+      lastProgressAt = Date.now();
       stalled = true;
+      stopReason = (
+        `The bot made no physical progress while pathfinding for ${Math.round(NO_PROGRESS_TIMEOUT_MS / 1000)} seconds; ` +
+        `the target is likely unreachable or outside the loaded world. Pick a closer, reachable waypoint.`
+      );
       pathfinderBot.pathfinder.stop();
     }
   }, 500);
@@ -814,7 +879,7 @@ async function gotoNear(
         }
       };
       const onStopped = (): void => {
-        finish(fail("PathStopped", "Path was stopped before it could be completed!"));
+        finish(fail("PathStopped", stopReason));
       };
       bot.on("goal_reached", onReached);
       bot.on("path_update", onUpdate);
@@ -842,6 +907,10 @@ async function gotoNear(
   } finally {
     clearInterval(progressTimer);
     bot.removeListener("path_update", onPathUpdate);
+    bot.removeListener("path_reset", onPathReset);
+    if (signal) {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 }
 
@@ -882,7 +951,7 @@ export function summarizeNavigation(
   const verticalDelta = target.y - start.y;
   let diagnosis = `${profile} route completed`;
   if (stalled) {
-    diagnosis = "route found, but the character made no physical progress for 6 seconds";
+    diagnosis = "pathfinding made no physical progress; the target is likely unreachable or outside the loaded world";
   } else if (update.status === "noPath" && verticalDelta > 1) {
     diagnosis = profile === "walk_only"
       ? "walk-only pathfinding found no existing ascent within the movement limits"
@@ -894,7 +963,7 @@ export function summarizeNavigation(
       ? "no route exists through loaded walkable terrain without digging, placing, parkour, or a drop over one block"
       : "no route exists through the currently loaded terrain, even with digging and block placement enabled";
   } else if (update.status === "timeout") {
-    diagnosis = "path search exhausted its computation budget";
+    diagnosis = "path search exhausted its computation budget; the target may be unreachable or outside the loaded chunks";
   } else if (update.status !== "success") {
     diagnosis = `pathfinder ended with status ${update.status}`;
   }

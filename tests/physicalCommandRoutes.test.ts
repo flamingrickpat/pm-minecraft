@@ -168,7 +168,7 @@ describe("physical command HTTP routes", () => {
         target: { x: 2, y: 64, z: 2 },
         tolerance: 1.5,
         profile: "walk_only"
-      });
+      }, expect.any(AbortSignal));
     });
   });
 

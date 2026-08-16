@@ -152,11 +152,11 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
           }
           bot.actions.syncOrientation();
         },
-        walkTo: async (input) => {
+        walkTo: async (input, signal) => {
           if (!bot || !bot.status.connected) {
             throw new Error("Bot is not connected.");
           }
-          return bot.actions.walkTo(input);
+          return bot.actions.walkTo(input, signal);
         },
         findBlock: async (input) => {
           if (!bot || !bot.status.connected) {
@@ -238,7 +238,7 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
         );
       }
       paper = await checkPaperReachable(config.minecraft.host, config.minecraft.port, Math.min(config.command.timeoutMs, 5000));
-      bot = createLiveBot(config.minecraft, emit);
+      bot = createLiveBot(config.minecraft, emit, { commandTimeoutMs: config.command.timeoutMs });
       inventoryService = createInventoryService(bot.bot);
       craftingService = createCraftingService(bot.bot);
       hookViewerOnSpawn(bot, viewer, emit, () => viewerHooked, (value) => {
