@@ -306,7 +306,7 @@ function healthInput() {
   return {
     startedAt: new Date("2026-06-17T19:00:00Z"),
     config: {
-      minecraft: { host: "127.0.0.1", port: 25565, username: "turnbased-bot", mineVisibilityIgnoreDistance: 3, walkToMaxDistance: 16 },
+      minecraft: { host: "127.0.0.1", port: 25565, username: "turnbased-bot", mineVisibilityIgnoreDistance: 3, walkMaxChunks: 8, walkSearchTimeoutMs: 1000 },
       web: { host: "127.0.0.1", port: 3000 },
       viewer: { enabled: true, port: 3001, firstPerson: true, captureWidth: 640, captureHeight: 640, deviceScaleFactor: 2, fovDegrees: 80 },
       command: { timeoutMs: 30000, maxFineControlDurationMs: 3000, stateBroadcastIntervalMs: 500 },

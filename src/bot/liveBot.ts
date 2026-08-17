@@ -6,7 +6,7 @@ import { createBotStateSnapshot } from "../state/botState.js";
 import { createChatInbox, type MinecraftMessage } from "../state/chatInbox.js";
 import type { RuntimeEvent } from "../server/http.js";
 import { controlNames, type CommandControls, type ControlName, type ControlStates } from "../commands/controls.js";
-import { createPhysicalCommandActions, installPathfinder, pathfindingBudgetMs, type PhysicalCommandActions } from "./actions.js";
+import { createPhysicalCommandActions, installPathfinder, type PhysicalCommandActions } from "./actions.js";
 
 /**
  * Runtime state needs a live Mineflayer source; own one bot connection and expose its current status.
@@ -46,7 +46,7 @@ export interface BotStatus {
 export function createLiveBot(
   config: RuntimeConfig["minecraft"],
   emit: (event: RuntimeEvent) => void = () => undefined,
-  options: { commandTimeoutMs?: number } = {}
+  options: { walkSearchTimeoutMs?: number } = {}
 ): BotRuntime {
   const chatInbox = createChatInbox();
   const bot = mineflayer.createBot({
@@ -60,7 +60,7 @@ export function createLiveBot(
     (bot.physics as typeof bot.physics & { stepHeight: number }).stepHeight = 1.1;
     emit({ type: "log", level: "info", message: "Set Mineflayer physics step height to 1.1." });
   });
-  installPathfinder(bot, pathfindingBudgetMs(options.commandTimeoutMs ?? 30_000));
+  installPathfinder(bot, config.walkSearchTimeoutMs);
   const status: BotStatus = {
     connecting: true,
     connected: false,
@@ -142,7 +142,7 @@ export function createLiveBot(
     commands: createCommandControls(bot, emit),
     actions: createPhysicalCommandActions(bot, {
       mineVisibilityIgnoreDistance: config.mineVisibilityIgnoreDistance,
-      walkToMaxDistance: config.walkToMaxDistance
+      maxChunkLimit: config.walkMaxChunks
     }),
     getState: () => createBotStateSnapshot(bot, status),
     getMessages: () => chatInbox.messages(),

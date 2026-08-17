@@ -131,11 +131,11 @@ function createContext(bodyUrl: string): MinecraftContext {
     call,
     observe: () => call("observe") as unknown as Promise<MinecraftObservation>,
     findBlock: (blockName, maxDistance = 64) => call("find_block", { blockName, maxDistance }, 15),
-    walkTo: (target, tolerance = 1.5, timeoutSeconds = 60, profile = "adaptive") => call("walk_to", { target, tolerance, profile }, timeoutSeconds),
+    walkTo: (target, tolerance = 1.5, timeoutSeconds = 60, chunkLimit = 3) => call("walk_to", { target, tolerance, chunkLimit }, timeoutSeconds),
     mineBlock: (block, walkIntoRange = true, timeoutSeconds = 60) => call("mine_block", { block, walkIntoRange }, timeoutSeconds),
     placeBlock: (referenceBlock, face, walkIntoRange = true, timeoutSeconds = 60) => call("place_block", { referenceBlock, face, walkIntoRange }, timeoutSeconds),
     useBlock: (block, walkIntoRange = true, timeoutSeconds = 30) => call("use_block", { block, walkIntoRange }, timeoutSeconds),
-    attackEntity: (entityId, walkIntoRange = true, timeoutSeconds = 30) => call("attack_entity", { entityId, walkIntoRange }, timeoutSeconds),
+    attackEntity: (entityId, walkIntoRange = true, timeoutSeconds = 30, renavigationCount = 3) => call("attack_entity", { entityId, walkIntoRange, renavigationCount }, timeoutSeconds),
     equip: (itemName) => call("inventory_equip", { itemName }, 15),
     craft: (itemName, repetitions = 1) => call("craft_item", { itemName, repetitions }, 60),
     smelt: (inputItemName, inputCount, fuelItemName, fuelCount = 1, timeoutSeconds = 60) => call(

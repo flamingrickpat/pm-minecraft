@@ -311,6 +311,9 @@ class ServerConfig(BaseModel):
     anti_stall_guard: bool = False
     mine_visibility_ignore_distance: float = Field(default=3.0, ge=0)
     walk_to_max_distance: float = Field(default=16.0, gt=0)
+    # Absolute cap on walk_to's chunk_limit (search region), and the A* budget.
+    max_chunk_limit: int = Field(default=8, ge=1)
+    walk_search_timeout_ms: int = Field(default=1000, ge=100)
     skill_timeout_seconds: float = Field(default=90.0, ge=1)
     event_notifications: EventNotifications = Field(
         default_factory=EventNotifications
@@ -537,6 +540,7 @@ class TeeTextStream:
 class BodyApi:
     ACTION_ROUTES: ClassVar[dict[str, tuple[str, str]]] = {
         "find_block": ("POST", "/api/world/find-block"),
+        "find_interactables": ("POST", "/api/world/interactables"),
         "walk_to": ("POST", "/api/command/walk-to"),
         "mine_block": ("POST", "/api/command/mine-block"),
         "place_block": ("POST", "/api/command/place-block"),
@@ -571,10 +575,13 @@ class BodyApi:
             "maxDistance": "positive integer",
             "requireVisible": "must be true; line-of-sight search is enforced",
         },
+        "find_interactables": {
+            "maxDistance": "positive number 1..64 (default 16); lists right-click-able blocks (doors, gates, buttons, levers, chests, etc.)",
+        },
         "walk_to": {
             "target": {"x": "number", "y": "number", "z": "number"},
             "tolerance": "positive number",
-            "profile": "adaptive|walk_only; adaptive preserves the existing destructive-capable pathfinder default",
+            "chunk_limit": "positive integer (chunks); walk search region size, default 3, capped by the server's configured max",
         },
         "mine_block": {
             "block": {"x": "integer", "y": "integer", "z": "integer"},
@@ -598,6 +605,7 @@ class BodyApi:
         "attack_entity": {
             "entityId": "non-negative integer from a fresh observation",
             "walkIntoRange": "boolean",
+            "renavigationCount": "positive integer; max re-walks to the moving target, default 3",
         },
         "inspect": {"block": {"x": "integer", "y": "integer", "z": "integer"}},
         "rotate": {
@@ -643,6 +651,7 @@ class BodyApi:
 
     ACTION_ALIASES: ClassVar[dict[str, str]] = {
         "findBlock": "find_block",
+        "findInteractables": "find_interactables",
         "walkTo": "walk_to",
         "mineBlock": "mine_block",
         "placeBlock": "place_block",
@@ -925,6 +934,12 @@ class BodySupervisor:
                 ),
                 "MINECRAFT_WALK_TO_MAX_DISTANCE": str(
                     self.config.walk_to_max_distance
+                ),
+                "MINECRAFT_WALK_MAX_CHUNKS": str(
+                    self.config.max_chunk_limit
+                ),
+                "MINECRAFT_WALK_SEARCH_TIMEOUT_MS": str(
+                    self.config.walk_search_timeout_ms
                 ),
             }
         )
@@ -2079,11 +2094,6 @@ class MinecraftMcpRuntime:
                             target_assessment=target_assessment,
                         )
             before = preloaded_before or await self.snapshot(False)
-            if action == "walk_to":
-                self._align_observed_navigation_waypoint(
-                    before["observation"],
-                    parameters,
-                )
             self.assert_character_active()
             started = time.monotonic()
             try:
@@ -3631,6 +3641,20 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         )
 
     @mcp.tool
+    async def minecraft_find_interactables(
+        max_distance: int = 16,
+        include_image: bool = False,
+    ) -> ToolResult:
+        """List all right-click/use interactable blocks within `max_distance` (1..64, default 16): doors, fence gates, trapdoors, buttons, levers, chests/barrels, furnaces, crafting tables, anvils, beds, hoppers, etc. Good for finding entrances/gates to get into fenced or walled areas. Returns name, position, and distance for each."""
+        safe_max = min(max(1, int(max_distance)), 64)
+        return await runtime.call_tool(
+            "find_interactables",
+            {"maxDistance": safe_max},
+            15,
+            include_image,
+        )
+
+    @mcp.tool
     async def minecraft_find_block(
         block_name: str,
         max_distance: int = 64,
@@ -3654,18 +3678,18 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         x: float,
         y: float,
         z: float,
-        tolerance: float = 1.0,
-        profile: Literal["adaptive", "walk_only"] = "adaptive",
+        tolerance: float = 1.5,
+        chunk_limit: int = 3,
         timeout_seconds: float = 60,
         include_image: bool = False,
     ) -> ToolResult:
-        """Walk to a point (flat x, y, z coordinates, NOT a position/block object). Adaptive by default: it may dig, place scaffold, tower, parkour, or drop up to four blocks to reach the target, and stops within `tolerance` blocks. Set profile="walk_only" to forbid changing blocks (digging, placement, towers, parkour, drops over one block). tolerance defaults to 1 so the body gets adjacent (needed to reach pickups/placements); raise it only for long noisy hops."""
+        """Walk on foot to a point (flat x, y, z coordinates, NOT a position/block object). Only walks: no digging, no placing, no parkour, no towers, no doors, and no falls over one block. Searches only within a start-centered region of `chunk_limit` chunks (default 3; the server caps this). Stops within `tolerance` blocks. If there is no on-foot path it fails fast (blocked/unreachable or search budget exhausted) instead of sitting around."""
         return await runtime.call_tool(
             "walk_to",
             {
                 "target": {"x": x, "y": y, "z": z},
                 "tolerance": tolerance,
-                "profile": profile,
+                "chunkLimit": chunk_limit,
             },
             timeout_seconds,
             include_image,
@@ -3956,6 +3980,18 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         help="Reject walk_to targets farther than this many blocks (default 16, one chunk).",
     )
     parser.add_argument(
+        "--max-chunk-limit",
+        type=int,
+        default=8,
+        help="Absolute cap on walk_to's chunk_limit/search region (default 8).",
+    )
+    parser.add_argument(
+        "--walk-search-timeout-ms",
+        type=int,
+        default=1000,
+        help="A* compute budget in ms for each walk path search (default 1000).",
+    )
+    parser.add_argument(
         "--skill-timeout-seconds",
         type=float,
         default=DEFAULT_SKILL_TIMEOUT_SECONDS,
@@ -3987,6 +4023,8 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         anti_stall_guard=args.enable_anti_stall_guard,
         mine_visibility_ignore_distance=args.mine_visibility_ignore_distance,
         walk_to_max_distance=args.walk_to_max_distance,
+        max_chunk_limit=args.max_chunk_limit,
+        walk_search_timeout_ms=args.walk_search_timeout_ms,
         skill_timeout_seconds=args.skill_timeout_seconds,
     )
 

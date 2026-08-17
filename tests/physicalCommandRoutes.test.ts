@@ -156,31 +156,31 @@ describe("physical command HTTP routes", () => {
     });
   });
 
-  it("routes the non-destructive walk-only profile", async () => {
+  it("routes the chunk-limited walk with its default tolerance", async () => {
     await withCommandServer(async ({ port, actions }) => {
       const response = await post(port, "/api/command/walk-to", {
         target: { x: 2, y: 64, z: 2 },
-        profile: "walk_only"
+        chunkLimit: 3
       });
 
       expect(response.status).toBe(200);
       expect(actions.walkTo).toHaveBeenCalledWith({
         target: { x: 2, y: 64, z: 2 },
         tolerance: 1.5,
-        profile: "walk_only"
+        chunkLimit: 3
       }, expect.any(AbortSignal));
     });
   });
 
-  it("rejects unknown navigation profiles before queueing an action", async () => {
+  it("rejects a chunk limit above the server maximum before queueing an action", async () => {
     await withCommandServer(async ({ port, actions }) => {
       const response = await post(port, "/api/command/walk-to", {
         target: { x: 2, y: 64, z: 2 },
-        profile: "creative_flight"
+        chunkLimit: 12
       });
 
       expect(response.status).toBe(400);
-      expect(await response.json()).toMatchObject({ error: "invalid_navigation_profile" });
+      expect(await response.json()).toMatchObject({ error: "chunk_limit_exceeded" });
       expect(actions.walkTo).not.toHaveBeenCalled();
     });
   });

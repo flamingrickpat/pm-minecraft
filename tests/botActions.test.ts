@@ -1,40 +1,48 @@
 import { describe, expect, it, vi } from "vitest";
 import { Vec3 } from "vec3";
-import { configureNavigationMovements, createPhysicalCommandActions, summarizeNavigation } from "../src/bot/actions.js";
+import { createPhysicalCommandActions, summarizeNavigation } from "../src/bot/actions.js";
 
 describe("navigation diagnostics", () => {
-  it("reports route shape and planned world modifications", () => {
+  it("reports route shape from the path waypoints", () => {
     const report = summarizeNavigation({
       status: "success",
       path: [
-        { x: 1, y: 65, z: 0, toBreak: [{}] },
-        { x: 2, y: 64, z: 0, toPlace: [{}, {}] }
+        { x: 1, y: 65, z: 0 },
+        { x: 2, y: 64, z: 0 }
       ]
     }, { x: 0, y: 64, z: 0 }, { x: 2, y: 64, z: 0 }, false);
 
     expect(report).toMatchObject({
-      profile: "adaptive",
       pathStatus: "success",
       pathNodes: 2,
       ascents: 1,
       drops: 1,
-      blocksToBreak: 1,
-      blocksToPlace: 2,
       stalled: false
     });
   });
 
-  it("explains when a high target needs a deliberate construction strategy", () => {
+  it("prefers the pathfinder's visited-node count when available", () => {
+    const report = summarizeNavigation(
+      { status: "success", path: [], visitedNodes: 42 } as never,
+      { x: 0, y: 64, z: 0 },
+      { x: 8, y: 64, z: 8 },
+      false
+    );
+    expect(report.pathNodes).toBe(42);
+  });
+
+  it("explains an unreachable target on foot", () => {
     const report = summarizeNavigation(
       { status: "noPath", path: [] },
       { x: 0, y: 64, z: 0 },
       { x: 4, y: 70, z: 0 },
       false
     );
-    expect(report.diagnosis).toContain("staircase or tunnel");
+    expect(report.diagnosis).toContain("no walkable route");
+    expect(report.diagnosis).not.toContain("staircase");
   });
 
-  it("labels an exhausted search as likely unreachable or out of loaded chunks", () => {
+  it("labels an exhausted search as possibly unreachable or too complex on foot", () => {
     const report = summarizeNavigation(
       { status: "timeout", path: [] },
       { x: 0, y: 64, z: 0 },
@@ -44,72 +52,16 @@ describe("navigation diagnostics", () => {
     expect(report.diagnosis).toContain("unreachable");
   });
 
-  it("labels a stalled bot as likely unreachable or outside the loaded world", () => {
+  it("labels a stalled walk without hinting at digging", () => {
     const report = summarizeNavigation(
-      { status: "partial", path: [], toBreak: [], toPlace: [] } as never,
+      { status: "partial", path: [] },
       { x: 0, y: 64, z: 0 },
       { x: 16, y: 64, z: 16 },
       true
     );
     expect(report.stalled).toBe(true);
-    expect(report.diagnosis).toContain("unreachable");
-  });
-
-  it("reports walk-only limits without suggesting destructive recovery", () => {
-    const report = summarizeNavigation(
-      { status: "noPath", path: [] },
-      { x: 0, y: 64, z: 0 },
-      { x: 0, y: 66, z: 0 },
-      false,
-      "walk_only"
-    );
-
-    expect(report).toMatchObject({ profile: "walk_only" });
-    expect(report.diagnosis).toContain("no existing ascent");
-    expect(report.diagnosis).not.toContain("staircase");
-  });
-
-  it("configures walk-only movement without destructive pathfinder capabilities", () => {
-    const movements = {
-      canDig: true,
-      allow1by1towers: true,
-      allowParkour: true,
-      scafoldingBlocks: [1, 2],
-      maxDropDown: 4,
-      infiniteLiquidDropdownDistance: true
-    };
-
-    const configured = configureNavigationMovements(movements as never, "walk_only");
-
-    expect(configured).toMatchObject({
-      canDig: false,
-      allow1by1towers: false,
-      allowParkour: false,
-      scafoldingBlocks: [],
-      maxDropDown: 1,
-      infiniteLiquidDropdownDistance: false
-    });
-  });
-
-  it("preserves adaptive movement defaults", () => {
-    const movements = {
-      canDig: true,
-      allow1by1towers: true,
-      allowParkour: true,
-      scafoldingBlocks: [1, 2],
-      maxDropDown: 4,
-      infiniteLiquidDropdownDistance: true
-    };
-
-    expect(configureNavigationMovements(movements as never, "adaptive")).toBe(movements);
-    expect(movements).toEqual({
-      canDig: true,
-      allow1by1towers: true,
-      allowParkour: true,
-      scafoldingBlocks: [1, 2],
-      maxDropDown: 4,
-      infiniteLiquidDropdownDistance: true
-    });
+    expect(report.diagnosis).toContain("stopped moving");
+    expect(report.diagnosis).not.toContain("dig");
   });
 });
 

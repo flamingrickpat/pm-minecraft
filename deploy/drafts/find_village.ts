@@ -79,7 +79,7 @@ const run: SkillEntrypoint = async (context: MinecraftContext, rawInput: unknown
 
     // Hop toward the next waypoint along the heading.
     waypoint = { x: waypoint.x + d.x * hop, y: waypoint.y, z: waypoint.z + d.z * hop };
-    const w = await context.walkTo(waypoint, 12, 45, "adaptive");
+    const w = await context.walkTo(waypoint, 12, 45);
     if (w.ok === true) {
       const after = await context.observe();
       pos = after.player.blockPosition as Vector3;

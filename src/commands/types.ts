@@ -7,10 +7,9 @@ export interface Vector3 {
 export interface WalkToInput {
   target: Vector3;
   tolerance: number;
-  profile?: NavigationProfile;
+  /** Search-region size in chunks (default 3). Validated against the server's max. */
+  chunkLimit?: number;
 }
-
-export type NavigationProfile = "adaptive" | "walk_only";
 
 export interface BlockCommandOptions {
   walkIntoRange: boolean;
@@ -39,4 +38,6 @@ export interface UseBlockInput extends BlockCommandOptions {
 
 export interface AttackEntityInput extends BlockCommandOptions {
   entityId: number;
+  /** How many times to re-walk to the entity's current position when it moves out of range (default 3). */
+  renavigationCount?: number;
 }

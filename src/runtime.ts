@@ -164,6 +164,12 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
           }
           return bot.actions.findBlock(input);
         },
+        findInteractables: async (input) => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.findInteractables(input);
+        },
         mineBlock: async (input) => {
           if (!bot || !bot.status.connected) {
             throw new Error("Bot is not connected.");
@@ -207,7 +213,8 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
           return bot.actions.inspectBlock(input);
         }
       },
-      maxFineControlDurationMs: config.command.maxFineControlDurationMs
+      maxFineControlDurationMs: config.command.maxFineControlDurationMs,
+      maxChunkLimit: config.minecraft.walkMaxChunks
     },
     frames: frameCapture,
     targeting: pixelTargeting,
@@ -238,7 +245,7 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
         );
       }
       paper = await checkPaperReachable(config.minecraft.host, config.minecraft.port, Math.min(config.command.timeoutMs, 5000));
-      bot = createLiveBot(config.minecraft, emit, { commandTimeoutMs: config.command.timeoutMs });
+      bot = createLiveBot(config.minecraft, emit, { walkSearchTimeoutMs: config.minecraft.walkSearchTimeoutMs });
       inventoryService = createInventoryService(bot.bot);
       craftingService = createCraftingService(bot.bot);
       hookViewerOnSpawn(bot, viewer, emit, () => viewerHooked, (value) => {

@@ -2,7 +2,7 @@ import type { Bot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { CommandResult } from "../commands/commandQueue.js";
-import type { AttackEntityInput, FindBlockInput, JumpPlaceBlockInput, MineBlockInput, NavigationProfile, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
+import type { AttackEntityInput, FindBlockInput, JumpPlaceBlockInput, MineBlockInput, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
 import { isVisibleFromHead } from "../perception/visibility.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
@@ -17,13 +17,10 @@ export type PathfinderUpdate = {
 };
 
 export interface NavigationReport {
-  profile: NavigationProfile;
   pathStatus: string;
   pathNodes: number;
   ascents: number;
   drops: number;
-  blocksToBreak: number;
-  blocksToPlace: number;
   stalled: boolean;
   diagnosis: string;
 }
@@ -35,14 +32,16 @@ class NavigationFailure extends Error {
   }
 }
 
-// If the bot makes no physical progress for this long while pathfinding, the
-// search is stuck (unreachable target, walled-off area, or goal outside the
-// loaded chunks). Fail fast with a diagnosis instead of letting command_queue
-// report a bare timeout at COMMAND_TIMEOUT_MS.
-const NO_PROGRESS_TIMEOUT_MS = 8_000;
-// A path is considered "movement" for the watchdog when the bot travels at
-// least this far between 500ms polls (~1 block/s floor; walking is ~4 m/s).
-const MIN_PROGRESS_DISTANCE = 0.4;
+// A path is considered "movement" for the liveness backstop when the bot
+// travels at least this far between polls.
+const MIN_PROGRESS_DISTANCE = 0.2;
+// If the bot made forward progress but then stops moving for this long while
+// walking a path, the walk is stuck (path invalidated by gravel/water/etc).
+// This is the "should never happen" safety net, not the normal completion path
+// (the pathfinder's own goal_reached/noPath events handle that).
+const NO_PROGRESS_TIMEOUT_MS = 3_000;
+// Number of blocks in one Minecraft chunk.
+const CHUNK = 16;
 
 /**
  * Physical commands need real Mineflayer effects; execute explicit user actions at the bot boundary.
@@ -62,6 +61,7 @@ export interface PhysicalCommandActions {
   syncOrientation(): void;
   walkTo(input: WalkToInput, signal?: AbortSignal): Promise<CommandResult>;
   findBlock(input: FindBlockInput): Promise<CommandResult>;
+  findInteractables(input: { maxDistance: number }): Promise<CommandResult>;
   mineBlock(input: MineBlockInput): Promise<CommandResult>;
   placeBlock(input: PlaceBlockInput): Promise<CommandResult>;
   jumpPlaceBlock(input: JumpPlaceBlockInput): Promise<CommandResult>;
@@ -92,6 +92,7 @@ type EntityLike = NonNullable<Bot["entity"]> & {
   username?: string;
   displayName?: string;
   type?: string;
+  health?: number;
 };
 
 interface BlockLike {
@@ -108,10 +109,11 @@ export function createPhysicalCommandActions(
   bot: Bot,
   options: {
     mineVisibilityIgnoreDistance: number;
-    walkToMaxDistance: number;
+    /** Absolute cap (in chunks) on walk_to's reach; a requested chunk_limit above this is rejected. */
+    maxChunkLimit: number;
   } = {
     mineVisibilityIgnoreDistance: 3.0,
-    walkToMaxDistance: 512.0
+    maxChunkLimit: 8
   }
 ): PhysicalCommandActions {
   // Track intended yaw/pitch so getOrientation() is not affected by server
@@ -179,34 +181,38 @@ export function createPhysicalCommandActions(
       // or when the UI needs to re-establish the baseline orientation.
       syncTrackedFromEntity();
     },
-    walkTo: async ({ target, tolerance, profile = "adaptive" }, signal) => {
-      // Cap a single route to one chunk so a failed call is cheap to
-      // diagnose and long journeys are split into explicit hops.
+    walkTo: async ({ target, tolerance, chunkLimit }, signal) => {
       const startPosition = bot.entity.position;
-      const horizontalDistance = Math.hypot(
-        target.x - startPosition.x,
-        target.z - startPosition.z
-      );
-      if (horizontalDistance > options.walkToMaxDistance) {
+      // Already there? Return immediately without searching.
+      if (distXZ(startPosition, target) <= tolerance) {
+        return { ok: true, message: "Already within tolerance of target.", data: { status: "reached", position: vector(startPosition), target } };
+      }
+      const limit = Math.min(Math.max(1, Math.round(chunkLimit ?? DEFAULT_CHUNK_LIMIT)), options.maxChunkLimit);
+      const region = navigationRegion(bot, limit);
+      // Fail instantly if the target is outside the search region.
+      if (
+        target.x < region.minX || target.x > region.maxX ||
+        target.z < region.minZ || target.z > region.maxZ
+      ) {
         return {
           ok: false,
           reason: "target_too_far",
-          message: (
-            `walk_to target is ${horizontalDistance.toFixed(1)} blocks away horizontally, ` +
-            `exceeding the ${options.walkToMaxDistance}-block limit. Split the route into shorter hops ` +
-            `(alignment is one chunk long).`
-          ),
-          data: {
-            status: "too_far",
-            position: vector(startPosition),
-            target,
-            horizontalDistance: Math.round(horizontalDistance * 10) / 10,
-            maxDistance: options.walkToMaxDistance
-          }
+          message: `Target is outside the ${limit}-chunk walk search region (limit: ${limit} chunk(s)). Move closer or raise chunk_limit.`,
+          data: { status: "too_far", position: vector(startPosition), target, chunkLimit: limit }
+        };
+      }
+      // Fail instantly if there is no place to stand near the target.
+      const standable = findStandableCell(bot, target);
+      if (!standable) {
+        return {
+          ok: false,
+          reason: "target_not_standable",
+          message: "The target has no standable block nearby to walk to.",
+          data: { status: "not_standable", position: vector(startPosition), target }
         };
       }
       try {
-        const navigation = await gotoNear(bot, target, tolerance, profile, signal);
+        const navigation = await gotoNear(bot, target, tolerance, region, signal);
         return { ok: true, message: "Reached target.", data: { status: "reached", position: vector(bot.entity.position), target, navigation } };
       } catch (error) {
         return {
@@ -246,6 +252,28 @@ export function createPhysicalCommandActions(
           displayName: found.displayName ?? null,
           distance: bot.entity.position.distanceTo(found.position)
         }
+      };
+    },
+    findInteractables: async ({ maxDistance }) => {
+      const range = Math.min(Math.max(4, maxDistance), 64);
+      const finder = bot as Bot & { findBlocks?(options: Record<string, unknown>): Vec3[] };
+      const positions = finder.findBlocks?.({
+        matching: (block: unknown) => isInteractableName((block as BlockLike)?.name ?? ""),
+        point: bot.entity.position,
+        maxDistance: range,
+        count: 64
+      }) ?? [];
+      const blocks = positions.map((pos) => ({
+        name: (bot.blockAt(pos) as BlockLike | null)?.name ?? "unknown",
+        x: pos.x,
+        y: pos.y,
+        z: pos.z,
+        distance: Math.round(bot.entity.position.distanceTo(pos) * 10) / 10
+      }));
+      return {
+        ok: true,
+        message: `Found ${blocks.length} interactable block(s) within ${range} blocks.`,
+        data: { blocks: blocks.sort((a, b) => a.distance - b.distance), count: blocks.length, maxDistance: range }
       };
     },
     mineBlock: async ({ block: target, walkIntoRange }) => {
@@ -325,7 +353,7 @@ export function createPhysicalCommandActions(
         const dropPos = centerOf(visibleTarget);
         if (bot.entity.position.distanceTo(dropPos) > 2.0) {
           try {
-            await gotoNear(bot, dropPos, 1.5);
+            await gotoNear(bot, dropPos, 1.5, defaultNavigationRegion(bot));
           } catch {
             // Pathfinding may fail if terrain is complex; ignore
           }
@@ -603,55 +631,58 @@ export function createPhysicalCommandActions(
         return failed("use_failed", `Mineflayer use failed: ${errorMessage(error)}`, { block: target, blockName: block.name });
       }
     },
-    attackEntity: async ({ entityId, walkIntoRange }) => {
+    attackEntity: async ({ entityId, walkIntoRange, renavigationCount = 3 }) => {
       const resolveTarget = (): EntityLike | null => {
         const entity = bot.entities?.[entityId] as EntityLike | undefined;
         return entity && entity !== bot.entity && entity.position ? entity : null;
       };
-      let target = resolveTarget();
-      if (!target) {
-        return failed("entity_not_found", "The observed entity is no longer present.", { entityId });
-      }
-      const label = target.username ?? target.name ?? target.displayName ?? `entity ${entityId}`;
-      if (bot.entity.position.distanceTo(target.position) > 4) {
+
+      for (let attempt = 0; ; attempt++) {
+        const target = resolveTarget();
+        if (!target) {
+          return failed("entity_not_found", "The observed entity is no longer present.", { entityId, attempt });
+        }
+        const label = target.username ?? target.name ?? target.displayName ?? `entity ${entityId}`;
+        const distance = bot.entity.position.distanceTo(target.position);
+        if (distance <= ATTACK_RANGE) {
+          const healthBefore = typeof target.health === "number" ? target.health : null;
+          try {
+            const eyeTarget = target.position.offset(0, 0.8, 0);
+            await bot.lookAt(eyeTarget, false);
+            syncTrackedToTarget(eyeTarget);
+            await bot.attack(target);
+            await new Promise(resolve => setTimeout(resolve, 400));
+            const healthAfter = typeof target.health === "number" ? target.health : null;
+            const hit = healthBefore !== null && healthAfter !== null && healthAfter < healthBefore;
+            return {
+              ok: true,
+              message: hit ? `Hit ${label}.` : `Attacked ${label}.`,
+              data: {
+                entityId,
+                name: label,
+                kind: target.type ?? "unknown",
+                hit,
+                healthBefore,
+                healthAfter: healthAfter ?? null,
+                targetStillPresent: resolveTarget() !== null
+              }
+            };
+          } catch (error) {
+            return failed("attack_failed", `Mineflayer attack failed: ${errorMessage(error)}`, { entityId, name: label });
+          }
+        }
+        // Out of range: walk to the entity's current position, then re-check.
         if (!walkIntoRange) {
-          return failed("entity_out_of_range", `${label} is outside attack range.`, {
-            entityId,
-            distance: bot.entity.position.distanceTo(target.position)
-          });
+          return failed("entity_out_of_range", `${label} is outside attack range.`, { entityId, distance, attempts: attempt });
+        }
+        if (attempt >= renavigationCount) {
+          return failed("entity_out_of_range", `${label} moved or is out of range after ${attempt} walk(s). Give up and reposition.`, { entityId, distance, attempts: attempt });
         }
         try {
-          await gotoNear(bot, vector(target.position), 2.5, "walk_only");
+          await gotoNear(bot, vector(target.position), 2.0, defaultNavigationRegion(bot));
         } catch (error) {
           return failed("entity_unreachable", `Could not reach ${label}: ${errorMessage(error)}`, { entityId });
         }
-        target = resolveTarget();
-        if (!target) {
-          return failed("entity_not_found", `${label} moved out of the loaded world.`, { entityId });
-        }
-      }
-      const distance = bot.entity.position.distanceTo(target.position);
-      if (distance > 4) {
-        return failed("entity_out_of_range", `${label} moved outside attack range.`, { entityId, distance });
-      }
-      try {
-        const eyeTarget = target.position.offset(0, 0.8, 0);
-        await bot.lookAt(eyeTarget, false);
-        syncTrackedToTarget(eyeTarget);
-        await bot.attack(target);
-        await new Promise(resolve => setTimeout(resolve, 350));
-        return {
-          ok: true,
-          message: `Attacked ${label} once.`,
-          data: {
-            entityId,
-            name: label,
-            kind: target.type ?? "unknown",
-            targetStillPresent: resolveTarget() !== null
-          }
-        };
-      } catch (error) {
-        return failed("attack_failed", `Mineflayer attack failed: ${errorMessage(error)}`, { entityId, name: label });
       }
     },
     inspectBlock: async (target) => {
@@ -663,7 +694,7 @@ export function createPhysicalCommandActions(
       const canHarvestWithHeldItem = typeof block.canHarvest === "function"
         ? Boolean(block.canHarvest(bot.heldItem?.type ?? null))
         : null;
-      const digTimeMs = block.diggable ? bot.digTime(block) : null;
+      const digTimeMs = block.diggable ? bot.digTime(block as never) : null;
       return {
         ok: true,
         message: "Inspected block.",
@@ -729,50 +760,127 @@ async function waitForBlockRemoved(bot: Bot, position: Vec3, timeoutMs: number):
 }
 
 /**
- * Install mineflayer-pathfinder with a search budget derived from the command
- * timeout.
- *
- * The library default thinkTimeout (5000ms) is too small for complex mountain
- * terrain and far goals, which produced "path search exhausted its computation
- * budget" failures. But thinkTimeout counts *compute* time, and the A* search
- * runs ~40ms per 50ms physics tick, so N ms of budget takes ~1.25 * N of wall
- * clock. The budget must therefore stay below the command timeout or the
- * pathfinder can never emit its own noPath/timeout verdict before command_queue
- * aborts the command with a generic "Command timed out".
+ * Install mineflayer-pathfinder and cap its A* compute budget. We only ever
+ * hand it a static, walk-only goal inside a bounded region, so a small budget
+ * is enough: reachable goals resolve in milliseconds, unreachable ones fail
+ * fast instead of grinding. thinkTimeout is cumulative *compute* time across
+ * physics ticks (~40ms of compute per 50ms tick), so the wall-clock cost stays
+ * under ~1.25x the budget.
  */
-export function installPathfinder(bot: Bot, searchBudgetMs = 40_000): void {
+export function installPathfinder(bot: Bot, searchBudgetMs = 1_000): void {
   const current = bot as Bot & { pathfinder?: unknown; loadPlugin(plugin: (bot: Bot) => void): void };
   if (!current.pathfinder) {
     current.loadPlugin(pathfinder);
   }
   const pf = (bot as unknown as { pathfinder?: { thinkTimeout: number; tickTimeout: number } }).pathfinder;
   if (pf) {
-    pf.thinkTimeout = Math.max(5000, searchBudgetMs);
+    pf.thinkTimeout = Math.max(250, searchBudgetMs);
     pf.tickTimeout = 40;
   }
 }
 
+export interface NavigationRegion {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+}
+
+const DEFAULT_CHUNK_LIMIT = 3;
+// Search-region size for internal walks (attack range, drop pickup, walk-into
+// mining/placing range). These targets are normally right next to the bot.
+const INTERNAL_NAV_CHUNK_LIMIT = 8;
+const ATTACK_RANGE = 4;
+
+function navigationRegion(bot: Bot, chunkLimit: number): NavigationRegion {
+  const chunkX = Math.floor(bot.entity.position.x / CHUNK);
+  const chunkZ = Math.floor(bot.entity.position.z / CHUNK);
+  // Chunk-aligned box, plus a small cushion so boundary cells are not pruned
+  // by the exclusion filter before the target's chunk is fully searchable.
+  const half = chunkLimit * CHUNK + 2;
+  return {
+    minX: chunkX * CHUNK - half,
+    maxX: chunkX * CHUNK + CHUNK - 1 + half,
+    minZ: chunkZ * CHUNK - half,
+    maxZ: chunkZ * CHUNK + CHUNK - 1 + half
+  };
+}
+
+function defaultNavigationRegion(bot: Bot): NavigationRegion {
+  return navigationRegion(bot, INTERNAL_NAV_CHUNK_LIMIT);
+}
+
+function distXZ(a: { x: number; z: number }, b: { x: number; z: number }): number {
+  return Math.hypot(a.x - b.x, a.z - b.z);
+}
+
 /**
- * Convert a wall-clock command timeout into an A* compute budget that settles
- * *before* the queue-level timeout fires (0.8 ~= 40ms tick budget / 50ms tick).
+ * Find a cell the bot could stand in near the target, or null.
+ * Walk_to refuses targets with no standable floor at all.
  */
-export function pathfindingBudgetMs(commandTimeoutMs: number): number {
-  return Math.max(5000, Math.round((commandTimeoutMs - 5000) * 0.8));
+function findStandableCell(bot: Bot, target: Vector3): Vec3 | null {
+  const x0 = Math.floor(target.x);
+  const z0 = Math.floor(target.z);
+  const baseY = Math.floor(target.y);
+  for (const y of [baseY, baseY + 1, baseY - 1]) {
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dz = -2; dz <= 2; dz++) {
+        const cell = new Vec3(x0 + dx, y, z0 + dz);
+        if (isStandable(bot, cell)) return cell;
+      }
+    }
+  }
+  return null;
+}
+
+function isStandable(bot: Bot, cell: Vec3): boolean {
+  const at = bot.blockAt(cell);
+  const below = bot.blockAt(cell.offset(0, -1, 0));
+  if (!at || !below) return false;
+  // Feet space must not be fully solid, and something solid must be under it.
+  return at.boundingBox !== "block" && below.boundingBox === "block";
+}
+
+/**
+ * A Movements instance restricted to plain walking: no digging, placing,
+ * parkour, towers, doors, or falls over one block — plus a spatial bound that
+ * keeps the search inside the region.
+ */
+function makeWalkMovements(bot: Bot, region: NavigationRegion): InstanceType<typeof Movements> {
+  const movements = new Movements(bot);
+  movements.canDig = false;
+  movements.allowParkour = false;
+  movements.allow1by1towers = false;
+  movements.scafoldingBlocks = [];
+  movements.canOpenDoors = false;
+  movements.maxDropDown = 1;
+  movements.infiniteLiquidDropdownDistance = false;
+  movements.allowSprinting = true;
+  // Moves that touch a block outside the region cost >= 100 and the pathfinder
+  // prunes them, so the search can never leave the box.
+  const bound = (block: unknown): number => {
+    const pos = (block as { position?: { x: number; z: number } })?.position;
+    if (!pos) return 0;
+    return pos.x < region.minX || pos.x > region.maxX || pos.z < region.minZ || pos.z > region.maxZ ? 100 : 0;
+  };
+  movements.exclusionAreasStep.push(bound);
+  movements.exclusionAreasBreak.push(bound);
+  movements.exclusionAreasPlace.push(bound);
+  return movements;
 }
 
 async function gotoNear(
   bot: Bot,
   target: Vector3,
   tolerance: number,
-  profile: NavigationProfile = "adaptive",
+  region: NavigationRegion,
   signal?: AbortSignal
 ): Promise<NavigationReport> {
   const pathfinderBot = bot as Bot & {
     pathfinder?: {
-      goto(goal: PathfinderGoal): Promise<void>;
       setMovements(movements: InstanceType<typeof Movements>): void;
+      setGoal(goal: PathfinderGoal | null, dynamic?: boolean): void;
       stop(): void;
-      isMoving(): boolean;
     };
   };
   if (!pathfinderBot.pathfinder) {
@@ -780,208 +888,156 @@ async function gotoNear(
   }
 
   const start = vector(bot.entity.position);
+  if (distXZ(start, target) <= tolerance) {
+    return { pathStatus: "success", pathNodes: 0, ascents: 0, drops: 0, stalled: false, diagnosis: "already within tolerance" };
+  }
+
   let update: PathfinderUpdate = { status: "searching", path: [] };
-  let lastPosition = bot.entity.position.clone();
-  let lastProgressAt = Date.now();
-  let lastStatus = "searching";
-  let stalled = false;
-  let stopReason = "The path was stopped before it could be completed.";
-  const onPathUpdate = (value: PathfinderUpdate): void => {
-    update = value;
-  };
-  const onPathReset = (): void => {
-    lastProgressAt = Date.now();
-  };
-  bot.on("path_update", onPathUpdate);
-  bot.on("path_reset", onPathReset);
-  const onAbort = (): void => {
-    // The command queue fired (timeout or cancel). Back out of the A* search
-    // immediately and surface a diagnostic instead of standing still for the
-    // remaining budget or letting a search keep burning CPU in the background.
-    if (pathfinderBot.pathfinder) {
-      const reason = signal?.reason instanceof Error ? signal.reason.message : "Command timed out.";
-      stopReason = `${reason} Pathfinding was stopped before it could find a route; the target is likely unreachable or outside the loaded chunks.`;
-      stalled = true;
-      pathfinderBot.pathfinder.stop();
-    }
-  };
-  if (signal) {
-    if (signal.aborted) {
-      onAbort();
-    } else {
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-  }
-  const progressTimer = setInterval(() => {
-    const position = bot.entity.position;
-    const moved = position.distanceTo(lastPosition);
-    // Planned world edits (digging/placing/scaffolding) are real liveness even
-    // when the bot stands still between actions, so they reset the watchdog.
-    const planningWork = update.path.some(
-      (move) => (move.toBreak?.length ?? 0) > 0 || (move.toPlace?.length ?? 0) > 0
-    );
-    if (moved >= MIN_PROGRESS_DISTANCE || update.status !== lastStatus || planningWork) {
-      lastPosition = position.clone();
-      lastProgressAt = Date.now();
-      lastStatus = update.status;
-    } else if (Date.now() - lastProgressAt >= NO_PROGRESS_TIMEOUT_MS) {
-      // No route, no movement, nothing planned, and presumably nothing coming:
-      // fail fast instead of letting command_queue report a bare timeout.
-      lastProgressAt = Date.now();
-      stalled = true;
-      stopReason = (
-        `The bot made no physical progress while pathfinding for ${Math.round(NO_PROGRESS_TIMEOUT_MS / 1000)} seconds; ` +
-        `the target is likely unreachable or outside the loaded world. Pick a closer, reachable waypoint.`
-      );
-      pathfinderBot.pathfinder.stop();
-    }
-  }, 500);
+  let stallReason = "The path was stopped before it could be completed.";
 
-  pathfinderBot.pathfinder.setMovements(configureNavigationMovements(new Movements(bot), profile));
-  // Use a GoalXZ so terrain height is auto-chosen: overworld travel should aim
-  // at a horizontal position and let the pathfinder pick whichever standable Y
-  // is reachable, instead of failing because the exact target Y doesn't match.
+  // Install the restricted movements and a STATIC goal BEFORE attaching
+  // listeners: a leftover stop flag from a previous aborted walk is consumed
+  // by the library on setMovements/setGoal and its path_stop event would
+  // otherwise race our handlers. Static goals make the library emit
+  // goal_reached when the bot arrives (dynamic goals do not — that was the
+  // original 30s hang).
+  pathfinderBot.pathfinder.setMovements(makeWalkMovements(bot, region));
+  // GoalNearXZ: aim at the horizontal target and let the pathfinder choose
+  // whichever standable Y is reachable (the caller already validated that a
+  // standable cell exists nearby).
   const goal = new goals.GoalNearXZ(target.x, target.z, tolerance);
-  // Dynamic goal (dynamic=true): the pathfinder re-paths and requests chunks as
-  // it travels, so a goal far beyond the initially-loaded area is reachable in
-  // one long walk instead of many hard one-chunk hops. This is what makes
-  // long-distance overland travel (e.g. village hunting) work.
-  pathfinderBot.pathfinder.setGoal(goal, true);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const fail = (name: string, message: string): Error => {
-        const err = new Error(message);
-        (err as Error & { name: string }).name = name;
-        return err;
-      };
-      const finish = (err?: Error): void => {
-        if (settled) return;
-        settled = true;
-        bot.removeListener("goal_reached", onReached);
-        bot.removeListener("path_update", onUpdate);
-        bot.removeListener("goal_updated", onChanged);
-        bot.removeListener("path_stop", onStopped);
-        setTimeout(() => (err ? reject(err) : resolve()), 0);
-      };
-      const onReached = (): void => finish();
-      const onUpdate = (value: PathfinderUpdate): void => {
-        update = value;
-        if (value.status === "noPath") {
-          finish(fail("NoPath", "No path to the goal!"));
-        } else if (value.status === "timeout") {
-          finish(fail("Timeout", "Took too long to decide path to goal!"));
-        }
-      };
-      const onChanged = (changed: unknown): void => {
-        if (changed !== goal) {
-          finish(fail("GoalChanged", "The goal was changed before it could be completed!"));
-        }
-      };
-      const onStopped = (): void => {
-        finish(fail("PathStopped", stopReason));
-      };
-      bot.on("goal_reached", onReached);
-      bot.on("path_update", onUpdate);
-      bot.on("goal_updated", onChanged);
-      bot.on("path_stop", onStopped);
-    });
-    const position = bot.entity.position;
-    const dx = target.x - position.x;
-    const dz = target.z - position.z;
-    const report = summarizeNavigation(update, start, target, stalled, profile);
-    if (dx * dx + dz * dz > tolerance * tolerance) {
-      throw new NavigationFailure(
-        `Pathfinder stopped without reaching goal: position ${JSON.stringify(vector(position))}, ` +
-        `target ${JSON.stringify(target)}, tolerance ${tolerance}. ${report.diagnosis}`,
-        report
-      );
-    }
-    return report;
-  } catch (error) {
-    if (error instanceof NavigationFailure) {
-      throw error;
-    }
-    const report = summarizeNavigation(update, start, target, stalled, profile);
-    throw new NavigationFailure(`${errorMessage(error)} ${report.diagnosis}`, report);
-  } finally {
-    clearInterval(progressTimer);
-    bot.removeListener("path_update", onPathUpdate);
-    bot.removeListener("path_reset", onPathReset);
-    if (signal) {
-      signal.removeEventListener("abort", onAbort);
-    }
-  }
-}
+  pathfinderBot.pathfinder.setGoal(goal, false);
 
-export function configureNavigationMovements(
-  movements: InstanceType<typeof Movements>,
-  profile: NavigationProfile
-): InstanceType<typeof Movements> {
-  if (profile === "walk_only") {
-    movements.canDig = false;
-    movements.allow1by1towers = false;
-    movements.allowParkour = false;
-    movements.scafoldingBlocks = [];
-    movements.maxDropDown = 1;
-    movements.infiniteLiquidDropdownDistance = false;
-  }
-  return movements;
+  return await new Promise<NavigationReport>((resolve, reject) => {
+    let settled = false;
+    let stalled = false;
+    let sawMovement = false;
+    let lastPosition = bot.entity.position.clone();
+    let lastMovedAt = Date.now();
+    let backstop: ReturnType<typeof setInterval> | undefined;
+
+    const bad = (name: string, message: string): Error => {
+      const err = new Error(message);
+      (err as Error & { name: string }).name = name;
+      return err;
+    };
+    const report = (): NavigationReport => summarizeNavigation(update, start, target, stalled);
+
+    const onReached = (): void => finish(null);
+    const onUpdate = (value: PathfinderUpdate): void => {
+      update = value;
+      if (value.status === "noPath") {
+        finish(bad("NoPath", "No walkable path to the target within the search region: the way is blocked or the target is unreachable on foot."));
+      } else if (value.status === "timeout") {
+        finish(bad("Timeout", "Pathfinding timed out before finding a route; the target may be too complex to reach on foot. Try moving closer."));
+      }
+    };
+    const onChanged = (changed: unknown): void => {
+      if (changed !== goal) {
+        finish(bad("GoalChanged", "The navigation goal was changed before it could be completed."));
+      }
+    };
+    const onStopped = (): void => finish(bad("PathStopped", stallReason));
+
+    const onAbort = (): void => {
+      stalled = true;
+      stallReason = "Navigation was stopped: command timeout or cancel fired mid-walk.";
+      finish(bad("PathStopped", stallReason));
+    };
+
+    const detach = (): void => {
+      if (backstop) clearInterval(backstop);
+      bot.removeListener("goal_reached", onReached);
+      bot.removeListener("path_update", onUpdate);
+      bot.removeListener("goal_updated", onChanged);
+      bot.removeListener("path_stop", onStopped);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+
+    function finish(err: Error | null): void {
+      if (settled) return;
+      settled = true;
+      detach();
+      // Stop cleanly: clearing the goal resets the path and control states
+      // without setting the library's sticky stop flag (pathfinder.stop()
+      // would poison the next walk).
+      try {
+        pathfinderBot.pathfinder?.setGoal(null as unknown as PathfinderGoal);
+      } catch {
+        // already stopped
+      }
+      setTimeout(() => (err ? reject(err) : resolve(report())), 0);
+    }
+
+    bot.on("goal_reached", onReached);
+    bot.on("path_update", onUpdate);
+    bot.on("goal_updated", onChanged);
+    bot.on("path_stop", onStopped);
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    // Backstop: normal completion is driven by the library's own events above.
+    // This only settles the cases where the library went silent: the bot
+    // arrived (success) or stopped moving forever (stuck walk).
+    backstop = setInterval(() => {
+      const position = bot.entity.position;
+      if (distXZ(position, target) <= tolerance) {
+        finish(null);
+        return;
+      }
+      const moved = position.distanceTo(lastPosition);
+      if (moved >= MIN_PROGRESS_DISTANCE) {
+        lastPosition = position.clone();
+        lastMovedAt = Date.now();
+        sawMovement = true;
+      } else if (sawMovement && Date.now() - lastMovedAt >= NO_PROGRESS_TIMEOUT_MS) {
+        stalled = true;
+        stallReason = "The bot stopped moving during the walk; the path may have been invalidated (e.g. falling gravel or changed blocks). Try again or pick a closer target.";
+        finish(bad("PathStopped", stallReason));
+      }
+    }, 250);
+  });
 }
 
 export function summarizeNavigation(
   update: PathfinderUpdate,
   start: Vector3,
   target: Vector3,
-  stalled: boolean,
-  profile: NavigationProfile = "adaptive"
+  stalled: boolean
 ): NavigationReport {
   let ascents = 0;
   let drops = 0;
-  let blocksToBreak = 0;
-  let blocksToPlace = 0;
   let previous: Vector3 = start;
   for (const move of update.path) {
     if (move.y > previous.y) ascents += 1;
     if (move.y < previous.y) drops += 1;
-    blocksToBreak += move.toBreak?.length ?? 0;
-    blocksToPlace += move.toPlace?.length ?? 0;
     previous = move;
   }
-  const verticalDelta = target.y - start.y;
-  let diagnosis = `${profile} route completed`;
+  const raw = update as PathfinderUpdate & { visitedNodes?: number };
+  let diagnosis = "walk route found";
   if (stalled) {
-    diagnosis = "pathfinding made no physical progress; the target is likely unreachable or outside the loaded world";
-  } else if (update.status === "noPath" && verticalDelta > 1) {
-    diagnosis = profile === "walk_only"
-      ? "walk-only pathfinding found no existing ascent within the movement limits"
-      : "adaptive pathfinding found no ascent; a deliberate staircase or tunnel may be required";
-  } else if (update.status === "noPath" && verticalDelta < (profile === "walk_only" ? -1 : -4)) {
-    diagnosis = `${profile} pathfinding found no descent; the required drop exceeds the profile limit`;
+    diagnosis = "the bot stopped moving during the walk; the path may have been invalidated or the terrain changed";
   } else if (update.status === "noPath") {
-    diagnosis = profile === "walk_only"
-      ? "no route exists through loaded walkable terrain without digging, placing, parkour, or a drop over one block"
-      : "no route exists through the currently loaded terrain, even with digging and block placement enabled";
+    diagnosis = "no walkable route; the target is blocked or unreachable on foot within the search region";
   } else if (update.status === "timeout") {
-    diagnosis = "path search exhausted its computation budget; the target may be unreachable or outside the loaded chunks";
-  } else if (update.status !== "success") {
+    diagnosis = "path search exhausted its budget; the target may be unreachable or the terrain too complex on foot";
+  } else if (update.status !== "success" && update.status !== "partial") {
     diagnosis = `pathfinder ended with status ${update.status}`;
   }
   return {
-    profile,
     pathStatus: update.status,
-    pathNodes: update.path.length,
+    pathNodes: typeof raw.visitedNodes === "number" ? raw.visitedNodes : update.path.length,
     ascents,
     drops,
-    blocksToBreak,
-    blocksToPlace,
     stalled,
     diagnosis
   };
 }
 
 async function walkToBlockRange(bot: Bot, block: BlockLike): Promise<void> {
-  await gotoNear(bot, vector(block.position), 2.0);
+  await gotoNear(bot, vector(block.position), 2.0, defaultNavigationRegion(bot));
 }
 
 async function ensureRange(bot: Bot, block: BlockLike, walkIntoRange: boolean): Promise<CommandResult | { ok: true }> {
@@ -1019,6 +1075,30 @@ async function ensureRange(bot: Bot, block: BlockLike, walkIntoRange: boolean): 
     };
   }
   return { ok: true };
+}
+
+const INTERACTABLE_NAMES = new Set([
+  "lever", "chest", "trapped_chest", "ender_chest", "barrel",
+  "furnace", "blast_furnace", "smoker", "crafting_table",
+  "anvil", "chip_anvil", "damaged_anvil", "dispenser", "dropper", "hopper",
+  "beacon", "note_block", "daylight_detector", "grindstone", "stonecutter",
+  "cartography_table", "fletching_table", "smithing_table", "loom", "composter",
+  "lectern", "brewing_stand", "enchanting_table", "jukebox", "respawn_anchor",
+  "repeater", "comparator", "target", "bell"
+]);
+
+/** True for right-click/use interactable blocks: doors, gates, buttons, plates, beds, etc. */
+function isInteractableName(name: string): boolean {
+  if (INTERACTABLE_NAMES.has(name)) return true;
+  return (
+    /_door$/.test(name) ||
+    /_fence_gate$/.test(name) ||
+    /_trapdoor$/.test(name) ||
+    /_button$/.test(name) ||
+    /_pressure_plate$/.test(name) ||
+    /_bed$/.test(name) ||
+    /shulker_box$/.test(name)
+  );
 }
 
 function blockAt(bot: Bot, target: Vector3): BlockLike | null {
@@ -1116,6 +1196,9 @@ function navigationReason(error: unknown): string {
   if (error instanceof NavigationFailure && error.report.pathStatus === "noPath") {
     return "pathfinder_no_path";
   }
+  const name = error instanceof Error ? error.name : "";
+  if (name === "NoPath") return "pathfinder_no_path";
+  if (name === "Timeout") return "pathfinder_timed_out";
   return pathfinderReason(error);
 }
 

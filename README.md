@@ -146,27 +146,19 @@ capture (viewer/bot not ready, no supported browser found) is reported as
 `screenshot: {"error": ..., "message": ...}`, distinct from `screenshot: null`
 (image capture is disabled server-wide via `--no-images`).
 
-## Navigation profiles
+## Navigation (walk only)
 
-`minecraft_walk_to` uses the `adaptive` profile by default. It can dig, place
-scaffold blocks, use towers, use parkour, and drop as many as four blocks to
-reach the target. It aims at the horizontal position (GoalNearXZ, so terrain
-height is chosen automatically) and uses a **dynamic goal that streams/loads
-chunks as it travels**, so it can cover long overland distances in one walk —
-not just one chunk. `-ViewDistance` (default 24) controls how many chunks are
-loaded around the bot.
+`minecraft_walk_to` only walks. It can climb 1-block steps and step down 1
+block, but it does **not** dig, place scaffolding, tower, parkour, or open
+doors. It aims at the horizontal position (`GoalNearXZ`, so terrain height is
+chosen automatically) using a **static goal** inside a start-centered region of
+`chunk_limit` chunks (default 3, capped by the server's configured max). If the
+target is outside that region, has no standable floor nearby, or has no on-foot
+path, the call fails fast instead of sitting around.
 
-`tolerance` defaults to **1** so the body gets adjacent for pickups and
-placements; raise it for long noisy hops.
-
-Set `profile: walk_only` when the route must not change blocks. This profile
-disables digging, scaffold placement, towers, and parkour. It also limits drops
-to one block and disables unlimited liquid drops. The command fails if no such
-route exists.
-
-`walk_only` does not guarantee that inventory stays unchanged. The character
-can still pick up an item that is on the route. Compare before-state and
-after-state inventory when that postcondition is required.
+`tolerance` defaults to **1.5**. The search A* budget (`walkSearchTimeoutMs`,
+default 1000) bounds how long pathfinding can take before it fails with a
+"move closer" message.
 
 ## Tunneling & long-distance navigation
 
@@ -175,10 +167,9 @@ after-state inventory when that postcondition is required.
   skips that gate for targets within `--mine-visibility-ignore-distance`
   blocks (default `3`, pass `-MineVisibilityIgnoreDistance` to the start
   script) so you can tunnel straight ahead from a 1-wide tunnel.
-- `minecraft_walk_to` accepts targets up to `--walk-to-max-distance` blocks
-  away (default `512`, pass `-WalkToMaxDistance`). The pathfinder's A* compute
-  budget (`thinkTimeout`, default 40000ms) is raised so complex mountain
-  terrain resolves instead of "path search exhausted its computation budget".
+- `minecraft_walk_to` accepts a `chunk_limit` up to `--max-chunk-limit`
+  (default `8`). Larger requests are rejected with
+  `error: requested chunk limit (N) greater than allowed (M)`.
 - `minecraft_pillar_up` reports a clear `pillar_up_needs_placeable_block`
   error when the held item is not a placeable block, and explains that the
   landing headroom must be cleared first; `dig_up` clears headroom per-hop.

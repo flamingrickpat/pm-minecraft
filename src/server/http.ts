@@ -82,6 +82,8 @@ export interface RuntimeHttpServerOptions {
     applyControlStates: CommandControls["applyControlStates"];
     actions: PhysicalCommandActions;
     maxFineControlDurationMs?: number;
+    /** Absolute cap (chunks) on walk_to search region; larger requests are rejected. */
+    maxChunkLimit?: number;
   };
   frames?: FrameBundleCapture;
   targeting?: PixelTargeting;
@@ -236,11 +238,15 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
   if (request.method === "POST" && request.url === "/api/command/walk-to") {
-    await queuedAction(request, response, options, "walk_to", parseWalkTo, (actions, input, signal) => actions.walkTo(input, signal));
+    await queuedAction(request, response, options, "walk_to", (body) => parseWalkTo(body, options.commands?.maxChunkLimit), (actions, input, signal) => actions.walkTo(input, signal));
     return;
   }
   if (request.method === "POST" && request.url === "/api/world/find-block") {
     await findBlock(request, response, options);
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/world/interactables") {
+    await findInteractables(request, response, options);
     return;
   }
   if (request.method === "POST" && request.url === "/api/command/mine-block") {
@@ -674,6 +680,32 @@ async function findBlock(request: IncomingMessage, response: ServerResponse, opt
   const result = await options.commands.actions.findBlock(input.value);
   await recordReadonlyCommand(options, "find_block", input.value, result);
   writeJson(response, result.ok ? 200 : 404, result);
+}
+
+async function findInteractables(request: IncomingMessage, response: ServerResponse, options: RuntimeHttpServerOptions): Promise<void> {
+  if (!options.commands) {
+    writeJson(response, 503, {
+      ok: false,
+      error: "commands_unavailable",
+      message: "Commands are unavailable because the bot runtime is not ready."
+    });
+    return;
+  }
+
+  const parsed = await readJson(request);
+  if (!parsed.ok) {
+    writeJson(response, 400, { ok: false, error: "invalid_json", message: parsed.message });
+    return;
+  }
+  const input = parseInteractables(parsed.body);
+  if (!input.ok) {
+    writeJson(response, 400, { ok: false, error: input.error, message: input.message });
+    return;
+  }
+
+  const result = await options.commands.actions.findInteractables(input.value);
+  await recordReadonlyCommand(options, "find_interactables", input.value, result);
+  writeJson(response, 200, result);
 }
 
 async function stopCommand(response: ServerResponse, options: RuntimeHttpServerOptions): Promise<void> {
@@ -1204,7 +1236,7 @@ function parseLook(body: Record<string, unknown>): Parsed<{ yaw: number; pitch: 
   return { ok: true, value: { yaw, pitch } };
 }
 
-function parseWalkTo(body: Record<string, unknown>): Parsed<{ target: Vector3; tolerance: number; profile: "adaptive" | "walk_only" }> {
+function parseWalkTo(body: Record<string, unknown>, maxChunkLimit = 8): Parsed<{ target: Vector3; tolerance: number; chunkLimit: number }> {
   const target = parseVector(body.target, "target", false);
   if (!target.ok) {
     return target;
@@ -1213,11 +1245,18 @@ function parseWalkTo(body: Record<string, unknown>): Parsed<{ target: Vector3; t
   if (!tolerance.ok) {
     return tolerance;
   }
-  const profile = body.profile ?? "adaptive";
-  if (profile !== "adaptive" && profile !== "walk_only") {
-    return { ok: false, error: "invalid_navigation_profile", message: "profile must be adaptive or walk_only." };
+  const chunkLimit = (body.chunkLimit ?? 3) as unknown;
+  if (typeof chunkLimit !== "number" || !Number.isInteger(chunkLimit) || chunkLimit < 1) {
+    return { ok: false, error: "invalid_chunk_limit", message: "chunkLimit must be a positive integer (chunks)." };
   }
-  return { ok: true, value: { target: target.value, tolerance: tolerance.value, profile } };
+  if (chunkLimit > maxChunkLimit) {
+    return {
+      ok: false,
+      error: "chunk_limit_exceeded",
+      message: `error: requested chunk limit (${chunkLimit}) greater than allowed (${maxChunkLimit})`
+    };
+  }
+  return { ok: true, value: { target: target.value, tolerance: tolerance.value, chunkLimit } };
 }
 
 function parseMineBlock(body: Record<string, unknown>): Parsed<{ block: Vector3; walkIntoRange: boolean }> {
@@ -1226,6 +1265,14 @@ function parseMineBlock(body: Record<string, unknown>): Parsed<{ block: Vector3;
     return block;
   }
   return { ok: true, value: { block: block.value, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
+}
+
+function parseInteractables(body: Record<string, unknown>): Parsed<{ maxDistance: number }> {
+  const maxDistance = body.maxDistance ?? 16;
+  if (typeof maxDistance !== "number" || !Number.isFinite(maxDistance) || maxDistance < 1 || maxDistance > 64) {
+    return { ok: false, error: "invalid_max_distance", message: "maxDistance must be between 1 and 64." };
+  }
+  return { ok: true, value: { maxDistance } };
 }
 
 function parseFindBlock(body: Record<string, unknown>): Parsed<{ blockName: string; maxDistance: number; requireVisible: boolean }> {
@@ -1263,12 +1310,16 @@ function parseUseBlock(body: Record<string, unknown>): Parsed<{ block: Vector3; 
   return { ok: true, value: { block: block.value, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
 }
 
-function parseAttackEntity(body: Record<string, unknown>): Parsed<{ entityId: number; walkIntoRange: boolean }> {
+function parseAttackEntity(body: Record<string, unknown>): Parsed<{ entityId: number; walkIntoRange: boolean; renavigationCount: number }> {
   const entityId = body.entityId;
   if (!Number.isInteger(entityId) || typeof entityId !== "number" || entityId < 0) {
     return { ok: false, error: "invalid_entity_id", message: "entityId must be a non-negative integer from a fresh observation." };
   }
-  return { ok: true, value: { entityId, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
+  const renavigationCount = optionalPositiveNumber(body.renavigationCount ?? 3, 3, "invalid_renavigation_count", "renavigationCount must be a positive number.");
+  if (!renavigationCount.ok) {
+    return renavigationCount;
+  }
+  return { ok: true, value: { entityId, walkIntoRange: booleanValue(body.walkIntoRange, false), renavigationCount: Math.round(renavigationCount.value) } };
 }
 
 function parsePixelTarget(body: Record<string, unknown>): Parsed<{ frameId: string; x: number; y: number; maxDistance: number }> {

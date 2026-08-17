@@ -14,8 +14,10 @@ export interface RuntimeConfig {
     host: string; port: number; username: string; viewDistance?: number;
     /** mine_block skips its head-line-of-sight gate for targets within this many blocks (tunneling). */
     mineVisibilityIgnoreDistance: number;
-    /** walk_to rejects targets farther than this many blocks; split long routes into hops. */
-    walkToMaxDistance: number;
+    /** Absolute cap (in chunks) on walk_to's search region; larger requested chunk_limit is rejected. */
+    walkMaxChunks: number;
+    /** A* compute budget in ms for each walk path search. */
+    walkSearchTimeoutMs: number;
   };
   web: { host: string; port: number };
   viewer: { enabled: boolean; port: number; firstPerson: boolean; viewDistance?: number; captureWidth: number; captureHeight: number; deviceScaleFactor: number; fovDegrees: number };
@@ -36,10 +38,15 @@ export function parseRuntimeConfig(env: NodeJS.ProcessEnv): RuntimeConfig {
         3.0,
         "MINECRAFT_MINE_VISIBILITY_IGNORE_DISTANCE"
       ),
-      walkToMaxDistance: floatValue(
-        env.MINECRAFT_WALK_TO_MAX_DISTANCE,
-        16.0,
-        "MINECRAFT_WALK_TO_MAX_DISTANCE"
+      walkMaxChunks: intValue(
+        env.MINECRAFT_WALK_MAX_CHUNKS,
+        8,
+        "MINECRAFT_WALK_MAX_CHUNKS"
+      ),
+      walkSearchTimeoutMs: intValue(
+        env.MINECRAFT_WALK_SEARCH_TIMEOUT_MS,
+        1000,
+        "MINECRAFT_WALK_SEARCH_TIMEOUT_MS"
       )
     },
     web: {
