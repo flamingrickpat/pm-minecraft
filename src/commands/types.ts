@@ -40,4 +40,12 @@ export interface AttackEntityInput extends BlockCommandOptions {
   entityId: number;
   /** How many times to re-walk to the entity's current position when it moves out of range (default 3). */
   renavigationCount?: number;
+  /** Maximum swings before giving up (default 25). The bot hits until the target is dead/gone. */
+  maxHits?: number;
+}
+
+export interface ChestInput {
+  itemName: string;
+  /** Amount to move; defaults to every matching item. */
+  count?: number;
 }

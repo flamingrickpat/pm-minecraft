@@ -2,11 +2,11 @@ import type { Bot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { CommandResult } from "../commands/commandQueue.js";
-import type { AttackEntityInput, FindBlockInput, JumpPlaceBlockInput, MineBlockInput, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
+import type { AttackEntityInput, ChestInput, FindBlockInput, JumpPlaceBlockInput, MineBlockInput, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
 import { isVisibleFromHead } from "../perception/visibility.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
-type PathfinderGoal = InstanceType<typeof goals.GoalNear>;
+type PathfinderGoal = InstanceType<typeof goals.Goal>;
 type PathfinderMove = Vector3 & {
   toBreak?: unknown[];
   toPlace?: unknown[];
@@ -67,6 +67,9 @@ export interface PhysicalCommandActions {
   jumpPlaceBlock(input: JumpPlaceBlockInput): Promise<CommandResult>;
   pillarUp(): Promise<CommandResult>;
   useBlock(input: UseBlockInput): Promise<CommandResult>;
+  useHeldItem(): Promise<CommandResult>;
+  chestDeposit(input: ChestInput): Promise<CommandResult>;
+  chestWithdraw(input: ChestInput): Promise<CommandResult>;
   attackEntity(input: AttackEntityInput): Promise<CommandResult>;
   inspectBlock(block: Vector3): Promise<CommandResult>;
 }
@@ -228,7 +231,7 @@ export function createPhysicalCommandActions(
         };
       }
     },
-    findBlock: async ({ blockName, maxDistance, requireVisible = true }) => {
+    findBlock: async ({ blockName, maxDistance }) => {
       const registry = (bot as Bot & { registry?: { blocksByName?: Record<string, { id: number }> } }).registry;
       const blockId = registry?.blocksByName?.[blockName]?.id;
       if (typeof blockId !== "number") {
@@ -237,11 +240,12 @@ export function createPhysicalCommandActions(
       const found = bot.findBlock({
         matching: blockId,
         maxDistance,
-        useExtraInfo: requireVisible ? (block) => isVisibleFromHead(bot, block) : undefined
+        // Anti-x-ray is hard-locked here (not just at the HTTP/MCP layer): the
+        // scan always requires head line-of-sight (360 degrees) or proximity.
+        useExtraInfo: (block) => isVisibleOrNear(bot, block as Parameters<Bot["canSeeBlock"]>[0])
       });
       if (!found) {
-        const visibility = requireVisible ? "head-ray-visible " : "";
-        return failed("block_not_found", `No ${visibility}${blockName} found within ${maxDistance} loaded blocks.`, { blockName, maxDistance, requireVisible });
+        return failed("block_not_found", `No head-ray-visible ${blockName} found within ${maxDistance} loaded blocks.`, { blockName, maxDistance, requireVisible: true });
       }
       return {
         ok: true,
@@ -261,7 +265,10 @@ export function createPhysicalCommandActions(
         matching: (block: unknown) => isInteractableName((block as BlockLike)?.name ?? ""),
         point: bot.entity.position,
         maxDistance: range,
-        count: 64
+        count: 64,
+        // Same anti-x-ray rule as find_block: only head-visible blocks, plus a
+        // small proximity override for blocks too close/obscured to raycast.
+        useExtraInfo: (block: unknown) => isVisibleOrNear(bot, block as Parameters<Bot["canSeeBlock"]>[0])
       }) ?? [];
       const blocks = positions.map((pos) => ({
         name: (bot.blockAt(pos) as BlockLike | null)?.name ?? "unknown",
@@ -326,7 +333,12 @@ export function createPhysicalCommandActions(
           );
         }
         let digError: unknown = null;
-        const digPromise = (bot as ActionBot).dig(visibleTarget, true, "raycast").then(
+        // Viewport-independent face: compute the dig face from the player→block
+        // offset instead of mineflayer's raycast, which throws "Block not in
+        // view" whenever a neighbouring wall blocks the eye ray. Explicit faces
+        // also work from any rotation.
+        const digFace = digFaceFor(bot, visibleTarget);
+        const digPromise = (bot as ActionBot).dig(visibleTarget, true, digFace).then(
           () => undefined,
           (error: unknown) => {
             digError = error;
@@ -336,11 +348,15 @@ export function createPhysicalCommandActions(
           digPromise,
           waitForBlockRemoved(bot, vec(target), 25_000)
         ]);
+        // Let the world cache settle before reading the result state so a stale
+        // block echo cannot report the pre-mine block name (playtest finding 4).
+        await new Promise(resolve => setTimeout(resolve, 250));
         const after = blockAt(bot, target);
-        if (digError && after && after.name !== "air" && after.boundingBox !== "empty") {
+        const stillSolid = after !== null && after.name !== "air" && after.boundingBox !== "empty";
+        if (digError && stillSolid) {
           throw digError;
         }
-        if (after && after.name !== "air" && after.boundingBox !== "empty") {
+        if (stillSolid) {
           return failed("dig_unverified", "Mineflayer returned without removing the target block.", {
             block: target,
             blockName: visibleTarget.name,
@@ -349,9 +365,9 @@ export function createPhysicalCommandActions(
         }
 
         // Walk to the drop location to collect the item, but only when the
-        // drop is out of pickup range already — pathfinder calls are slow.
+        // drop is outside the (raised) pickup radius — pathfinder calls are slow.
         const dropPos = centerOf(visibleTarget);
-        if (bot.entity.position.distanceTo(dropPos) > 2.0) {
+        if (bot.entity.position.distanceTo(dropPos) > 10) {
           try {
             await gotoNear(bot, dropPos, 1.5, defaultNavigationRegion(bot));
           } catch {
@@ -363,6 +379,12 @@ export function createPhysicalCommandActions(
         // normal pickup delay so the authoritative after-state does not race a
         // nearby item entity and send an agent into a false retry loop.
         await new Promise(resolve => setTimeout(resolve, 1_000));
+        // Re-read the target AFTER the pickup settle: this is the authoritative
+        // result block name (air for a cleanly mined block).
+        const resultBlock = blockAt(bot, target);
+        const resultBlockName = resultBlock !== null && resultBlock.name !== "air" && resultBlock.boundingBox !== "empty"
+          ? resultBlock.name
+          : "air";
         
         return {
           ok: true,
@@ -370,7 +392,7 @@ export function createPhysicalCommandActions(
           data: {
             block: target,
             blockName: visibleTarget.name,
-            resultBlockName: after?.name ?? null,
+            resultBlockName,
             heldItemBefore,
             canHarvest
           }
@@ -631,59 +653,135 @@ export function createPhysicalCommandActions(
         return failed("use_failed", `Mineflayer use failed: ${errorMessage(error)}`, { block: target, blockName: block.name });
       }
     },
-    attackEntity: async ({ entityId, walkIntoRange, renavigationCount = 3 }) => {
-      const resolveTarget = (): EntityLike | null => {
-        const entity = bot.entities?.[entityId] as EntityLike | undefined;
-        return entity && entity !== bot.entity && entity.position ? entity : null;
+    useHeldItem: async () => {
+      const held = bot.heldItem as { name?: string; count?: number; displayName?: string; type?: number } | null;
+      if (!held?.name) {
+        return failed("no_item_held", "Nothing is held; equip an item first (inventory_equip).", {});
+      }
+      const registry = (bot as unknown as { registry?: { foodsArray?: Array<{ id: number; foodPoints?: number }> } }).registry;
+      const isFood = Array.isArray(registry?.foodsArray) && held.type !== undefined
+        ? registry.foodsArray.some((f) => f.id === held.type && (f.foodPoints ?? 0) > 0)
+        : false;
+      try {
+        if (isFood) {
+          const eater = bot as Bot & { consume?: () => Promise<void> };
+          if (typeof eater.consume !== "function") {
+            return failed("use_item_unavailable", "Mineflayer eat/consume is not available on this version.", { itemName: held.name });
+          }
+          await eater.consume();
+          return { ok: true, message: `Consumed ${held.name}.`, data: { action: "consume", itemName: held.name, isFood: true } };
+        }
+        // Generic right-click use: eggs/ender pearls/chorus fruit/buckets/potions, etc.
+        const user = bot as Bot & { activateItem?: (offHand?: boolean) => void };
+        if (typeof user.activateItem !== "function") {
+          return failed("use_item_unavailable", "Mineflayer activateItem is not available on this version.", { itemName: held.name });
+        }
+        user.activateItem(false);
+        // Let the server process the use (throw/drink/activate).
+        await new Promise(resolve => setTimeout(resolve, 400));
+        return { ok: true, message: `Used ${held.name}.`, data: { action: "use", itemName: held.name, isFood: false } };
+      } catch (error) {
+        if (errorMessage(error).toLowerCase().includes("food is full")) {
+          return failed("food_full", `Can't eat ${held.name}: food is already full.`, { itemName: held.name });
+        }
+        return failed("use_item_failed", `Failed to use ${held.name}: ${errorMessage(error)}`, { itemName: held.name });
+      }
+    },
+    chestDeposit: async ({ itemName, count }) => {
+      const window = openedContainerWindow(bot);
+      if (!window) {
+        return failed("no_chest_window", "No container (chest/barrel) window is open. Open one first with use_block, then deposit.", { itemName });
+      }
+      const itemId = registryItemId(bot, itemName);
+      if (typeof itemId !== "number") {
+        return failed("unknown_item", `Unknown item name: ${itemName}`, { itemName });
+      }
+      const available = typeof window.countRange === "function"
+        ? window.countRange(window.inventoryStart, window.inventoryEnd, itemId, 0)
+        : 0;
+      const toMove = count !== undefined && count > 0 ? Math.min(count, available) : available;
+      if (toMove <= 0) {
+        return failed("item_not_in_inventory", `No ${itemName} in the player inventory to deposit.`, { itemName });
+      }
+      await window.deposit!(itemId, 0, toMove);
+      return {
+        ok: true,
+        message: `Deposited ${toMove} × ${itemName} into the container.`,
+        data: { itemName, count: toMove, windowContents: containerContents(window) }
       };
+    },
+    chestWithdraw: async ({ itemName, count }) => {
+      const window = openedContainerWindow(bot);
+      if (!window) {
+        return failed("no_chest_window", "No container (chest/barrel) window is open. Open one first with use_block, then withdraw.", { itemName });
+      }
+      const itemId = registryItemId(bot, itemName);
+      if (typeof itemId !== "number") {
+        return failed("unknown_item", `Unknown item name: ${itemName}`, { itemName });
+      }
+      const available = typeof window.countRange === "function"
+        ? window.countRange(0, window.inventoryStart, itemId, 0)
+        : 0;
+      const toMove = count !== undefined && count > 0 ? Math.min(count, available) : available;
+      if (toMove <= 0) {
+        return failed("item_not_in_container", `No ${itemName} in the container to withdraw.`, { itemName });
+      }
+      await window.withdraw!(itemId, 0, toMove);
+      return {
+        ok: true,
+        message: `Withdrew ${toMove} × ${itemName} from the container.`,
+        data: { itemName, count: toMove, windowContents: containerContents(window) }
+      };
+    },
+    attackEntity: async ({ entityId, walkIntoRange, renavigationCount = 3, maxHits = 25 }) => {
+      const resolveTarget = (): (EntityLike & { id: number }) | null => {
+        const entity = bot.entities?.[entityId] as EntityLike | undefined;
+        return entity && entity !== bot.entity && entity.position
+          ? (entity as EntityLike & { id: number })
+          : null;
+      };
+      const first = resolveTarget();
+      if (!first) {
+        return failed("entity_not_found", "The observed entity is no longer present.", { entityId, attempt: 0 });
+      }
+      const label = first.username ?? first.name ?? first.displayName ?? `entity ${entityId}`;
+      const kindOf = (t: EntityLike): string => t.type ?? t.kind ?? "unknown";
 
-      for (let attempt = 0; ; attempt++) {
+      // No health tracking: keep swinging until the target is dead/gone.
+      let hits = 0;
+      let walks = 0;
+      for (let attempt = 0; attempt < maxHits; attempt++) {
         const target = resolveTarget();
         if (!target) {
-          return failed("entity_not_found", "The observed entity is no longer present.", { entityId, attempt });
+          return { ok: true, message: `${label} is dead or gone after ${hits} hit(s).`, data: { entityId, name: label, kind: kindOf(first), hits, killed: true, walks } };
         }
-        const label = target.username ?? target.name ?? target.displayName ?? `entity ${entityId}`;
         const distance = bot.entity.position.distanceTo(target.position);
         if (distance <= ATTACK_RANGE) {
-          const healthBefore = typeof target.health === "number" ? target.health : null;
           try {
             const eyeTarget = target.position.offset(0, 0.8, 0);
             await bot.lookAt(eyeTarget, false);
             syncTrackedToTarget(eyeTarget);
-            await bot.attack(target);
-            await new Promise(resolve => setTimeout(resolve, 400));
-            const healthAfter = typeof target.health === "number" ? target.health : null;
-            const hit = healthBefore !== null && healthAfter !== null && healthAfter < healthBefore;
-            return {
-              ok: true,
-              message: hit ? `Hit ${label}.` : `Attacked ${label}.`,
-              data: {
-                entityId,
-                name: label,
-                kind: target.type ?? "unknown",
-                hit,
-                healthBefore,
-                healthAfter: healthAfter ?? null,
-                targetStillPresent: resolveTarget() !== null
-              }
-            };
+            const hit = await strikeAndDetectHit(bot, target);
+            if (hit) hits++;
           } catch (error) {
-            return failed("attack_failed", `Mineflayer attack failed: ${errorMessage(error)}`, { entityId, name: label });
+            return failed("attack_failed", `Mineflayer attack failed: ${errorMessage(error)}`, { entityId, name: label, hits, walks });
           }
+          continue;
         }
-        // Out of range: walk to the entity's current position, then re-check.
         if (!walkIntoRange) {
-          return failed("entity_out_of_range", `${label} is outside attack range.`, { entityId, distance, attempts: attempt });
+          return failed("entity_out_of_range", `${label} is outside attack range.`, { entityId, distance, hits, walks });
         }
-        if (attempt >= renavigationCount) {
-          return failed("entity_out_of_range", `${label} moved or is out of range after ${attempt} walk(s). Give up and reposition.`, { entityId, distance, attempts: attempt });
+        if (walks >= renavigationCount) {
+          return failed("entity_out_of_range", `${label} moved out of range after ${walks} walk(s). Give up and reposition.`, { entityId, distance, hits, walks });
         }
         try {
           await gotoNear(bot, vector(target.position), 2.0, defaultNavigationRegion(bot));
+          walks++;
         } catch (error) {
-          return failed("entity_unreachable", `Could not reach ${label}: ${errorMessage(error)}`, { entityId });
+          return failed("entity_unreachable", `Could not reach ${label}: ${errorMessage(error)}`, { entityId, hits, walks });
         }
       }
+      return failed("attack_timeout", `${label} is still alive after ${maxHits} swings (${hits} connected).`, { entityId, name: label, kind: kindOf(first), hits, kills: 0, walks });
     },
     inspectBlock: async (target) => {
       const block = blockAt(bot, target);
@@ -881,6 +979,13 @@ async function gotoNear(
       setMovements(movements: InstanceType<typeof Movements>): void;
       setGoal(goal: PathfinderGoal | null, dynamic?: boolean): void;
       stop(): void;
+      thinkTimeout?: number;
+      getPathFromTo(
+        movements: InstanceType<typeof Movements>,
+        startPos: Vec3,
+        goal: PathfinderGoal | null,
+        options?: { timeout?: number }
+      ): Generator<{ result: { status: string; path: PathfinderMove[]; visitedNodes?: number } }>;
     };
   };
   if (!pathfinderBot.pathfinder) {
@@ -895,17 +1000,42 @@ async function gotoNear(
   let update: PathfinderUpdate = { status: "searching", path: [] };
   let stallReason = "The path was stopped before it could be completed.";
 
-  // Install the restricted movements and a STATIC goal BEFORE attaching
-  // listeners: a leftover stop flag from a previous aborted walk is consumed
-  // by the library on setMovements/setGoal and its path_stop event would
-  // otherwise race our handlers. Static goals make the library emit
-  // goal_reached when the bot arrives (dynamic goals do not — that was the
-  // original 30s hang).
-  pathfinderBot.pathfinder.setMovements(makeWalkMovements(bot, region));
+  const bad = (name: string, message: string): Error => {
+    const err = new Error(message);
+    (err as Error & { name: string }).name = name;
+    return err;
+  };
+
+  // Install the restricted movements BEFORE attaching listeners / searching: a
+  // leftover stop flag from a previous aborted walk is consumed by the library
+  // on setMovements and its path_stop event would otherwise race our handlers.
+  const movements = makeWalkMovements(bot, region);
+  pathfinderBot.pathfinder.setMovements(movements);
+
   // GoalNearXZ: aim at the horizontal target and let the pathfinder choose
   // whichever standable Y is reachable (the caller already validated that a
   // standable cell exists nearby).
   const goal = new goals.GoalNearXZ(target.x, target.z, tolerance);
+
+  // Phase 1 — resolve the search to a verdict WITHOUT moving. Mineflayer's
+  // incremental pathfinder can start walking partial paths while the search is
+  // still running, which used to displace the bot several blocks whenever a
+  // search ended in noPath. By settling the search first and only handing the
+  // goal to the walker once a path is confirmed, a noPath/timeout verdict now
+  // leaves the bot exactly where it started.
+  const searchBudget = pathfinderBot.pathfinder.thinkTimeout ?? 1000;
+  const searchResult = await settleSearch(pathfinderBot, movements, goal, searchBudget, signal);
+  if (searchResult.status === "noPath") {
+    throw bad("NoPath", "No walkable path to the target within the search region: the way is blocked or the target is unreachable on foot.");
+  }
+  if (searchResult.status === "timeout") {
+    throw bad("Timeout", "Pathfinding timed out before finding a route; the target may be too complex to reach on foot. Try moving closer.");
+  }
+  update = { status: searchResult.status, path: searchResult.path ?? [] };
+  (update as PathfinderUpdate & { visitedNodes?: number }).visitedNodes = searchResult.visitedNodes;
+
+  // Phase 2 — feed the confirmed (reachable) goal to the library walker.
+  // Static goals make the pathfinder emit goal_reached when it arrives.
   pathfinderBot.pathfinder.setGoal(goal, false);
 
   return await new Promise<NavigationReport>((resolve, reject) => {
@@ -916,12 +1046,8 @@ async function gotoNear(
     let lastMovedAt = Date.now();
     let backstop: ReturnType<typeof setInterval> | undefined;
 
-    const bad = (name: string, message: string): Error => {
-      const err = new Error(message);
-      (err as Error & { name: string }).name = name;
-      return err;
-    };
     const report = (): NavigationReport => summarizeNavigation(update, start, target, stalled);
+
 
     const onReached = (): void => finish(null);
     const onUpdate = (value: PathfinderUpdate): void => {
@@ -999,6 +1125,44 @@ async function gotoNear(
       }
     }, 250);
   });
+}
+
+async function settleSearch(
+  pathfinderBot: Bot & {
+    pathfinder?: {
+      getPathFromTo(
+        movements: InstanceType<typeof Movements>,
+        startPos: Vec3,
+        goal: PathfinderGoal | null,
+        options?: { timeout?: number }
+      ): Generator<{ result: { status: string; path: PathfinderMove[]; visitedNodes?: number } }>;
+    };
+  },
+  movements: InstanceType<typeof Movements>,
+  goal: PathfinderGoal,
+  budgetMs: number,
+  signal?: AbortSignal
+): Promise<{ status: string; path: PathfinderMove[]; visitedNodes?: number }> {
+  if (!pathfinderBot.pathfinder) {
+    throw new Error("mineflayer-pathfinder is not loaded.");
+  }
+  const startPos = (pathfinderBot as unknown as { entity?: { position: Vec3 } }).entity?.position
+    ?? new Vec3(0, 0, 0);
+  const generator = pathfinderBot.pathfinder.getPathFromTo(movements, startPos, goal, { timeout: budgetMs });
+  let result: { status: string; path: PathfinderMove[]; visitedNodes?: number } = { status: "searching", path: [] };
+  for (;;) {
+    if (signal?.aborted) {
+      const err = new Error("Navigation was stopped: command timeout or cancel fired during pathfinding.");
+      (err as Error & { name: string }).name = "PathStopped";
+      throw err;
+    }
+    const step = generator.next();
+    result = step.value.result;
+    if (result.status !== "partial") break;
+    // Let physics ticks / keepalives breathe between compute slices.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  return result;
 }
 
 export function summarizeNavigation(
@@ -1099,6 +1263,54 @@ function isInteractableName(name: string): boolean {
     /_bed$/.test(name) ||
     /shulker_box$/.test(name)
   );
+}
+
+// Blocks this close to the player's eye are always reported even when the
+// head ray fails (too near, or the view is partly obscured). This prevents
+// the scan from repeatedly missing blocks a player would trivially see by
+// turning around, while still blocking far-distance "x-ray" scanning.
+const PROXIMITY_VISIBLE_BLOCKS = 4;
+/**
+ * True when a block is visible from the player's head (360 degrees, not
+ * dependent on what the bot currently faces) or within PROXIMITY_VISIBLE_BLOCKS.
+ */
+function isVisibleOrNear(bot: Bot, block: Parameters<Bot["canSeeBlock"]>[0]): boolean {
+  const eyeHeight = (bot.entity as typeof bot.entity & { eyeHeight?: number }).eyeHeight ?? 1.62;
+  const eye = bot.entity.position.offset(0, eyeHeight, 0);
+  if (block.position.distanceTo(eye) <= PROXIMITY_VISIBLE_BLOCKS) return true;
+  return isVisibleFromHead(bot, block);
+}
+
+/**
+ * Strike the target and report whether the server registered damage.
+ * The entityHurt mineflayer event is authoritative; entity.health metadata is
+ * unreliable on some versions, so it is only a fallback.
+ */
+async function strikeAndDetectHit(bot: Bot, targetState: EntityLike & { id: number }): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const onHurt = (entity: unknown): void => {
+      if ((entity as { id?: number })?.id !== targetState.id) return;
+      finish(true);
+    };
+    const finish = (hit: boolean): void => {
+      if (settled) return;
+      settled = true;
+      bot.removeListener("entityHurt", onHurt);
+      clearTimeout(timer);
+      resolve(hit);
+    };
+    bot.on("entityHurt", onHurt);
+    // Entity health is not populated in mineflayer on 1.19.4, so the only
+    // reliable hit signal is the server's entityHurt event.
+    timer = setTimeout(() => finish(false), 800);
+    try {
+      (bot as Bot & { attack(entity: unknown): void }).attack(targetState as never);
+    } catch {
+      finish(false);
+    }
+  });
 }
 
 function blockAt(bot: Bot, target: Vector3): BlockLike | null {
@@ -1211,7 +1423,7 @@ function navigationReason(error: unknown): string {
  *   "minecraft:furnace"   → furnace (smelting)
  *   "minecraft:inventory" → player inventory (2x2 crafting, rarely opened via activateBlock)
  */
-function detectOpenedWindowType(bot: Bot): "crafting_table" | "furnace" | null {
+function detectOpenedWindowType(bot: Bot): "crafting_table" | "furnace" | "chest" | null {
   const raw = bot as Bot & { currentWindow?: { type?: string | number } };
   if (!raw.currentWindow) return null;
   const typeStr = typeof raw.currentWindow.type === "string"
@@ -1219,5 +1431,49 @@ function detectOpenedWindowType(bot: Bot): "crafting_table" | "furnace" | null {
     : String(raw.currentWindow.type ?? "");
   if (typeStr === "minecraft:crafting") return "crafting_table";
   if (typeStr === "minecraft:furnace") return "furnace";
+  // Generic item containers share the same deposit/withdraw machinery.
+  if (typeStr.includes("chest") || typeStr.includes("barrel") || typeStr.includes("shulker") || typeStr.includes("hopper") || typeStr.includes("container")) {
+    return "chest";
+  }
   return null;
+}
+
+interface ContainerWindowLike {
+  type?: string | number;
+  inventoryStart: number;
+  inventoryEnd: number;
+  countRange?(start: number, end: number, itemType: number, metadata?: number): number;
+  containerItems?(): Array<{ name: string; count: number; slot: number }>;
+  deposit?(itemType: number, metadata: number, count: number): Promise<void>;
+  withdraw?(itemType: number, metadata: number, count: number): Promise<void>;
+}
+
+function openedContainerWindow(bot: Bot): ContainerWindowLike | null {
+  const window = (bot as Bot & { currentWindow?: ContainerWindowLike }).currentWindow;
+  if (!window) return null;
+  const typeStr = typeof window.type === "string" ? window.type : String(window.type ?? "");
+  const isContainer = typeStr.includes("chest") || typeStr.includes("barrel") || typeStr.includes("shulker") || typeStr.includes("hopper") || typeStr.includes("container");
+  return isContainer ? window : null;
+}
+
+function containerContents(window: ContainerWindowLike): Array<{ name: string; count: number; slot: number }> {
+  if (typeof window.containerItems !== "function") return [];
+  return window.containerItems().map((item) => ({ name: item.name, count: item.count, slot: item.slot }));
+}
+
+function registryItemId(bot: Bot, itemName: string): number | undefined {
+  return (bot as Bot & { registry?: { itemsByName?: Record<string, { id: number }> } }).registry?.itemsByName?.[itemName]?.id;
+}
+
+function digFaceFor(bot: Bot, block: BlockLike): Vec3 {
+  const eyeHeight = (bot.entity as { eyeHeight?: number }).eyeHeight ?? 1.62;
+  const dx = bot.entity.position.x - (block.position.x + 0.5);
+  const dy = bot.entity.position.y + eyeHeight - (block.position.y + 0.5);
+  const dz = bot.entity.position.z - (block.position.z + 0.5);
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  const az = Math.abs(dz);
+  if (ay >= ax && ay >= az) return new Vec3(0, dy >= 0 ? 1 : -1, 0);
+  if (ax >= az) return new Vec3(dx >= 0 ? 1 : -1, 0, 0);
+  return new Vec3(0, 0, dz >= 0 ? 1 : -1);
 }

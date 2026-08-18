@@ -135,7 +135,10 @@ function createContext(bodyUrl: string): MinecraftContext {
     mineBlock: (block, walkIntoRange = true, timeoutSeconds = 60) => call("mine_block", { block, walkIntoRange }, timeoutSeconds),
     placeBlock: (referenceBlock, face, walkIntoRange = true, timeoutSeconds = 60) => call("place_block", { referenceBlock, face, walkIntoRange }, timeoutSeconds),
     useBlock: (block, walkIntoRange = true, timeoutSeconds = 30) => call("use_block", { block, walkIntoRange }, timeoutSeconds),
-    attackEntity: (entityId, walkIntoRange = true, timeoutSeconds = 30, renavigationCount = 3) => call("attack_entity", { entityId, walkIntoRange, renavigationCount }, timeoutSeconds),
+    useItem: () => call("use_item", {}, 15),
+    chestDeposit: (itemName, count, timeoutSeconds = 30) => call("chest_deposit", count === undefined ? { itemName } : { itemName, count }, timeoutSeconds),
+    chestWithdraw: (itemName, count, timeoutSeconds = 30) => call("chest_withdraw", count === undefined ? { itemName } : { itemName, count }, timeoutSeconds),
+    attackEntity: (entityId, walkIntoRange = true, timeoutSeconds = 30, renavigationCount = 3, maxHits = 25) => call("attack_entity", { entityId, walkIntoRange, renavigationCount, maxHits }, timeoutSeconds),
     equip: (itemName) => call("inventory_equip", { itemName }, 15),
     craft: (itemName, repetitions = 1) => call("craft_item", { itemName, repetitions }, 60),
     smelt: (inputItemName, inputCount, fuelItemName, fuelCount = 1, timeoutSeconds = 60) => call(

@@ -269,6 +269,18 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     await handleUseBlock(request, response, options);
     return;
   }
+  if (request.method === "POST" && request.url === "/api/command/use-item") {
+    await queuedAction(request, response, options, "use_item", parseUseItem, (actions) => actions.useHeldItem());
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/chest/deposit") {
+    await queuedAction(request, response, options, "chest_deposit", parseChestInput, (actions, input) => actions.chestDeposit(input));
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/chest/withdraw") {
+    await queuedAction(request, response, options, "chest_withdraw", parseChestInput, (actions, input) => actions.chestWithdraw(input));
+    return;
+  }
   if (request.method === "POST" && request.url === "/api/command/attack-entity") {
     await queuedAction(request, response, options, "attack_entity", parseAttackEntity, (actions, input) => actions.attackEntity(input));
     return;
@@ -1284,7 +1296,9 @@ function parseFindBlock(body: Record<string, unknown>): Parsed<{ blockName: stri
   if (!Number.isFinite(maxDistance) || maxDistance < 1 || maxDistance > 256) {
     return { ok: false, error: "invalid_max_distance", message: "maxDistance must be between 1 and 256." };
   }
-  return { ok: true, value: { blockName, maxDistance, requireVisible: booleanValue(body.requireVisible, true) } };
+  // Anti-x-ray is hard-locked server-side: callers (including skills, which
+  // talk to this HTTP API directly) cannot disable line-of-sight filtering.
+  return { ok: true, value: { blockName, maxDistance, requireVisible: true } };
 }
 
 function parsePlaceBlock(body: Record<string, unknown>): Parsed<{ referenceBlock: Vector3; face: Vector3; walkIntoRange: boolean }> {
@@ -1308,6 +1322,26 @@ function parseUseBlock(body: Record<string, unknown>): Parsed<{ block: Vector3; 
     return block;
   }
   return { ok: true, value: { block: block.value, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
+}
+
+function parseUseItem(body: Record<string, unknown>): Parsed<Record<string, never>> {
+  return { ok: true, value: {} };
+}
+
+function parseChestInput(body: Record<string, unknown>): Parsed<{ itemName: string; count?: number }> {
+  const itemName = typeof body.itemName === "string" ? body.itemName.trim() : "";
+  if (!itemName) {
+    return { ok: false, error: "invalid_item_name", message: "itemName must be a non-empty string." };
+  }
+  let count: number | undefined;
+  if (body.count !== undefined && body.count !== null) {
+    count = typeof body.count === "number" ? body.count : undefined;
+    if (typeof count === "number" && (!Number.isInteger(count) || count < 0)) {
+      return { ok: false, error: "invalid_count", message: "count must be a non-negative integer." };
+    }
+    if (typeof count === "number" && count === 0) count = undefined;
+  }
+  return { ok: true, value: { itemName, count } };
 }
 
 function parseAttackEntity(body: Record<string, unknown>): Parsed<{ entityId: number; walkIntoRange: boolean; renavigationCount: number }> {

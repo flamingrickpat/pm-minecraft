@@ -547,6 +547,9 @@ class BodyApi:
         "jump_place_block": ("POST", "/api/command/jump-place-block"),
         "pillar_up": ("POST", "/api/command/pillar-up"),
         "use_block": ("POST", "/api/command/use-block"),
+        "use_item": ("POST", "/api/command/use-item"),
+        "chest_deposit": ("POST", "/api/chest/deposit"),
+        "chest_withdraw": ("POST", "/api/chest/withdraw"),
         "attack_entity": ("POST", "/api/command/attack-entity"),
         "inspect": ("POST", "/api/command/inspect"),
         "rotate": ("POST", "/api/command/rotate"),
@@ -602,10 +605,22 @@ class BodyApi:
             "block": {"x": "integer", "y": "integer", "z": "integer"},
             "walkIntoRange": "boolean",
         },
+        "use_item": {
+            "heldItem": "the currently equipped item is used/consumed: food is eaten, throwables are thrown, potions/milk are drunk",
+        },
         "attack_entity": {
             "entityId": "non-negative integer from a fresh observation",
             "walkIntoRange": "boolean",
             "renavigationCount": "positive integer; max re-walks to the moving target, default 3",
+            "maxHits": "positive integer; max swings before giving up, default 25",
+        },
+        "chest_deposit": {
+            "itemName": "exact Mineflayer item name to move into the open container",
+            "count": "positive integer; amount to deposit (defaults to every matching item)",
+        },
+        "chest_withdraw": {
+            "itemName": "exact Mineflayer item name to take from the open container",
+            "count": "positive integer; amount to withdraw (defaults to every matching item)",
         },
         "inspect": {"block": {"x": "integer", "y": "integer", "z": "integer"}},
         "rotate": {
@@ -658,6 +673,9 @@ class BodyApi:
         "jumpPlaceBlock": "jump_place_block",
         "pillarUp": "pillar_up",
         "useBlock": "use_block",
+        "useItem": "use_item",
+        "chestDeposit": "chest_deposit",
+        "chestWithdraw": "chest_withdraw",
         "attackEntity": "attack_entity",
         "lookAt": "look_at",
         "fineControl": "fine_control",
@@ -3716,6 +3734,31 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     async def minecraft_pillar_up(include_image: bool = False) -> ToolResult:
         """Ascend exactly one block by naturally jumping and placing the currently held placeable block beneath the character. No coordinates or face are needed: the body derives the block below, retries up to three jumps, verifies the placed block, and waits for landing. Equip a suitable solid block and use a fresh observation whose localAirspace.clearanceBlocksAboveHead is at least 1."""
         return await runtime.call_tool("pillar_up", {}, 30, include_image)
+
+    @mcp.tool
+    async def minecraft_use_item(timeout_seconds: float = 10, include_image: bool = False) -> ToolResult:
+        """Use the currently equipped item as if right-clicking: food/milk/potions are eaten/drunk (waits for consumption), eggs/ender pearls/chorus fruit are thrown, and other activatable items are triggered. Verify the effect (food hunger, inventory delta, thrown entity) from the returned state. Returns food_full when the hunger bar is already full."""
+        return await runtime.call_tool("use_item", {}, timeout_seconds, include_image)
+
+    @mcp.tool
+    async def minecraft_chest_deposit(
+        item_name: str, count: int | None = None, include_image: bool = False
+    ) -> ToolResult:
+        """Move items from the player's inventory into the currently open container window (chest/barrel/shulker). Open the container first with use_block, which reports windowType "chest". Returns the container's resulting contents. Fails with no_chest_window when nothing is open."""
+        body: dict[str, Any] = {"itemName": item_name}
+        if count is not None:
+            body["count"] = count
+        return await runtime.call_tool("chest_deposit", body, 30, include_image)
+
+    @mcp.tool
+    async def minecraft_chest_withdraw(
+        item_name: str, count: int | None = None, include_image: bool = False
+    ) -> ToolResult:
+        """Take items from the currently open container window (chest/barrel/shulker) into the player's inventory. Open the container first with use_block, which reports windowType "chest". Returns the container's resulting contents. Fails with no_chest_window when nothing is open."""
+        body: dict[str, Any] = {"itemName": item_name}
+        if count is not None:
+            body["count"] = count
+        return await runtime.call_tool("chest_withdraw", body, 30, include_image)
 
     @mcp.tool
     async def minecraft_collect_blocks(

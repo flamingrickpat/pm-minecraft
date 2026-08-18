@@ -79,7 +79,10 @@ export interface MinecraftContext {
   mineBlock(block: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
   placeBlock(referenceBlock: Vector3, face: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
   useBlock(block: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
-  attackEntity(entityId: number, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
+  useItem(): Promise<MinecraftResponse>;
+  chestDeposit(itemName: string, count?: number, timeoutSeconds?: number): Promise<MinecraftResponse>;
+  chestWithdraw(itemName: string, count?: number, timeoutSeconds?: number): Promise<MinecraftResponse>;
+  attackEntity(entityId: number, walkIntoRange?: boolean, timeoutSeconds?: number, renavigationCount?: number, maxHits?: number): Promise<MinecraftResponse>;
   equip(itemName: string): Promise<MinecraftResponse>;
   craft(itemName: string, repetitions?: number): Promise<MinecraftResponse>;
   smelt(inputItemName: string, inputCount: number, fuelItemName: string, fuelCount?: number, timeoutSeconds?: number): Promise<MinecraftResponse>;

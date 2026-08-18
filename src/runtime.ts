@@ -200,6 +200,24 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
           }
           return bot.actions.useBlock(input);
         },
+        useHeldItem: async () => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.useHeldItem();
+        },
+        chestDeposit: async (input) => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.chestDeposit(input);
+        },
+        chestWithdraw: async (input) => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.chestWithdraw(input);
+        },
         attackEntity: async (input) => {
           if (!bot || !bot.status.connected) {
             throw new Error("Bot is not connected.");
