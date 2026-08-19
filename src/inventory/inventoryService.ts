@@ -122,7 +122,12 @@ export function createInventoryService(bot: Bot): InventoryService {
         if (item && item.name && typeof item.name === "string" && item.name.toLowerCase() === normalized) {
           try {
             // Use bot.equip() which handles hotbar/main inventory correctly
+            console.log("[EQUIP] Before equip - heldItem:", bot.heldItem?.name, "quickBarSlot:", bot.quickBarSlot);
             await bot.equip(item, "hand");
+            // Wait a bit for the inventory update to propagate
+            await new Promise(r => setTimeout(r, 100));
+            console.log("[EQUIP] After equip - heldItem:", bot.heldItem?.name, "quickBarSlot:", bot.quickBarSlot);
+            console.log("[EQUIP] Hotbar slots:", bot.inventory.slots.slice(36, 45).map((s, i) => s?.name || "empty").join(", "));
             return {
               ok: true,
               slot: bot.heldItem?.slot ?? i,

@@ -18,7 +18,7 @@ import type { CommandHooks, CommandCompletion } from "../commands/commandQueue.j
 export interface ActionLoggerOptions {
   enabled: boolean;
   directory: string;
-  snapshotState: () => unknown | null;
+  snapshotState: () => Promise<unknown | null>;
   captureScreenshot: () => Promise<Buffer | null>;
   log?: (level: "info" | "warn", message: string) => void;
 }
@@ -45,7 +45,7 @@ export function createActionLogger(options: ActionLoggerOptions): CommandHooks {
       command,
       input,
       capturedAt: new Date().toISOString(),
-      state: safeSnapshot(options.snapshotState)
+      state: await safeSnapshot(options.snapshotState)
     };
     await writeFile(statePath, JSON.stringify(state, null, 2));
 
@@ -100,9 +100,9 @@ export function createActionLogger(options: ActionLoggerOptions): CommandHooks {
   };
 }
 
-function safeSnapshot(snapshot: () => unknown | null): unknown {
+async function safeSnapshot(snapshot: () => Promise<unknown | null>): Promise<unknown> {
   try {
-    return snapshot();
+    return await snapshot();
   } catch (error) {
     return { error: `State snapshot failed: ${message(error)}` };
   }

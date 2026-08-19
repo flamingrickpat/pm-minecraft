@@ -58,7 +58,7 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
   const actionLogger = createActionLogger({
     enabled: config.actionLog.enabled,
     directory: config.actionLog.directory,
-    snapshotState: () => {
+    snapshotState: async () => {
       if (!bot || !bot.status.spawned) {
         return null;
       }
@@ -108,7 +108,7 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
     config: config.web,
     health: () => healthInput(startedAt, config, bot, paper, viewer, server.status),
     state: () => bot ? bot.getState() : disconnectedState(config.minecraft.username),
-    observation: () => bot && bot.status.spawned
+    observation: async () => bot && bot.status.spawned
       ? buildLLMState(bot.bot, { nearbyBlockRadius: config.actionLog.nearbyBlockRadius, messages: bot.getMessages() })
       : null,
     chat: {

@@ -75,7 +75,7 @@ export interface RuntimeHttpServerOptions {
   config: RuntimeConfig["web"];
   health: () => HealthInput;
   state: () => BotStateSnapshot;
-  observation?: () => unknown | null;
+  observation?: () => Promise<unknown | null>;
   chat?: { send(text: string): Promise<void> };
   commands?: {
     queue: CommandQueue;
@@ -201,7 +201,7 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     return;
   }
   if (request.method === "GET" && request.url === "/api/observation") {
-    const observation = options.observation?.() ?? null;
+    const observation = await options.observation?.() ?? null;
     if (observation === null) {
       writeJson(response, 503, {
         ok: false,

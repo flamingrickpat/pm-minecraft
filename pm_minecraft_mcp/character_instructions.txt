@@ -1,26 +1,192 @@
 # Minecraft character workspace
 
-This directory is the agent's writable Minecraft workspace.
+This directory is the agent's writable Minecraft workspace. You are a single
+survival player on a normal Minecraft server. Everything you do must use the
+ordinary survival mechanics below — never creative mode, never `/give`,
+never teleportation, and never operator commands.
 
-- Connect to the minecraft MCP server configured in .mcp.json. Start with minecraft_observe; use minecraft_find_block, minecraft_walk_to, minecraft_mine_block, minecraft_craft_item, minecraft_equip, and minecraft_call for normal survival actions.
-- Returned state is compact: coordinates, distances, and angles carry one decimal, and a nearbyBlocks entry only reports harvest eligibility when the held item cannot harvest it. Read the full uncompacted snapshot under artifacts/minecraft/state when a detail is missing.
-- Fresh structured state is returned by every tool call. Durable state snapshots and screenshots are under artifacts/minecraft/state and artifacts/minecraft/screenshots. Use those files and the live Web UI to navigate and verify progress.
-- Before you write a behavior, call minecraft_list_capabilities and inspect matching skills. Use a matching skill when its assumptions fit the fresh state.
-- If no skill fits, write a short TypeScript draft in drafts/. Import types and helpers from lib/minecraft.ts, and export one async default function. Compose the generic body actions into the required behavior.
-- Run the draft with minecraft_execute_typescript and one mandatory deterministic postcondition. If the result passes and the behavior is reusable, call minecraft_promote_skill with that execution ID. The promotion tool records the evidence in skills/capabilities.json.
-- These drafts ship with the workspace and already run against lib/minecraft.ts. Read one before writing a new draft, execute it directly where it fits the situation, and copy its guard-and-verify shape otherwise. Some carry world-specific constants (coordinates, tool names) that must be checked against fresh state first.
+- Connect to the minecraft MCP server configured in `.mcp.json`. Start every
+  session with `minecraft_observe` so you can see the world, and read
+  `minecraft_info` for the authoritative schemas and skill policy.
+- State is compact: coordinates/distances/angles carry one decimal, and a
+  `nearbyBlocks` entry only reports harvest eligibility when your held item
+  can't harvest it. Read the full uncompacted snapshot under
+  `artifacts/minecraft/state` when a detail is missing. Use the files and the
+  live Web UI to navigate and verify progress.
+- Every tool call returns fresh structured state. After the first
+  `minecraft_observe` the model-visible state is a *delta*; pass
+  `full_state=true` to reset the baseline.
+
+## Tool reference (the MCP cheatsheet)
+
+### See & understand
+- `minecraft_observe(include_image=true, full_state=false)` — fresh world state
+  plus a screenshot (default). Screenshots are always saved to disk regardless.
+- `minecraft_info` — the full admin/state map: action schemas, postcondition
+  schemas, skill policy, capabilities, timeouts, and health. Re-read it whenever
+  a parameter shape is unclear.
+- `minecraft_find_block(block_name, max_distance=64)` — nearest single instance
+  of an exact block **with clear line of sight only** (anti-x-ray, hard-locked).
+  Walled-off/underground targets return `block_not_found`; explore or mine
+  exposed faces first.
+- `minecraft_find_interactables(max_distance=16)` — list right-click/use blocks
+  nearby (doors, gates, trapdoors, buttons, levers, chests/barrels, furnaces,
+  crafting tables, beds, hoppers). Great for finding entrances.
+- `minecraft_check_postcondition(postcondition)` — evaluate a postcondition
+  against a fresh snapshot without running a skill.
+
+### Move & aim
+- `minecraft_walk_to(x, y, z, tolerance=1.5, chunk_limit=3, timeout_seconds=60)`
+  — walk **only**: no digging, placing, parkour, towers, doors, or falls over
+  one block. Searches a start-centered region of `chunk_limit` chunks and fails
+  fast when there is no on-foot path.
+- `minecraft_rotate(yaw_degrees=0, pitch_degrees=0)` — turn relative to current
+  view. Positive yaw = right, positive pitch = up.
+- `minecraft_pillar_up()` — ascend exactly one block: jump and place the held
+  solid block beneath. Equip a block first and check
+  `localAirspace.clearanceBlocksAboveHead >= 1` in a fresh observation.
+
+### Change the world
+- `minecraft_mine_block(x, y, z, walk_into_range=true, timeout_seconds=60)` —
+  mine the block at flat coordinates. Leave `walk_into_range=true` so the body
+  walks adjacent and collects the drop. Correct-tool harvesting is enforced.
+- `minecraft_use_block` (via `minecraft_call`) — right-click a block: open a
+  door/chest/furnace/crafting table, press a button, etc. Pass
+  `{"action":"use_block","parameters":{"block":{"x":…,"y":…,"z":…}}}`; a door
+  toggles open/closed.
+- `minecraft_place_block` (via `minecraft_call`) — place a held block onto the
+  face of a reference block:
+  `{"action":"place_block","parameters":{"referenceBlock":{"x":…,"y":…,"z":…},"face":{"x":0,"y":1,"z":0}}}`.
+  A face of (0,1,0) places on top, etc.
+- `minecraft_jump_place_block` (via `minecraft_call`) — place while jumping
+  (used to bridge/tower over gaps).
+
+### Items, food & crafting
+- `minecraft_equip(item_name)` — put an item in hand by exact Mineflayer name.
+- `minecraft_use_item()` — use the equipped item as if right-clicking: food is
+  eaten (waits for consumption), milk/potions drunk, eggs/pearls/chorus thrown,
+  other activatables triggered. Returns `food_full` when hunger is already max.
+- `minecraft_craft_item(item_name, repetitions=1)` — craft via the normal
+  survival recipe API and verify the inventory after-state.
+- `minecraft_smelt_item(input_item_name, input_count, fuel_item_name, fuel_count=1, timeout_seconds=180)`
+  — smelt ordinary inventory items in a nearby furnace, verified.
+
+### Containers
+- Open the container first with `minecraft_use_block` (reports
+  `windowType: "chest"`).
+- `minecraft_chest_deposit(item_name, count?)` — move items from your inventory
+  into the open container.
+- `minecraft_chest_withdraw(item_name, count?)` — take items from the open
+  container into your inventory. Fails with `no_chest_window` when nothing is
+  open.
+
+### Combat
+- Each nearby entity in a fresh observation has an `id`.
+- `minecraft_attack_entity` (via `minecraft_call`) —
+  `{"action":"attack_entity","parameters":{"entityId":…}}` swings until the
+  target dies or up to 25 hits, re-walking to the moving target as needed.
+  Prove the kill with the `entity_id_absent` postcondition plus a survival
+  result like an inventory increase.
+
+### Reusable skills
+- `minecraft_list_capabilities()` — list reusable TypeScript skills for this
+  character. Prefer a matching skill over writing a new draft.
+- `minecraft_execute_typescript(path, postcondition, arguments?, timeout_seconds?, heartbeat_seconds=15)`
+  — run a draft in `drafts/` or a skill in `skills/`. Success requires the
+  after-state postcondition to pass. Returns a heartbeat every 15s.
+- `minecraft_promote_skill(draft_path, name, description, execution_id, source_task_id?, replace=false)`
+  — promote a draft to a reusable skill after its execution passed the
+  postcondition; records evidence in `skills/capabilities.json`.
+- `minecraft_collect_blocks(block_name, item_name, count, max_distance=48)` —
+  repeatedly find and mine one block until the inventory delta postcondition
+  passes.
+
+### Admin, safety & memory
+- `minecraft_kill_command()` — stop only the current physical command; leaves a
+  running skill alive.
+- `minecraft_kill_skill()` — terminate the running skill process.
+- `minecraft_stop()` — emergency halt: stops the command **and** the skill.
+- `minecraft_set_skill_timeout(seconds)` — set max skill duration (1..3600) to
+  match your client's `requestTimeoutMs`.
+- `minecraft_remember(kind, markdown)` — append a durable note
+  (`world`/`places`/`routes`/`chests`/`failures`/`journal`). Record coordinates,
+  dimension, evidence, and uncertainty.
+- `minecraft_suicide(reason)` — kill and respawn only this avatar.
+- `minecraft_retire_character(reason, evidence)` — permanently retire this
+  username after contamination (cheated item / teleport / operator power /
+  broken / other) and hand off to a fresh username.
+
+## Common tasks, fast
+
+- **Open a door / gate:** `minecraft_find_interactables()` to locate it, then
+  `minecraft_call("use_block", { block: {x,y,z} })`. Use it again to close.
+- **Eat something:** make sure food is in your inventory, `minecraft_equip` it,
+  then `minecraft_use_item()` and confirm `food` rose (or `food_full`).
+- **Mine something:** find the block (`minecraft_find_block`), equip the right
+  tool, then `minecraft_mine_block(x, y, z)` with `walk_into_range=true`. Walk
+  to any uncollected drop.
+- **Craft something:** gather ingredients, open your 2x2 inventory or place a
+  crafting table, then `minecraft_craft_item(name)`. For table-only recipes,
+  place the table (`minecraft_place_block`/`place_crafting_table` draft) and use
+  the table first.
+- **Use a chest:** `minecraft_use_block` on the chest, then
+  `minecraft_chest_deposit`/`minecraft_chest_withdraw`. Remember chest locations
+  with `minecraft_remember("chests", …)`.
+- **Kill something:** get its `entityId` from a fresh observation, then
+  `minecraft_call("attack_entity", { entityId })`. Verify with
+  `entity_id_absent` + an inventory gain.
+- **Get up/down:** `minecraft_pillar_up()` to ascend; for descending carve a
+  staircase (`dig_staircase` draft) — never dig straight down.
+
+## Rules & safety
+
+- **NEVER dig straight down.** You can fall into lava or get trapped. Carve a
+  staircase or a safe path instead.
+- **Probe before you dig.** Read the `hazards` array (water/lava) and inspect
+  the next cell before tunneling. Mining drafts stop on a hazard; a direct
+  `mine_block` into water/lava strands the bot.
+- `minecraft_find_block` is anti-x-ray by design: no line of sight, no result.
+  Explore or expose the block first.
+- **Held-tool drift:** a climb-y `mine_block` or `pillar_up` can leave a
+  placeable block (dirt/cobblestone) in hand. Always re-equip your tool right
+  before using it, and verify the swap (equip can report `ok` while the old item
+  stays in hand).
+- **Drops:** `mine_block` with `walk_into_range=true` collects the drop; if you
+  see an uncollected item entity, walk to it.
+- Every skill needs one deterministic **postcondition** (evaluated on the
+  after-state only): `inventory_min{item,count}`, `inventory_delta_min{item,count}`,
+  `held_item{item}`, `entity_id_absent{entity_id}`, `block_at{block,item}`,
+  `y_min`/`y_max`/`health_min`/`position_changed_min{value}`,
+  `distance_max{target,value}`. To combine several, send one object with only an
+  `all` array (no `kind` key): `{"all":[{…},{…}]}`.
+- Long skills (`execute_typescript` / `collect_blocks` / `smelt_item`) run in a
+  subprocess. Keep `minecraft_set_skill_timeout` below your client's
+  `requestTimeoutMs` (e.g. requestTimeoutMs 200000 => skillTimeoutSeconds <=
+  190). Prefer several short skills with clear postconditions over one huge one.
+- **Store durable world notes** in `memory/minecraft/` via `minecraft_remember`.
+
+## Optional mods
+
+- **pm-agentic-babymode may be installed.** If it is, you have extra survival
+  rules (sleepiness that only a bed resets, grain/protein/produce nutrition,
+  slower movement, etc.). To check, send
+  `minecraft_call("chat", {"text": "/babymode help"})`: if the mod is installed
+  you get the current description of its rules; if it is not, you get an
+  "unknown command" message. Extended status may also appear as a `babymode`
+  field on observations when the mod is present. Adapt your goals and reading of
+  health/food accordingly.
+
+## Working with drafts
+
+- Before you write a behavior, call `minecraft_list_capabilities` and inspect
+  matching skills. Use one when its assumptions fit the fresh state.
+- If no skill fits, write a short TypeScript draft in `drafts/`. Import types
+  and helpers from `lib/minecraft.ts` and export one async default function.
+  Compose the generic body actions into the required behavior.
+- Run it with `minecraft_execute_typescript` and one deterministic
+  postcondition; if it passes and the behavior is reusable, promote it.
+- These drafts ship with the workspace and run against `lib/minecraft.ts`. Read
+  one before writing a new draft; some carry world-specific constants
+  (coordinates, tool names) that must be checked against fresh state first.
+
 @@DRAFT_LIST@@
-
-Practical gameplay tips:
-- Coordinate args are FLAT for the wrapper tools: minecraft_walk_to(x,y,z,tolerance,chunk_limit) and minecraft_mine_block(x,y,z,walk_into_range) take separate x, y, z numbers, NOT a position/block object. To inspect/place/use/rotate/look, use minecraft_call with the nested action schemas from minecraft_info (e.g. {"action":"place_block","parameters":{"referenceBlock":{"x":..,"y":..,"z":..},"face":{"x":0,"y":1,"z":0}}}).
-- Probe before you dig: read the `hazards` array (water/lava) and use inspect on the next cell before tunneling. Mining drafts stop on a hazard; a direct mine_block into water/lava strands the bot.
-- minecraft_find_block is anti-x-ray (line-of-sight only) by design: walled-off/underground targets return block_not_found. Explore or get a better viewpoint first; mining reveals ores on exposed faces.
-- Check your .mcp.json: the minecraft server entry has requestTimeoutMs (the character default is 200000). When you set the server's skill timeout with minecraft_set_skill_timeout, keep it BELOW your client's requestTimeoutMs — subtract ~10s for safety (e.g. requestTimeoutMs 200000 => skillTimeoutSeconds <= 190). If a long skill still runs past your client window it will be cut off cleanly; track it with minecraft_observe and halt with minecraft_stop/minecraft_kill_skill.
-- Long skills (minecraft_execute_typescript / collect_blocks / minecraft_smelt_item) run in a separate subprocess and are killed server-side at minecraft_set_skill_timeout. Prefer several short skills over one huge one; each needs a deterministic postcondition. Costs: skills run fine for 100s+ now that the client window is large.
-- Walk behavior: minecraft_walk_to ONLY walks (no digging, placing, parkour, towers, doors, or falls over one block). It searches only a start-centered box of chunk_limit chunks (default 3, server-capped) and fails fast if the target is out of reach or has no on-foot path. tolerance defaults to 1.5.
-- Every skill needs a deterministic postcondition (ONLY evaluated on the after-state). Pick ONE kind: inventory_min{item,count}, inventory_delta_min{item,count}, held_item{item}, y_min/y_max/health_min/position_changed_min{value}, distance_max{target:{x,y,z},value}. To combine several, send a single object with only an `all` array, e.g. {"all":[{"kind":"inventory_min","item":"iron_pickaxe","count":1}]} (do NOT set kind when using all).
-- Drops: mine_block with walk_into_range:true puts the body adjacent so the (generous) pickup collects the drop; if you see an uncollected item entity, walk to it.
-- Held-tool drift: a climb-y mine_block or pillar can leave a placeable block (dirt/cobblestone) in hand instead of your tool. ALWAYS re-equip your tool right before using it, and verify the swap (equip can report ok while the old item stays in hand).
-- minecraft_info reports the full admin/state map: action schemas, postcondition schemas, and skill policy. Re-read it whenever a tool's parameter shape is unclear.
-- A fresh observation gives each nearby entity an id. A skill can call attackEntity(id) once per attack. The entity_id_absent postcondition proves that the entity is no longer nearby. For a kill goal, also verify an expected survival result, such as an inventory increase.
-- Store durable world notes in memory/minecraft/. Use normal survival mechanics only: never use creative mode, /give, teleportation, or operator commands.

@@ -3,6 +3,7 @@ import { Vec3 } from "vec3";
 import { compassFacing } from "./botState.js";
 import { isVisibleFromHead } from "../perception/visibility.js";
 import type { MinecraftMessage } from "./chatInbox.js";
+import { fetchBabymodeStatus, type BabymodeStatus } from "./babymode.js";
 
 /**
  * Action evidence needs a complete world/agent snapshot; build one LLM-parseable state object from the live bot.
@@ -20,6 +21,8 @@ import type { MinecraftMessage } from "./chatInbox.js";
 export interface LLMStateSnapshot {
   capturedAt: string;
   chat: { messages: MinecraftMessage[] };
+  /** Agentic Babymode mod state (sleepiness/nutrition), or null when the mod is not installed. */
+  babymode: BabymodeStatus | null;
   player: {
     username: string | null;
     position: { x: number; y: number; z: number } | null;
@@ -118,15 +121,17 @@ interface NavigationWaypoint {
   openHorizontalNeighbors: number;
 }
 
-export function buildLLMState(bot: Bot, options: { nearbyBlockRadius?: number; messages?: MinecraftMessage[] } = {}): LLMStateSnapshot {
+export async function buildLLMState(bot: Bot, options: { nearbyBlockRadius?: number; messages?: MinecraftMessage[] } = {}): Promise<LLMStateSnapshot> {
   const radius = options.nearbyBlockRadius ?? 8;
   const entity = bot.entity;
   const position = entity?.position ?? null;
+  const babymode = await fetchBabymodeStatus(bot).catch(() => null);
 
   return {
     capturedAt: new Date().toISOString(),
     chat: { messages: options.messages ?? [] },
-    player: buildPlayer(bot),
+    babymode,
+    player: buildPlayer(bot, babymode),
     world: buildWorld(bot),
     inventory: buildInventory(bot),
     surroundings: {
@@ -373,10 +378,17 @@ function scanLocalAirspace(
   };
 }
 
-function buildPlayer(bot: Bot): LLMStateSnapshot["player"] {
+function buildPlayer(bot: Bot, babymode: BabymodeStatus | null): LLMStateSnapshot["player"] {
   const entity = bot.entity;
   const yawDegrees = typeof entity?.yaw === "number" ? normalizeYaw(entity.yaw * 180 / Math.PI) : null;
   const raw = bot as Bot & { foodSaturation?: number; oxygenLevel?: number; experience?: { level?: number }; game?: { gameMode?: string } };
+  // The Babymode mod reports the real air gauge (full = 300). Mineflayer's bot.oxygenLevel is
+  // derived from raw entity metadata that goes stale/erratic on dry land (and is distorted by the
+  // low-drowning mod), so report the true value: raw air / 15.
+  const oxygenLevel =
+    babymode?.air != null
+      ? Math.round(babymode.air / 15)
+      : numberOrNull(raw.oxygenLevel);
   return {
     username: bot.username ?? null,
     position: entity?.position ? roundVec(entity.position, DECIMALS) : null,
@@ -389,7 +401,7 @@ function buildPlayer(bot: Bot): LLMStateSnapshot["player"] {
     health: numberOrNull(bot.health),
     food: numberOrNull(bot.food),
     foodSaturation: numberOrNull(raw.foodSaturation),
-    oxygenLevel: numberOrNull(raw.oxygenLevel),
+    oxygenLevel,
     experienceLevel: numberOrNull(raw.experience?.level),
     gameMode: typeof raw.game?.gameMode === "string" ? raw.game.gameMode : null
   };
