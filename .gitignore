@@ -14,3 +14,4 @@ logs/
 # Build artifacts copied into the package by hatch_build.py
 pm_minecraft_mcp/node/
 pm_minecraft_mcp/drafts/
+/.mcp.json

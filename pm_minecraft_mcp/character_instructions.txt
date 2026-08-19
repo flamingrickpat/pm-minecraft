@@ -11,11 +11,15 @@ never teleportation, and never operator commands.
 - State is compact: coordinates/distances/angles carry one decimal, and a
   `nearbyBlocks` entry only reports harvest eligibility when your held item
   can't harvest it. Read the full uncompacted snapshot under
-  `artifacts/minecraft/state` when a detail is missing. Use the files and the
+  `artifacts/minecraft/states` when a detail is missing. Use the files and the
   live Web UI to navigate and verify progress.
-- Every tool call returns fresh structured state. After the first
-  `minecraft_observe` the model-visible state is a *delta*; pass
-  `full_state=true` to reset the baseline.
+- Every tool call is logged as one `artifacts/minecraft/actions/<timestamp>_<tool>.yaml`.
+  Raw world states live under `artifacts/minecraft/states/` (each state stores
+  only the chat messages first seen in it, so every chat message exists exactly
+  once, and links to its screenshot in `artifacts/minecraft/screenshots/`).
+  `artifacts/minecraft/current_state.yaml` is just a pointer to the most recent
+  state file. Tool results return links to these files rather than inlining the
+  whole state, so follow the links to inspect what actually changed.
 
 ## Tool reference (the MCP cheatsheet)
 

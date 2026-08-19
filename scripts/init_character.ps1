@@ -30,7 +30,7 @@ if (Test-Path -LiteralPath $root) {
     $existing = Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop
     if ($existing.Count -gt 0) { throw "AgentRoot must be empty or not exist: $root" }
 }
-foreach ($relative in @("drafts", "skills", "lib", "memory\minecraft", "artifacts\minecraft\actions", "artifacts\minecraft\executions", "artifacts\minecraft\screenshots", "artifacts\minecraft\state")) {
+foreach ($relative in @("drafts", "skills", "lib", "memory\minecraft", "artifacts\minecraft\actions", "artifacts\minecraft\screenshots", "artifacts\minecraft\states")) {
     New-Item -ItemType Directory -Path (Join-Path $root $relative) -Force | Out-Null
 }
 New-Item -ItemType Directory -Path $artifacts -Force | Out-Null

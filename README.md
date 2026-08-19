@@ -109,28 +109,42 @@ different observation when it cannot see the target. For long-range planning,
 set `require_visible: false`; the result is a loaded-world location only and
 must still be reached and visibly verified before mining.
 
-## Model-visible state
+## On-disk logging
 
-Every tool result carries a compact view of the after-state, and the full
-snapshot is written to `artifacts/minecraft/state` instead of into the context
-window. The compaction rules:
+Everything is written under the character's artifact root
+(`artifacts/minecraft/`):
 
-- Coordinates, distances, and angles carry one decimal.
-- A `nearbyBlocks` entry reports `canHarvestWithHeldItem` and
-  `needsHarvestTool` only when the held item cannot harvest it;
-  `needsHarvestTool` is the cheapest tool that works.
-- `localAirspace.openBlocksByDirection` gives open blocks per compass
-  direction, and `boundaryDetail` lists only the boundaries that are not an
-  ordinary wall (a missing direction means solid feet and head).
-- `localAirspace.navigation` waypoints are `{x,y,z,clearance,openNeighbors}`
-  cells that can be passed straight to `walk_to`.
+- `states/` — one raw full state file per snapshot
+  (`<timestamp>-mcstate-<id>.yaml`). Each state stores only the chat messages
+  first seen in that state, so **every chat message exists exactly once** in
+  the whole tree; reconstruct the transcript by walking the files in order.
+  Each state links to its screenshot; it never contains image bytes or
+  duplicated screenshot metadata. `current_state.yaml` is a pointer file that
+  only contains the relative path of the most recent state.
+- `screenshots/` — the only place pictures live (`.png` plus a small metadata
+  sidecar per frame). States and actions only *link* to these.
+- `actions/` — one flat yaml per MCP tool call, named
+  `<timestamp>_<tool>.yaml`, written on the fly (a starter file with the tool
+  and input appears the moment the call starts, before/after state + screenshot
+  links are appended as snapshots happen, and the raw pretty-printed tool
+  output, duration and any exception land in the final rewrite). Fields:
+  `tool`, `tool_input`, `tool_output` (both pretty JSON block scalars), the
+  four links `before_state_path` / `before_screenshot_path` /
+  `after_state_path` / `after_screenshot_path` (empty when the tool made no
+  state, before-only for tools like `minecraft_observe` that make one), plus
+  lookup headers such as `execution_id` / `skill_path` for skills. Success or
+  failure is read straight from the return data in `tool_output`; exceptions
+  land in an `error:` block.
+- `mcp-server.log` — every caught body/network error and every unhandled
+  exception (with traceback) lands here.
 
-After the first call the results are deltas against the previous compact state;
-`minecraft_observe(full_state=true)` resets that baseline.
+Tool results return the same links (`beforeStatePath` / `afterStatePath` /
+`beforeScreenshotPath` / `afterScreenshotPath`) instead of inlining the whole
+state, so the model follows the files when it needs details.
 
-A screenshot is captured and written to
-`artifacts/minecraft/screenshots` for **every** state - before and after every
-action, on every `minecraft_observe` call - regardless of `include_image`, as
+Screenshots are captured and written to `artifacts/minecraft/screenshots` for
+**every** state - before and after every action, on every `minecraft_observe`
+call - regardless of `include_image`, as
 long as the server is started with image capture enabled (default; disable
 with `--no-images`). This gives a complete, seamless on-disk visual history of
 the run for later analysis, even for states the agent itself never looked at.
