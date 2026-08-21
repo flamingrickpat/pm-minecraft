@@ -289,6 +289,10 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     await inspectBlock(request, response, options);
     return;
   }
+  if (request.method === "POST" && request.url === "/api/command/raycast") {
+    await raycastCommand(request, response, options);
+    return;
+  }
   if (request.method === "POST" && request.url === "/api/frame/capture") {
     await captureFrame(response, options);
     return;
@@ -666,6 +670,28 @@ async function inspectBlock(request: IncomingMessage, response: ServerResponse, 
   // Record evidence for read-only inspect (bypasses command queue)
   await recordReadonlyCommand(options, "inspect", input.value, result);
   writeJson(response, result.ok ? 200 : 404, result);
+}
+
+async function raycastCommand(request: IncomingMessage, response: ServerResponse, options: RuntimeHttpServerOptions): Promise<void> {
+  if (!options.commands) {
+    writeJson(response, 503, {
+      ok: false,
+      error: "commands_unavailable",
+      message: "Commands are unavailable because the bot runtime is not ready."
+    });
+    return;
+  }
+  const parsed = await readJson(request);
+  if (!parsed.ok) {
+    writeJson(response, 400, { ok: false, error: "invalid_json", message: parsed.message });
+    return;
+  }
+  const maxDistance = typeof parsed.body.maxDistance === "number" && Number.isFinite(parsed.body.maxDistance)
+    ? parsed.body.maxDistance
+    : 64;
+  const result = await options.commands.actions.raycast(maxDistance);
+  await recordReadonlyCommand(options, "raycast", { maxDistance }, result);
+  writeJson(response, result.ok ? 200 : 400, result);
 }
 
 async function findBlock(request: IncomingMessage, response: ServerResponse, options: RuntimeHttpServerOptions): Promise<void> {

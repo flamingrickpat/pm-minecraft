@@ -72,6 +72,8 @@ export interface PhysicalCommandActions {
   chestWithdraw(input: ChestInput): Promise<CommandResult>;
   attackEntity(input: AttackEntityInput): Promise<CommandResult>;
   inspectBlock(block: Vector3): Promise<CommandResult>;
+  /** Raycast from the player's head along the current look direction and return what is being looked at. */
+  raycast(maxDistance?: number): Promise<CommandResult>;
 }
 
 type ActionBot = Bot & {
@@ -204,32 +206,64 @@ export function createPhysicalCommandActions(
           data: { status: "too_far", position: vector(startPosition), target, chunkLimit: limit }
         };
       }
-      // Fail instantly if there is no place to stand near the target.
-      const standable = findStandableCell(bot, target);
-      if (!standable) {
+      // Find safe standable cells in a sphere (radius 5) around the target,
+      // sorted nearest-first, with headroom and liquid-safety filtering. When
+      // the precise target has no reachable floor (grounded imprecision, an
+      // air/deep ravine goal, or a target inside a wall), we route to the best
+      // reachable nearby cell instead of failing outright.
+      const candidates = findStandableCells(bot, target);
+      if (candidates.length === 0) {
         return {
           ok: false,
           reason: "target_not_standable",
-          message: "The target has no standable block nearby to walk to.",
+          message: "No safe standable block was found near the target; nothing to walk to.",
           data: { status: "not_standable", position: vector(startPosition), target }
         };
       }
-      try {
-        const navigation = await gotoNear(bot, target, tolerance, region, signal);
-        return { ok: true, message: "Reached target.", data: { status: "reached", position: vector(bot.entity.position), target, navigation } };
-      } catch (error) {
-        return {
-          ok: false,
-          reason: navigationReason(error),
-          message: error instanceof Error ? error.message : String(error),
-          data: {
-            status: "failed",
-            position: vector(bot.entity.position),
-            target,
-            navigation: error instanceof NavigationFailure ? error.report : undefined
-          }
-        };
+      // Try pathfinding to each candidate in proximity order and use the first
+      // one that is actually reachable on foot.
+      const attempts: Array<{ standable: Vector3; reason: string; message: string }> = [];
+      for (const cell of candidates) {
+        try {
+          const navigation = await gotoNear(bot, cell, Math.min(tolerance, 1.5), region, signal);
+          const snapped = Math.floor(cell.x) !== Math.floor(target.x)
+            || Math.floor(cell.y) !== Math.floor(target.y)
+            || Math.floor(cell.z) !== Math.floor(target.z);
+          return {
+            ok: true,
+            message: snapped
+              ? `Reached target via routed standable cell ${fmtVec(cell)} (requested ${fmtVec(target)}).`
+              : "Reached target.",
+            data: {
+              status: "reached",
+              position: vector(bot.entity.position),
+              target,
+              standable: vector(cell),
+              rerouted: snapped,
+              navigation
+            }
+          };
+        } catch (error) {
+          attempts.push({
+            standable: vector(cell),
+            reason: navigationReason(error),
+            message: error instanceof Error ? error.message : String(error)
+          });
+        }
       }
+      return {
+        ok: false,
+        reason: "no_paths_findable",
+        message: `None of the ${candidates.length} safe standable cell(s) near the target are reachable on foot (e.g. across a ravine or wall). Use staircase/pillar or pick a different approach.`,
+        data: {
+          status: "failed",
+          position: vector(bot.entity.position),
+          target,
+          candidateCount: candidates.length,
+          candidates: attempts.map((a) => a.standable),
+          attempts
+        }
+      };
     },
     findBlock: async ({ blockName, maxDistance }) => {
       const registry = (bot as Bot & { registry?: { blocksByName?: Record<string, { id: number }> } }).registry;
@@ -808,6 +842,47 @@ export function createPhysicalCommandActions(
           canHarvestWithHeldItem
         }
       };
+    },
+    raycast: async (maxDistance = 64) => {
+      // Read the current orientation in this module's degree convention. The
+      // tracked degrees mirror lookAt/look so this matches where the crosshair
+      // actually points.
+      syncTrackedFromEntity();
+      const yawRad = degToRad(_trackedYaw);
+      const pitchRad = degToRad(_trackedPitch);
+      const dir = new Vec3(
+        -Math.sin(yawRad) * Math.cos(pitchRad),
+        Math.sin(pitchRad),
+        -Math.cos(yawRad) * Math.cos(pitchRad)
+      ).normalize();
+      const eyeHeight = (bot.entity as typeof bot.entity & { eyeHeight?: number }).eyeHeight ?? 1.62;
+      const start = bot.entity.position.offset(0, eyeHeight, 0);
+      const range = Math.min(Math.max(1, maxDistance), 200);
+      const match = (block: unknown): boolean =>
+        !!block && (block as { boundingBox?: string }).boundingBox === "block" &&
+        (block as { name?: string }).name !== "air" &&
+        (block as { name?: string }).name !== "cave_air";
+      const world = (bot as Bot & { world?: { raycast?(origin: Vec3, dir: Vec3, range: number, matcher?: (b: unknown) => boolean): unknown } }).world;
+      const hit = world?.raycast?.(start, dir, range, match);
+      if (!hit) {
+        return {
+          ok: true,
+          message: `Raycast hit nothing solid within ${range} blocks.`,
+          data: { hit: null, yaw: _trackedYaw, pitch: _trackedPitch, maxDistance: range }
+        };
+      }
+      const name = (hit as { name?: string }).name ?? "?";
+      const pos = (hit as { position?: Vec3 }).position;
+      return {
+        ok: true,
+        message: `Looking at ${name} at ${pos ? `${pos.x},${pos.y},${pos.z}` : "?"}.`,
+        data: {
+          hit: { blockName: name, position: pos ? { x: pos.x, y: pos.y, z: pos.z } : null, type: (hit as { type?: number }).type ?? null },
+          yaw: _trackedYaw,
+          pitch: _trackedPitch,
+          maxDistance: range
+        }
+      };
     }
   };
   return actions;
@@ -913,30 +988,87 @@ function distXZ(a: { x: number; z: number }, b: { x: number; z: number }): numbe
 }
 
 /**
- * Find a cell the bot could stand in near the target, or null.
- * Walk_to refuses targets with no standable floor at all.
+ * Find safe standable cells in a sphere (radius 5) around the target and,
+ * for air/high targets, directly beneath it via raytrace-down. Returns cells
+ * sorted by distance from the bot's current position (nearest first), each
+ * with clear headroom (2 air above feet) and no standing in / under liquids.
+ *
+ * A sphere (not a circle) is deliberate: over long distances the precise
+ * target can be a block inside the ground due to imprecision or a floating
+ * coordinate, so we also scan above the target for a valid floor.
  */
-function findStandableCell(bot: Bot, target: Vector3): Vec3 | null {
+function findStandableCells(bot: Bot, target: Vector3, radius = 5): Vec3[] {
+  const results: Vec3[] = [];
+  const seen = new Set<string>();
   const x0 = Math.floor(target.x);
+  const y0 = Math.floor(target.y);
   const z0 = Math.floor(target.z);
-  const baseY = Math.floor(target.y);
-  for (const y of [baseY, baseY + 1, baseY - 1]) {
-    for (let dx = -2; dx <= 2; dx++) {
-      for (let dz = -2; dz <= 2; dz++) {
-        const cell = new Vec3(x0 + dx, y, z0 + dz);
-        if (isStandable(bot, cell)) return cell;
+  const push = (cell: Vec3): void => {
+    const key = `${cell.x},${cell.y},${cell.z}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    results.push(cell);
+  };
+
+  // Sphere scan (inclusive radius, roughly cubic shell for integer cells).
+  const r2 = radius * radius;
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      for (let dz = -radius; dz <= radius; dz++) {
+        if (dx * dx + dy * dy + dz * dz > r2) continue;
+        const cell = new Vec3(x0 + dx, y0 + dy, z0 + dz);
+        if (isSafeStandable(bot, cell)) push(cell);
       }
     }
+  }
+
+  // Raytrace straight down from the target to first solid floor (air/deep
+  // overhang targets that the sphere's ±5 radius may not reach, and grounded
+  // targets whose precise Y is buried).
+  const raytraced = raytraceDownStandable(bot, target);
+  if (raytraced) push(raytraced);
+
+  // Nearest-first so the first pathfinding success is also the closest.
+  const pos = bot.entity.position;
+  results.sort((a, b) => a.distanceTo(pos) - b.distanceTo(pos));
+  return results;
+}
+
+/** True when a cell is a safe place to stand: floor below, clear headroom
+ * (2 air above feet for a 2-tall player), and not standing in or over a
+ * liquid (lava/water) that would be unsafe to walk into. */
+function isSafeStandable(bot: Bot, cell: Vec3): boolean {
+  const at = bot.blockAt(cell);
+  const below = bot.blockAt(cell.offset(0, -1, 0));
+  const head = bot.blockAt(cell.offset(0, 1, 0));
+  const head2 = bot.blockAt(cell.offset(0, 2, 0));
+  if (!at || !below || !head || !head2) return false;
+  // Feet space (and body/head rows) must not be solid; the floor must be solid.
+  if (at.boundingBox === "block") return false;
+  if (below.boundingBox !== "block") return false;
+  if (head.boundingBox === "block" || head2.boundingBox === "block") return false;
+  // Refuse standing in or over liquids.
+  const liquid = (n: string | undefined): boolean =>
+    !!n && (n.includes("lava") || n.includes("water") || n === "flowing_lava" || n === "flowing_water");
+  if (liquid(at.name) || liquid(below.name) || liquid(head.name)) return false;
+  return true;
+}
+
+/** From the target, scan straight down (up to 64 blocks) for the first safe
+ * standable cell, the classic "raytrace to ground" for air targets. Returns
+ * the first candidate found from the target downward. */
+function raytraceDownStandable(bot: Bot, target: Vector3): Vec3 | null {
+  const x = Math.floor(target.x);
+  const z = Math.floor(target.z);
+  for (let y = Math.floor(target.y); y > Math.floor(target.y) - 64; y--) {
+    const cell = new Vec3(x, y, z);
+    if (isSafeStandable(bot, cell)) return cell;
   }
   return null;
 }
 
-function isStandable(bot: Bot, cell: Vec3): boolean {
-  const at = bot.blockAt(cell);
-  const below = bot.blockAt(cell.offset(0, -1, 0));
-  if (!at || !below) return false;
-  // Feet space must not be fully solid, and something solid must be under it.
-  return at.boundingBox !== "block" && below.boundingBox === "block";
+function fmtVec(v: Vector3): string {
+  return `{x:${Math.round(v.x * 10) / 10},y:${Math.round(v.y * 10) / 10},z:${Math.round(v.z * 10) / 10}}`;
 }
 
 /**

@@ -51,9 +51,11 @@ export interface LLMStateSnapshot {
   };
   inventory: {
     selectedHotbarSlot: number | null;
-    heldItem: { name: string; count: number } | null;
+    heldItem: { slot: number; name: string; count: number } | null;
     hotbar: Array<{ slot: number; name: string; count: number } | null>;
     items: Array<{ name: string; count: number }>;
+    /** Full slot layout: inventory slot index (0-based, wish.py min) -> item name or null. */
+    slots: Array<string | null>;
     armor: { head: string | null; torso: string | null; legs: string | null; feet: string | null };
     emptySlots: number | null;
   };
@@ -450,7 +452,13 @@ function buildInventory(bot: Bot): LLMStateSnapshot["inventory"] {
   }
 
   const armorName = (slot: number): string | null => slots[slot]?.name ?? null;
-  const heldItem = bot.heldItem && bot.heldItem.name ? { name: bot.heldItem.name, count: bot.heldItem.count } : null;
+  const heldItem = bot.heldItem && bot.heldItem.name
+    ? { slot: bot.heldItem.slot, name: bot.heldItem.name, count: bot.heldItem.count }
+    : null;
+  // Full inventory slot layout (0-based index -> item name or null).
+  const slotLayout: Array<string | null> = slots.map((item) =>
+    item && item.name ? item.name : null
+  );
 
   return {
     selectedHotbarSlot: numberOrNull(bot.quickBarSlot),
@@ -459,6 +467,7 @@ function buildInventory(bot: Bot): LLMStateSnapshot["inventory"] {
     items: [...aggregated.entries()]
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count),
+    slots: slotLayout,
     armor: { head: armorName(5), torso: armorName(6), legs: armorName(7), feet: armorName(8) },
     emptySlots
   };

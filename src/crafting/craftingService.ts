@@ -486,12 +486,39 @@ export function createCraftingService(bot: Bot): CraftingService {
       try {
         const furnace = await bot.openFurnace(furnaceBlock);
         try {
+          // Stale items left in the input/fuel slots from a previous smelt make
+          // putInput/putFuel throw "destination full" when they hold a different
+          // item type. Reclaim a mismatched slot into the player inventory first
+          // so consecutive smelts never collide (a furnace commonly has leftover
+          // fuel or a different queued input).
+          const staleInput = typeof furnace.inputItem === "function" ? furnace.inputItem() : null;
+          if (staleInput && staleInput.name && staleInput.name !== inputItemName) {
+            await clearFurnaceSlot(bot, furnace, "input", staleInput);
+          }
+          const staleFuel = typeof furnace.fuelItem === "function" ? furnace.fuelItem() : null;
+          if (staleFuel && staleFuel.name && staleFuel.name !== fuelItemName) {
+            await clearFurnaceSlot(bot, furnace, "fuel", staleFuel);
+          }
+
           await furnace.putInput(inputItem.type, inputItem.metadata, inputCount);
           await furnace.putFuel(fuelItem.type, fuelItem.metadata, fuelCount);
           const deadline = Date.now() + timeoutMs;
           while (Date.now() < deadline) {
             const output = furnace.outputItem() as { name?: string; count?: number } | null;
             if (output?.name && typeof output.count === "number" && output.count >= inputCount) {
+              // Only take the output if it can fit in the player inventory; if
+              // the player is full, leave it in the furnace rather than have
+              // mineflayer drop it. Placing picks an empty slot, or stacks onto
+              // an existing matching stack when possible.
+              if (!inventoryCanFit(bot, output.name, output.count)) {
+                return {
+                  ok: false,
+                  error: "inventory_full_for_output",
+                  message: `Furnace produced ${output.count} ${output.name} but your inventory cannot fit it (no empty slot and no partial stack to top up). Left it in the furnace; free a slot and smelt again to collect it.`,
+                  outputItem: { name: output.name, count: output.count },
+                  leftInFurnace: true
+                };
+              }
               const taken = await furnace.takeOutput();
               return {
                 ok: true,
@@ -860,6 +887,75 @@ function findNearbyFurnace(bot: Bot, radius: number): NonNullable<ReturnType<Bot
     return null;
   }
   return bot.findBlock({ matching: furnaceId, maxDistance: radius });
+}
+
+/**
+ * Reclaim a stale, mismatched input/fuel slot from a furnace back into the
+ * player inventory so putInput/putFuel don't throw "destination full". Only
+ * avoids a collision; it never drops items (mineflayer's putAway stacks onto
+ * an existing stack or falls to an empty slot).
+ */
+async function clearFurnaceSlot(
+  bot: Bot,
+  furnace: {
+    takeInput?(): Promise<unknown>;
+    takeFuel?(): Promise<unknown>;
+    close?(): void;
+    inventoryStart: number;
+    inventoryEnd: number;
+  },
+  which: "input" | "fuel",
+  stale: { name: string; count: number },
+): Promise<void> {
+  try {
+    if (which === "input" && typeof furnace.takeInput === "function") {
+      await furnace.takeInput();
+    } else if (which === "fuel" && typeof furnace.takeFuel === "function") {
+      await furnace.takeFuel();
+    }
+  } catch {
+    // The stale slot may already be clear; try a manual transfer fallback.
+    try {
+      const destSlot = which === "input" ? 0 : 1;
+      await bot.transfer({
+        window: furnace as never,
+        itemType: 0,
+        metadata: 0,
+        count: stale.count,
+        sourceStart: destSlot,
+        sourceEnd: destSlot + 1,
+        destStart: furnace.inventoryStart,
+        destEnd: furnace.inventoryEnd,
+      });
+    } catch {
+      // Give up quietly; the next putInput/putFuel will fail with a clear
+      // message rather than silently corrupting inventory.
+    }
+  }
+}
+
+/**
+ * True when ``count`` of ``name`` can be placed in the player inventory without
+ * dropping: either it stacks onto an existing partial stack or there is an
+ * empty slot. Used so we never take a finished furnace output that would be
+ * dropped on the floor (the old lost-iron bug).
+ */
+function inventoryCanFit(bot: Bot, name: string, count: number): boolean {
+  const items = bot.inventory.items();
+  const MAX_STACK = 64;
+  let room = 0;
+  for (const item of items) {
+    if (item.name === name) {
+      room += MAX_STACK - item.count;
+    }
+  }
+  const emptySlots = typeof bot.inventory.emptySlotCount === "function"
+    ? bot.inventory.emptySlotCount()
+    : -1;
+  // If we cannot measure empty slots, be permissive (let mineflayer decide).
+  if (emptySlots < 0) return true;
+  room += emptySlots * MAX_STACK;
+  return room >= count;
 }
 
 function sleep(ms: number): Promise<void> {

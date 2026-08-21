@@ -683,6 +683,7 @@ class BodyApi:
         "look_at": ("POST", "/api/command/look-at"),
         "fine_control": ("POST", "/api/command/fine-control"),
         "sync_orientation": ("POST", "/api/command/sync-orientation"),
+        "raycast": ("POST", "/api/command/raycast"),
         "stop": ("POST", "/api/command/stop"),
         "hotbar_select": ("POST", "/api/hotbar/select"),
         "inventory_select": ("POST", "/api/inventory/select"),
@@ -983,6 +984,7 @@ Automatically refreshed by the Minecraft MCP server after observations and actio
 - Oxygen: {player["oxygenLevel"]}
 - Experience level: {player["experienceLevel"]}
 - Held item: {json.dumps(inventory["heldItem"], ensure_ascii=False)}
+- Held slot: {_held_slot(observation)}
 - Armor: {json.dumps(inventory["armor"], ensure_ascii=False)}
 - Empty inventory slots: {inventory["emptySlots"]}
 - Inventory: {items}
@@ -1197,6 +1199,10 @@ class MinecraftMcpRuntime:
         self.active_skill: asyncio.subprocess.Process | None = None
         self.active_skill_info: dict[str, Any] | None = None
         self.skill_timeout_seconds = float(config.skill_timeout_seconds)
+        # In-memory ephemeral waypoints (ore veins, staircase entries, unfinishable
+        # blocks). Not persisted; capped at WAYPOINT_CAP, oldest evicted first.
+        self.waypoints: list[dict[str, Any]] = []
+        self.waypoint_cap = 6
         # Body event detection cursor (in-memory; baselined on first sight).
         self.event_cursor: dict[str, Any] | None = None
         self.last_activity = time.monotonic()
@@ -3365,6 +3371,8 @@ def state_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]
         "foodChange": numeric_delta(before["player"]["food"], after["player"]["food"]),
         "heldItemBefore": before.get("inventory", {}).get("heldItem"),
         "heldItemAfter": after.get("inventory", {}).get("heldItem"),
+        "heldSlotBefore": _held_slot(before),
+        "heldSlotAfter": _held_slot(after),
         "inventoryChanges": inventory_changes,
     }
 
@@ -3385,6 +3393,16 @@ def material_action_reached_world(
 def numeric_delta(before: Any, after: Any) -> float | None:
     if isinstance(before, (int, float)) and isinstance(after, (int, float)):
         return after - before
+    return None
+
+
+def _held_slot(observation: dict[str, Any]) -> int | None:
+    """The inventory slot index of the currently held item, if known."""
+    held = observation.get("inventory", {}).get("heldItem")
+    if isinstance(held, dict):
+        slot = held.get("slot")
+        if isinstance(slot, int) and slot >= 0:
+            return slot
     return None
 
 
@@ -3530,6 +3548,70 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         """List reusable TypeScript skills that belong to this character."""
         async with runtime.lock:
             return runtime.list_capabilities()
+
+    @mcp.tool
+    @log_action(runtime, 'inventory_slots')
+    async def minecraft_inventory_slots() -> dict[str, Any]:
+        """Return the full current inventory slot layout as a read-only JSON map: slot index (integer) -> {name, count} or null for empty. Use this to see exactly which item is in which slot (including the held/hotbar slots) before equipping, so you never guess what is in hand. No state changes are made."""
+        observation = await asyncio.to_thread(runtime.api.observe)
+        inventory = observation.get("inventory", {})
+        slots = inventory.get("slots")
+        if not isinstance(slots, list):
+            raise RuntimeError("inventory slot layout unavailable")
+        layout = {
+            index: ({ "name": name } if name else None)
+            for index, name in enumerate(slots)
+        }
+        slot_list = inventory.get("hotbar") or []
+        return {
+            "slots": layout,
+            "selectedHotbarSlot": inventory.get("selectedHotbarSlot"),
+            "heldItem": inventory.get("heldItem"),
+            "heldSlot": _held_slot(observation),
+        }
+
+    @mcp.tool
+    @log_action(runtime, 'add_waypoint')
+    async def minecraft_add_waypoint(
+        description: str,
+        x: float | None = None,
+        y: float | None = None,
+        z: float | None = None,
+    ) -> dict[str, Any]:
+        """Save an in-memory waypoint at the given coordinates, or at the current position if any/all coordinates are omitted. Good for remembering non-static items like ore veins, a staircase entry, or a block that can't be mined yet. Capped at 6; when full the oldest waypoint is replaced. Not persisted across sessions."""
+        async with runtime.lock:
+            position = None
+            if x is None or y is None or z is None:
+                observation = await asyncio.to_thread(runtime.api.observe)
+                position = observation.get("player", {}).get("position")
+                if not isinstance(position, dict):
+                    raise RuntimeError("player position unavailable")
+            waypoint = {
+                "x": x if x is not None else position["x"],
+                "y": y if y is not None else position["y"],
+                "z": z if z is not None else position["z"],
+                "description": description,
+            }
+            runtime.waypoints.append(waypoint)
+            if len(runtime.waypoints) > runtime.waypoint_cap:
+                runtime.waypoints.pop(0)
+            return {
+                "added": waypoint,
+                "count": len(runtime.waypoints),
+                "waypoints": list(runtime.waypoints),
+                "cap": runtime.waypoint_cap,
+            }
+
+    @mcp.tool
+    @log_action(runtime, 'list_waypoints')
+    async def minecraft_list_waypoints() -> dict[str, Any]:
+        """Return all saved in-memory waypoints (up to 6, oldest evicted first). Read-only; no state changes. Each waypoint has x/y/z and a description."""
+        async with runtime.lock:
+            return {
+                "count": len(runtime.waypoints),
+                "waypoints": list(runtime.waypoints),
+                "cap": runtime.waypoint_cap,
+            }
 
     @mcp.tool
     @log_action(runtime, 'promote_skill')
@@ -3769,6 +3851,16 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         """Rotate relative to the current view. Positive yaw turns right; positive pitch looks up."""
         return await runtime.call_tool(
             "rotate", {"yaw": yaw_degrees, "pitch": pitch_degrees}, 10, include_image
+        )
+
+    @mcp.tool
+    @log_action(runtime, 'raytrace')
+    async def minecraft_raytrace(
+        max_distance: float = 64, include_image: bool = False
+    ) -> ToolResult:
+        """Raycast from the player's head along the current view direction and return the exact block and coordinates being looked at (the first solid block hit up to max_distance). Use it to confirm what the crosshair is pointing at before walking/mining, e.g. whether you're looking at a village structure (cobblestone/planks) or a distant landmark."""
+        return await runtime.call_tool(
+            "raycast", {"maxDistance": max_distance}, 10, include_image
         )
 
     @mcp.tool

@@ -229,6 +229,12 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
             throw new Error("Bot is not connected.");
           }
           return bot.actions.inspectBlock(input);
+        },
+        raycast: async (maxDistance) => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.raycast(maxDistance ?? 64);
         }
       },
       maxFineControlDurationMs: config.command.maxFineControlDurationMs,
