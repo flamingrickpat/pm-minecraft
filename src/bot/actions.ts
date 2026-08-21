@@ -486,6 +486,24 @@ export function createPhysicalCommandActions(
         }
         goal = alternatives[0];
         snapped = vector(goal);
+        // If the closest standable alternative is the cell the bot already
+        // stands in, the walk would report success without moving. Callers use
+        // walk_to_exact to ARRIVE somewhere; a no-op success desyncs their own
+        // position tracking (this exact bug made a tunnel script advance its
+        // feet counter while gravel refilled the tunnel behind it). Fail
+        // loudly instead, naming what blocks the requested cell.
+        const here = bot.entity.position;
+        const snapDistance = Math.hypot(here.x - (goal.x + 0.5), here.y - goal.y, here.z - (goal.z + 0.5));
+        if (snapDistance <= 1.0) {
+          return failed("target_not_standable", `target not standable and no better cell nearby: requested ${fmtVec(cell)}, but its floor is ${exact.floorBlock} with [${exact.blocksAbove.join(", ")}] above (${describeStandabilityIssues(exact.issues)}). the nearest standable alternative is the block you already stand in, so walking there would be a no-op. the standability rule needs a solid floor plus 3 blocks of clearance above it (jump headroom) — carve or clear the cells above ${fmtVec(cell)} first, then retry.`, {
+            status: "not_standable",
+            position: vector(startPosition),
+            target,
+            standability: exact,
+            snapped,
+            searchedRadius: 3
+          });
+        }
       }
       const region = navigationRegion(bot, options.maxChunkLimit);
       if (
@@ -2035,7 +2053,15 @@ async function gotoNearOnce(
   }
 
   const start = vector(bot.entity.position);
-  if (distXZ(start, target) <= tolerance) {
+  // 3D goals (walk_to_exact) must not short-circuit on horizontal distance
+  // alone: a bot directly above its target cell is NOT there. A horizontal-only
+  // check here used to report instant "success" while the bot hovered over the
+  // carved stair cell below it, and callers advanced their own position
+  // tracking without the bot ever moving.
+  const atTarget = opts.goalMode === "3d"
+    ? Math.hypot(start.x - target.x, start.y - target.y, start.z - target.z)
+    : distXZ(start, target);
+  if (atTarget <= tolerance) {
     return { pathStatus: "success", pathNodes: 0, ascents: 0, drops: 0, stalled: false, diagnosis: "already within tolerance" };
   }
 
@@ -2178,7 +2204,10 @@ async function gotoNearOnce(
     // arrived (success) or stopped moving forever (stuck walk).
     backstop = setInterval(() => {
       const position = bot.entity.position;
-      if (distXZ(position, target) <= tolerance) {
+      const arrived = opts.goalMode === "3d"
+        ? Math.hypot(position.x - target.x, position.y - target.y, position.z - target.z)
+        : distXZ(position, target);
+      if (arrived <= tolerance) {
         wlog(`backstop: within tolerance of ${fmtVec(target)} — success`);
         finish(null);
         return;

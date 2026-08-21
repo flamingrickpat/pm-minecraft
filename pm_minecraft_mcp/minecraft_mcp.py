@@ -3512,7 +3512,9 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     @mcp.tool
     @log_action(runtime, 'info')
     async def minecraft_info() -> dict[str, Any]:
-        """Return this character's connection, agent-home, skill, memory, and log locations."""
+        """Return this character's configuration and status: username, server address, body URL, directory layout (drafts, skills, memory, logs), and the postcondition schemas. Call this first in a new session to learn where everything lives.
+
+The result also includes the skill policy (character limit, timeout cap, allowed file extensions) and the current run status. The actionSchemas field lists every low-level action that minecraft_call accepts, with parameter shapes."""
         health = await asyncio.to_thread(runtime.api.health)
         return {
             "username": runtime.config.username,
@@ -3565,14 +3567,24 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     @mcp.tool
     @log_action(runtime, 'list_capabilities')
     async def minecraft_list_capabilities() -> dict[str, Any]:
-        """List reusable TypeScript skills that belong to this character."""
+        """List the reusable TypeScript skills that belong to this character. Each entry gives the skill name, file path, and description. Call this when you need a multi-step job done: mining, building, collecting. The descriptions state each skill's input arguments.
+
+When to use: at the start of a big task, to see what you can reuse instead of writing a new draft.
+When not to use: for one-off actions. The direct tools are simpler."""
         async with runtime.lock:
             return runtime.list_capabilities()
 
     @mcp.tool
     @log_action(runtime, 'inventory_slots')
     async def minecraft_inventory_slots() -> dict[str, Any]:
-        """Return the full current inventory slot layout as a read-only JSON map: slot index (integer) -> {name, count} or null for empty. Use this to see exactly which item is in which slot (including the held/hotbar slots) before equipping, so you never guess what is in hand. No state changes are made."""
+        """Return the full inventory as a slot map: slot index to item name, or null for empty. This is read-only and changes nothing.
+
+Use it before you equip or craft, so you never guess what is in hand. The result also tells you the selected hotbar slot and the held item.
+
+Slot numbers: 0 to 8 are the hotbar (9 to 44 are the main inventory in this body's layout). The held item is the item in the selected hotbar slot.
+
+When to use: before crafting (to count materials), before equipping (to find the item), and when a script reports a missing item.
+When not to use: for a quick material check. observe already includes the item list with counts."""
         observation = await asyncio.to_thread(runtime.api.observe)
         inventory = observation.get("inventory", {})
         slots = inventory.get("slots")
@@ -3598,7 +3610,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         y: float | None = None,
         z: float | None = None,
     ) -> dict[str, Any]:
-        """Save an in-memory waypoint at the given coordinates, or at the current position if any/all coordinates are omitted. Good for remembering non-static items like ore veins, a staircase entry, or a block that can't be mined yet. Capped at 6; when full the oldest waypoint is replaced. Not persisted across sessions."""
+        """Save an in-memory waypoint at given coordinates, or at your current position when you omit the coordinates. Good for ore veins, a staircase entry, or a block you cannot mine yet.
+
+The list holds at most 6 waypoints. When the list is full, the oldest entry is replaced. Waypoints do not survive a restart: write them to memory with remember when they must last.
+
+When to use: before you descend a staircase (save the entry), or when you spot ore you cannot reach yet.
+When not to use: for durable knowledge (use remember)."""
         async with runtime.lock:
             position = None
             if x is None or y is None or z is None:
@@ -3625,7 +3642,7 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     @mcp.tool
     @log_action(runtime, 'list_waypoints')
     async def minecraft_list_waypoints() -> dict[str, Any]:
-        """Return all saved in-memory waypoints (up to 6, oldest evicted first). Read-only; no state changes. Each waypoint has x/y/z and a description."""
+        """Return all saved waypoints (up to 6, oldest first). Read-only. Each entry has x, y, z, and a description. When the list is full, add_waypoint replaces the oldest entry."""
         async with runtime.lock:
             return {
                 "count": len(runtime.waypoints),
@@ -3643,7 +3660,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         source_task_id: str | None = None,
         replace: bool = False,
     ) -> dict[str, Any]:
-        """Promote a character draft after its named execution passed the mandatory postcondition."""
+        """Promote a draft skill to a reusable named skill. The gate: the named execution must have passed its postcondition. Find the execution id in the execute_typescript result of the successful run.
+
+Parameters: draft_path is the draft file. name is the new skill name. description tells future sessions what it does and what arguments it takes. execution_id is the id of the passing run. replace lets you overwrite an existing skill of the same name.
+
+When to use: after a draft ran clean twice (once is luck). Write the description like a tool description: purpose, arguments, limits, and failure modes.
+When not to use: for one-off scripts. Leave them in drafts."""
         async with runtime.lock:
             return runtime.promote_skill(
                 draft_path=draft_path,
@@ -3669,12 +3691,37 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         parameters: dict[str, Any],
         include_image: bool = False,
     ) -> ToolResult:
+        """Run one low-level body action directly. Use this for actions that have no dedicated tool: place_block, use_block, look_at, inspect, attack_entity, fine_control, hotbar_select, chat, and more.
+
+The action names and their parameters:
+- look_at: parameters {"target": {"x", "y", "z"}}. Turn the view to an exact world position. Use it before you mine a distant block or before fine_control, so "forward" points where you want to go.
+- inspect: parameters {"block": {"x", "y", "z"}}. Read one block: name, dig time with the held item, and whether the held item can harvest it. Costs no screenshot. Use it to check a tunnel face or a tool question before you commit.
+- place_block: parameters {"referenceBlock": {"x", "y", "z"}, "face": {"x", "y", "z"}}. Place the held item on that face of that block. The face is a unit vector, for example {"x": 0, "y": 1, "z": 0} for the top face. The body walks into range first. Equip the item to place before you call this.
+- jump_place_block: same parameters as place_block. Place while jumping, for cells above reach.
+- use_block: parameters {"block": {"x", "y", "z"}}. Activate a block: open a door, open a chest, open a crafting table, press a button. Doors report their open state.
+- attack_entity: parameters {"entityId": integer}. Attack one entity from a fresh observation. A chicken dies to one hit with a wooden sword.
+- fine_control: parameters {"controls": {"forward", "back", "left", "right", "jump", "sprint", "sneak"} booleans, "durationMs": 1 to 3000, "visualCheckFrameId": string}. Hold raw control states for a fixed time. No pathfinding. This is the escape hatch when the pathfinder refuses a legal move, for example an open door panel or a tunnel edge. The frame id must come from a capture_frame call within the last 60 seconds, so run capture_frame first through this same tool.
+- hotbar_select: parameters {"hotbarIndex": 0 to 8}. Select a hotbar slot by number.
+- inventory_select: parameters {"slot": integer}. Move the item cursor to a slot.
+- chat: parameters {"text": string}. Send one chat line. The server kicks bots that send chat too fast, so use this rarely.
+- stop: no parameters. Stop the current physical command.
+
+When to use: for any action that the dedicated tools do not cover. Also use look_at plus fine_control when a walk fails at a short gap.
+When not to use: for walking (use the walk tools), mining (use mine_block), or crafting (use craft_item). The dedicated tools add verification and better errors.
+
+Limits: the call waits up to 300 seconds. Actions that move the body can stall. If a call hangs, use stop, then retry."""
         safe_parameters = dict(parameters)
         return await runtime.call_tool(action, safe_parameters, 300, include_image)
 
     @mcp.tool
     @log_action(runtime, 'find_interactables')
     async def minecraft_find_interactables(include_image: bool = False) -> ToolResult:
+        """Find interactable blocks within 256 loaded blocks: doors, gates, chests, barrels, crafting tables, furnaces, beds, levers, buttons, and similar. Each result gives the block name, position, and distance.
+
+When to use: to locate a crafting table or a chest that a walk failure mentioned, or to find the door of a village house.
+When not to use: to find ore or wood (use find_block). This tool reports only blocks with an open/use action.
+
+Limits: the scan is not line-of-sight gated, but it covers only loaded chunks near you. The scan can take several seconds."""
         return await runtime.call_tool("find_interactables", {}, 60, include_image)
 
     @mcp.tool
@@ -3683,11 +3730,25 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         block_name: str,
         include_image: bool = False,
     ) -> ToolResult:
+        """Find one block of a given type within 256 loaded blocks. The name accepts glob patterns: "*log" matches oak_log and birch_log, "*ore" matches every ore.
+
+Anti-x-ray rule: the scan reports only blocks that a head ray can see, or blocks within a few blocks of you. A buried coal vein does not show up until a face is exposed. This rule is hard-locked. Do not try to work around it.
+
+When to use: to find trees ("*log"), surface stone, exposed ore in a cliff, or water. Mine toward the result with mine_block, then call find_block again to find the next one.
+When not to use: to see the block under your feet (that is in observe), or to find a crafting table (use find_interactables).
+
+Failures: "block_not_found" means no visible block of that type is in range. If you can see it in the screenshot, walk closer or change your view, then retry. "unknown_block" means the name matched nothing. The error lists near matches."""
         return await runtime.call_tool("find_block", {"blockName": block_name}, 60, include_image)
 
     @mcp.tool
     @log_action(runtime, 'scan_horizon')
     async def minecraft_scan_horizon(include_image: bool = False) -> ToolResult:
+        """Cast rays in 24 headings (every 15 degrees) at three pitch angles (15 up, level, 15 down). Each ray reports the first solid or liquid block it hits, with name, position, and distance. Range is up to 256 blocks.
+
+When to use: to get a panorama cheaply. One scan tells you where water, lava, cliffs, forests, and open plains are in every direction. Use it when you choose a travel direction or hunt for a river.
+When not to use: to find one specific block type (use find_block), or to inspect what is in front of you (use observe, which includes a screenshot).
+
+Limits: rays stop at the first block. The scan cannot see behind hills or into caves. Trees hide the ground behind them."""
         return await runtime.call_tool("scan_horizon", {}, 60, include_image)
 
     @mcp.tool
@@ -3698,6 +3759,17 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         z: float,
         include_image: bool = False,
     ) -> ToolResult:
+        """Walk to a spot near a target position that you can see. Give the coordinates of a visible point, for example the base of a tree or an ore face. The body finds standable ground within about 5 blocks of the target and walks to the closest reachable cell.
+
+When to use: to approach a block you found with find_block, or any short walk to a point in view.
+When not to use: for long travel (use walk_to_surface, which never fails on distance), or when you must stand in one exact cell (use walk_to_exact).
+
+Behavior details:
+- The walk opens closed wooden doors that block the route.
+- The result says when the goal snapped to a nearby cell.
+- "target_too_far" means the target is outside the search region around you (a few chunks). Use walk_to_surface toward the same x and z, then retry.
+- "target_not_standable" means no safe floor exists within 5 blocks of the target. Pick a nearby coordinate on solid ground.
+- If the walk stalls, the error names the blocking block, for example a closed door or leaves."""
         return await runtime.call_tool(
             "walk_to_visible",
             {"target": {"x": x, "y": y, "z": z}},
@@ -3712,6 +3784,16 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         z: float,
         include_image: bool = False,
     ) -> ToolResult:
+        """Travel to the surface above a column (x, z), over any distance. This is the long-range travel tool. It walks in hops, finds a new route after each hop, and opens doors on the way.
+
+When to use: to travel home from far away, to reach a distant landmark, or to return to the surface after mining. Give only x and z. The tool finds the surface height itself.
+When not to use: to reach an exact cell (use walk_to_exact), or to approach a visible target within a few chunks (walk_to_visible is cheaper).
+
+Behavior details:
+- Each hop covers up to a few chunks. Long trips need several calls. The error "hop_limit" tells you to call again from the new position.
+- "no_progress" means the terrain needs digging, bridging, or pillaring. The error names the closest reachable point. Walk there with walk_to_exact, then reassess.
+- Ravines and water can stop a hop. The error text suggests what to do next.
+- The tool can walk you off small ledges but refuses drops deeper than one block unless a safe path exists."""
         return await runtime.call_tool(
             "walk_to_surface",
             {"x": x, "z": z},
@@ -3727,6 +3809,19 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         z: float,
         include_image: bool = False,
     ) -> ToolResult:
+        """Walk to one exact block cell. Give the cell center: x.5, y, z.5, for example the center of a tunnel floor cell. The default tolerance is about 1 block.
+
+Standability rule: the target cell must have a solid floor and 3 blocks of clear space above it. The body needs jump headroom, so a 2-high tunnel is not standable. Carve tunnels 3 high.
+
+Behavior details:
+- If the exact cell is not standable, the tool snaps to the nearest standable cell within 3 blocks and tells you in the result.
+- If the snapped cell is the one you already stand in, the call fails with "target_not_standable". The error names the blocks above the requested cell. Carve or clear them, then retry.
+- The success check is 3-dimensional. A bot that hovers above the target cell is not there.
+- Closed wooden doors on the route open automatically.
+- Walk failures name the blocking block and give the closest reachable standable position. Walk there, then reassess.
+
+When to use: to enter a carved tunnel or staircase, to stand on a specific block, or to follow a walk failure's suggestion.
+When not to use: for open-ground travel (walk_to_surface is faster and has no distance limit)."""
         return await runtime.call_tool(
             "walk_to_exact",
             {"target": {"x": x, "y": y, "z": z}},
@@ -3742,6 +3837,18 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         z: int,
         include_image: bool = False,
     ) -> ToolResult:
+        """Mine one block at integer coordinates. The body looks at the block, walks into range if needed, digs, and verifies the drop landed in your inventory.
+
+Harvest rule: the held item must be able to harvest the block. Stone needs a pickaxe. A pickaxe of the wrong tier gives no drops. If the held item cannot harvest, the call fails with "unharvestable" and names the problem. Equip the right tool, then retry.
+
+Dig speed depends on the tool tier: a wooden pickaxe needs about 7 seconds for one stone block, a stone pickaxe about 2 seconds, an iron pickaxe under 1 second. Upgrade tools before you dig long tunnels.
+
+Watch the held item: mined drops stack into your hand slot and can displace your tool. If a script mines many blocks, re-equip the tool when a harvest error appears.
+
+When to use: for single blocks, ore that find_block reported, or small corrections. For many blocks in a row, write or run a skill (tunnel_and_mine, staircase_down) instead. One mine_block call costs one observe cycle, so 20 blocks by hand is slow.
+When not to use: to clear a 3-high tunnel face by hand. The skills do the same with progress guards and gravel handling.
+
+Gravel and sand: these blocks fall. A mined cell can refill from above within a second. Check the cell with inspect after you mine, or use the tunnel_and_mine skill, which re-mines refills automatically."""
         return await runtime.call_tool(
             "mine_block",
             {"block": {"x": x, "y": y, "z": z}},
@@ -3752,12 +3859,23 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     @mcp.tool
     @log_action(runtime, 'pillar_up')
     async def minecraft_pillar_up(include_image: bool = False) -> ToolResult:
-        """Ascend exactly one block by naturally jumping and placing the currently held placeable block beneath the character. No coordinates or face are needed: the body derives the block below, retries up to three jumps, verifies the placed block, and waits for landing. Equip a suitable solid block and use a fresh observation whose localAirspace.clearanceBlocksAboveHead is at least 1."""
+        """Place the held item as a block by jumping and putting it under your feet. This raises you exactly one block. Repeat to pillar upward.
+
+Requirements: hold a solid, placeable block (cobblestone, dirt, planks). The observation must show at least 1 block of clearance above your head. The body retries the jump up to three times and verifies the placed block.
+
+When to use: to climb one block, to pillar up a shaft, or to build a floor edge. staircase_up combines this with headroom carving for enclosed spaces.
+When not to use: indoors with no headroom (clear the cells above first, or use staircase_up), or with a tool held (equip a block first)."""
         return await runtime.call_tool("pillar_up", {}, 30, include_image)
 
     @mcp.tool
     @log_action(runtime, 'use_item')
     async def minecraft_use_item(include_image: bool = False) -> ToolResult:
+        """Use, eat, or throw the held item. Food is eaten, eggs and snowballs are thrown, potions and milk are drunk.
+
+When to use: to eat when hunger is low. Hold the food first with equip. Eating restores the hunger bar and lets health regenerate.
+When not to use: to activate a block in the world (use use_block through minecraft_call), or to place a block (use place_block through minecraft_call).
+
+Limits: the action applies to the held item only. If nothing usable is held, the call fails."""
         return await runtime.call_tool("use_item", {}, 120, include_image)
 
     @mcp.tool
@@ -3765,7 +3883,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     async def minecraft_chest_deposit(
         item_name: str, count: int | None = None, include_image: bool = False
     ) -> ToolResult:
-        """Move items from the player's inventory into the currently open container window (chest/barrel/shulker). Open the container first with use_block, which reports windowType "chest". Returns the container's resulting contents. Fails with no_chest_window when nothing is open."""
+        """Move items from your inventory into the open container (chest, barrel, shulker box). Open the container first with use_block through minecraft_call. The result reports the container contents after the move.
+
+Parameters: item_name is the exact item name, for example "cobblestone". count is optional. Without count, every matching item moves.
+
+When to use: to store surplus in your base chest before a mining trip, so a death loses less.
+When not to use: before a container is open. The call fails with "no_chest_window" when nothing is open."""
         body: dict[str, Any] = {"itemName": item_name}
         if count is not None:
             body["count"] = count
@@ -3776,7 +3899,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     async def minecraft_chest_withdraw(
         item_name: str, count: int | None = None, include_image: bool = False
     ) -> ToolResult:
-        """Take items from the currently open container window (chest/barrel/shulker) into the player's inventory. Open the container first with use_block, which reports windowType "chest". Returns the container's resulting contents. Fails with no_chest_window when nothing is open."""
+        """Take items from the open container (chest, barrel, shulker box) into your inventory. Open the container first with use_block through minecraft_call.
+
+Parameters: item_name is the exact item name. count is optional. Without count, every matching item moves.
+
+When to use: to restock food or tools from your base chest before a trip.
+When not to use: before a container is open. The call fails with "no_chest_window" when nothing is open."""
         body: dict[str, Any] = {"itemName": item_name}
         if count is not None:
             body["count"] = count
@@ -3790,6 +3918,16 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         count: int,
         ctx: Context,
     ) -> ToolResult:
+        """Collect a number of one block type from the world: find visible blocks, walk to each, mine it, and repeat until the inventory holds the requested count of the item.
+
+Parameters: block_name is the block to mine, for example "oak_log". item_name is the drop to count, for example "oak_log". count is the target number.
+
+The skill equips the cheapest tool that can harvest the block, so you do not need to equip first. It stops early with a clear message when no more visible blocks of that type are in range.
+
+When to use: to gather wood (oak_log x8), stone, or sand in bulk. This is the fastest way to stock a crafting session.
+When not to use: for ore hunting (ore hides from find_block until exposed, so write a tunnel skill instead), or for one block (use mine_block).
+
+Limits: the run needs a postcondition on the item count. If the world cannot supply the count, the run reports the shortfall."""
         if count <= 0:
             raise ValueError("count must be positive")
         return await runtime.execute_typescript(
@@ -3809,6 +3947,18 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     @mcp.tool
     @log_action(runtime, 'craft_item')
     async def minecraft_craft_item(item_name: str, repetitions: int = 1) -> ToolResult:
+        """Craft items by exact name. repetitions is the number of recipe runs, not the number of items.
+
+Recipe size rule: 2x2 recipes (planks, sticks, crafting_table, torches from charcoal) craft from your inventory at any time. 3x3 recipes (stone_pickaxe, furnace, chest, bed, doors) need a crafting table within reach. If no table is near, the call fails with "crafting_table_not_found". Place a table first: craft one from 4 planks, then place it with place_block through minecraft_call.
+
+Typical early chains:
+- 1 log -> craft oak_planks (gives 4). Then 2 planks -> 4 sticks.
+- 4 planks -> 1 crafting_table.
+- 3 cobblestone + 2 sticks -> 1 stone_pickaxe (needs a placed table).
+- 8 cobblestone -> 1 furnace (needs a placed table).
+
+When to use: before every tool upgrade and before building.
+When not to use: with the wrong materials in inventory. The error tells you what is missing. Check observe first."""
         return await runtime.call_tool(
             "craft_item",
             {"itemName": item_name, "repetitions": repetitions},
@@ -3824,6 +3974,16 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         fuel_item_name: str,
         fuel_count: int = 1,
     ) -> ToolResult:
+        """Smelt items in a furnace. A placed furnace must stand within 8 blocks of you. The call opens it, clears stale slots, loads the input and fuel, waits for the smelt, and returns the output.
+
+Parameters: input_item_name and input_count are what to smelt, for example raw_iron x3. fuel_item_name and fuel_count are the fuel, for example coal x1 or planks.
+
+Smelt time is about 10 seconds per item. The call waits for the full batch. One coal smelts up to 8 items.
+
+When to use: to turn raw_iron into iron_ingot, sand into glass, or raw food into cooked food. Smelt iron before you craft iron tools.
+When not to use: without a placed furnace nearby. The call fails with "furnace_not_found". Craft and place one first.
+
+Limits: you must stand near the furnace for the whole smelt. Do not walk away mid-call."""
         # Smelt time is deterministic (10s per item plus margin): the timeout
         # is computed, never guessed.
         effective_timeout = max(60.0, input_count * 10.0 + 30.0)
@@ -3842,6 +4002,14 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     @mcp.tool
     @log_action(runtime, 'equip')
     async def minecraft_equip(item_name: str, include_image: bool = False) -> ToolResult:
+        """Hold one item from your inventory. The item moves into the hotbar hand slot.
+
+Parameters: item_name is the exact name, for example "stone_pickaxe" or "cobblestone".
+
+When to use: before mine_block (hold the right tool), before place_block (hold the block), before use_item (hold the food), and before pillar_up (hold a solid block).
+When not to use: to read what you hold (that is in observe, under heldItem).
+
+Limits: the item must be in your inventory. Drops that land in your hand mid-script can displace the tool, so re-equip after long mine runs."""
         return await runtime.call_tool(
             "inventory_equip", {"itemName": item_name}, 60, include_image
         )
@@ -3851,7 +4019,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     async def minecraft_rotate(
         yaw_degrees: float = 0, pitch_degrees: float = 0, include_image: bool = False
     ) -> ToolResult:
-        """Rotate relative to the current view. Positive yaw turns right; positive pitch looks up."""
+        """Turn the view by a relative amount. Positive yaw turns right. Positive pitch looks up. The result reports the new absolute yaw and pitch.
+
+This is a RELATIVE turn, not an absolute heading. To face an exact world point, use look_at through minecraft_call instead.
+
+When to use: to look around before a screenshot, or to aim before fine_control. A full turn is 360 degrees, so yaw 180 faces the opposite way.
+When not to use: to aim at a block with known coordinates (look_at is exact)."""
         return await runtime.call_tool(
             "rotate", {"yaw": yaw_degrees, "pitch": pitch_degrees}, 10, include_image
         )
@@ -3859,18 +4032,28 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     @mcp.tool
     @log_action(runtime, 'raytrace')
     async def minecraft_raytrace(include_image: bool = False) -> ToolResult:
+        """Report the block your view ray hits first: name, position, distance, and the face you look at. Range is up to 256 blocks.
+
+When to use: to identify the block in the center of your screenshot before you mine it, or to confirm you face the right wall before fine_control.
+When not to use: to search for a block type (use find_block), or to scan all directions (use scan_horizon).
+
+Limits: the ray stops at the first solid or liquid. Air and grass pass through or hit the surface behind them."""
         return await runtime.call_tool("raycast", {}, 30, include_image)
 
     @mcp.tool
     @log_action(runtime, 'kill_command')
     async def minecraft_kill_command(include_image: bool = False) -> ToolResult:
-        """Stop only the currently running physical Mineflayer command (pathfinding/digging/controls). Leaves a running skill process alive."""
+        """Stop the current physical command (walk, dig, controls) but leave a running skill process alive. Use it when a walk hangs or walks the wrong way, and the skill logic is fine.
+
+When not to use: when a whole skill run went wrong. Use stop instead, which kills both the command and the skill process."""
         return await runtime.call_tool("stop", {}, 10, include_image)
 
     @mcp.tool
     @log_action(runtime, 'kill_skill')
     async def minecraft_kill_skill() -> dict[str, Any]:
-        """Terminate the running TypeScript skill process (and, necessarily, whatever command it was issuing). No-op when no skill is running."""
+        """Terminate the running TypeScript skill process, and with it the command it issues. No-op when no skill runs. The skill result reports the termination as cancelled. Use it when a skill loop must stop now.
+
+When not to use: when only the current walk must stop but the skill logic is fine. Use kill_command for that."""
         async with runtime.lock:
             result = await runtime.kill_skill()
         return {
@@ -3886,7 +4069,9 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     @mcp.tool
     @log_action(runtime, 'stop')
     async def minecraft_stop(include_image: bool = False) -> ToolResult:
-        """Stop the active Mineflayer command AND terminate any running skill process (kills both). Use for an emergency halt."""
+        """Emergency halt: stop the active physical command AND terminate the running skill process. Use this when anything moves that you did not ask for, or before you reassess a bad situation.
+
+After stop, the body is idle and safe to command again. State in the world stays as it is."""
         command = await runtime.call_tool("stop", {}, 10, include_image)
         async with runtime.lock:
             skill = await runtime.kill_skill()
@@ -3911,6 +4096,45 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         timeout_seconds: float | None = None,
         include_image: bool = False,
     ) -> ToolResult:
+        """Run a TypeScript skill file in the game world. This is how you do multi-step work: mine a staircase, tunnel for ore, build a house.
+
+Parameters:
+- path: the skill file. A relative path is relative to the agent home. Drafts live under drafts/, promoted skills under skills/.
+- arguments: the input object for the skill, for example {"targetY": 45, "direction": "x+"}.
+- postcondition: a required object that states what must be true after the run. Pass it as an object, not a string.
+- timeout_seconds: the cap. The server also has a hard cap (about 90 seconds). Long jobs must be split: design skills to resume from the current position, then call again.
+
+Postcondition kinds:
+- inventory_min: the inventory holds at least count of item.
+- inventory_delta_min: the inventory gained at least count of item during the run.
+- y_min / y_max: the feet Y is at least / at most value.
+- health_min, position_changed_min, distance_max: obvious guards.
+- held_item: the hand holds item.
+- block_at: the block at a position is item.
+- entity_id_absent: an entity is gone.
+- all: a list of the above, all must pass.
+
+Result statuses:
+- succeeded: the skill returned ok and the postcondition passed.
+- failed: the skill threw an error. Read the message: it names the blocking block or the failed step.
+- postcondition_failed: the skill exited normally, but the world does not match the goal. Read which check failed and the actual value.
+- timed_out: the run exceeded the timeout and was terminated. The world keeps its state, so a resumable skill can continue from the new position.
+
+Skill file rules:
+- Export "async function run(ctx, input)" or a default async function. Top-level await is not supported.
+- ctx exposes: observe(), equip(name), walkTo(target), and call(action, parameters, timeoutSeconds).
+- The call actions mirror minecraft_call: mine_block, place_block, walk_to_exact, look_at, inspect, fine_control, and the rest.
+- fine_control needs a frame id from ctx.call("capture_frame") taken within the last 60 seconds. Read it from the top level of the result, not from result.data.
+
+Design rules for your own skills:
+- Make them resumable: read the current position first, then work from there.
+- Verify walks: after walk_to_exact returns ok, observe and confirm the feet cell. An empty-path walk can report success without a move.
+- Mine tunnel faces 3 high: the standability rule needs 3 blocks of clearance above the floor.
+- Re-check mined cells after a short delay: gravel and sand fall and refill them.
+- Watch the skill timeout: about 6 staircase steps fit into 90 seconds with a wooden pickaxe.
+
+When to use: any job that needs more than 3 tool calls in a loop.
+When not to use: for one action (the direct tools are cheaper and clearer)."""
         effective_timeout = timeout_seconds if timeout_seconds is not None else runtime.skill_timeout_seconds
         return await runtime.execute_typescript(
             path,
@@ -3927,7 +4151,14 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     async def minecraft_check_postcondition(
         postcondition: PostconditionSpec,
     ) -> dict[str, Any]:
-        """Evaluate a deterministic postcondition against a fresh state. Delta checks compare the same snapshot and are therefore zero."""
+        """Evaluate one postcondition against a fresh snapshot, without running a skill. Use it to verify a goal before you claim it, or to check state after manual tool calls.
+
+Delta checks (inventory_delta_min, position_changed_min) compare one snapshot with itself, so they always read zero. Use absolute checks (inventory_min, y_min, block_at) with this tool.
+
+Parameters: postcondition is the same object type that execute_typescript requires.
+
+When to use: after a build phase, to confirm a block sits where you placed it. Or after smelting, to confirm the ingots are in the inventory.
+When not to use: to measure change over time (compare two observe results yourself instead)."""
         async with runtime.lock:
             snapshot = await runtime.snapshot(False)
         observation = snapshot["observation"]
@@ -3964,13 +4195,26 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         ],
         markdown: str,
     ) -> dict[str, Any]:
-        """Append a durable Markdown fact or note to the character's memory. Record coordinates, dimension, evidence, and uncertainty."""
+        """Append one durable Markdown note to this character's memory. Memory survives restarts, unlike waypoints. Use it for facts you want tomorrow: base coordinates, chest contents, routes, failures, and a journal.
+
+Parameters: kind is one of these: world (terrain and biomes), places (bases, mines, landmarks), routes (paths between places), chests (container locations and contents), failures (what went wrong and why), or journal (dated events).
+
+Write coordinates, dimension, evidence, and what you are unsure about. One note per call. Keep notes short and factual.
+
+When to use: after you build or find something important, and after you diagnose a bug or a trap.
+When not to use: for positions you need only this session (use add_waypoint, which is faster to read back)."""
         path = await asyncio.to_thread(runtime.home.append_note, kind, markdown)
         return {"ok": True, "kind": kind, "path": str(path), "writtenAt": utc_now()}
 
     @mcp.tool
     @log_action(runtime, 'suicide')
     async def minecraft_suicide(reason: str) -> ToolResult:
+        """Kill this character in the game to respawn at the world spawn point. Use it only to escape a trap you cannot leave alive: buried in gravel, sealed in stone, or stuck in a loop.
+
+Costs: the inventory drops at the death spot (peaceful mode keeps the world safe, but the items stay there until you collect them). Health and hunger reset at respawn.
+
+When to use: when every physical escape failed. First try stop, then walk tools, then fine_control through minecraft_call. Suicide is the last option.
+When not to use: as fast travel with a full inventory. Your items do not follow you."""
         return await runtime.suicide_avatar(reason, 120)
 
     @mcp.tool
@@ -3979,7 +4223,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         reason: Literal["cheated_item", "teleport", "operator_power", "character_broken", "other"],
         evidence: str,
     ) -> dict[str, Any]:
-        """Permanently retire this username after contamination. Preserve its logs and restart the MCP with a fresh numbered username."""
+        """Permanently retire this username after contamination. The logs stay, and the MCP restarts with a fresh numbered username.
+
+Contamination means the character gained an unfair state it cannot undo: cheated items, a teleport, or operator powers. Report the reason and the evidence.
+
+When to use: only after contamination. This action is permanent.
+When not to use: for a stuck bot (use suicide or stop), or for a bad session (just reconnect)."""
         if not evidence.strip():
             raise ValueError("evidence must describe what contaminated the character")
         runtime.retire_character(reason, {"evidence": evidence.strip(), "reportedBy": "agent"})
