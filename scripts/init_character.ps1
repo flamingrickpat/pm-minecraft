@@ -24,6 +24,10 @@ $draftSource = Join-Path $repoRoot "deploy\drafts"
 if (-not (Test-Path -LiteralPath $draftSource -PathType Container)) { throw "Example drafts are missing: $draftSource" }
 $exampleDrafts = @(Get-ChildItem -LiteralPath $draftSource -Filter "*.ts" -File)
 if ($exampleDrafts.Count -eq 0) { throw "Example drafts are missing: $draftSource" }
+# Markdown agent skills (survival, housing, etc.) deployed to .agents/skills so
+# the pm-coder harness (which discovers skills there) sees them on every run.
+$skillSource = Join-Path $repoRoot "deploy\agent_skills"
+if (-not (Test-Path -LiteralPath $skillSource -PathType Container)) { throw "Agent skills are missing: $skillSource" }
 $ports = @($MinecraftPort, $WebPort, $ViewerPort, $McpPort)
 if (($ports | Select-Object -Unique).Count -ne 4) { throw "Minecraft, web, viewer, and MCP ports must be distinct." }
 if (Test-Path -LiteralPath $root) {
@@ -35,6 +39,12 @@ foreach ($relative in @("drafts", "skills", "lib", "memory\minecraft", "artifact
 }
 New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
 Copy-Item -LiteralPath $sdk -Destination (Join-Path $root "lib\minecraft.ts")
+# Markdown agent skills -> .agents/skills/<name>/SKILL.md
+foreach ($skillDir in @(Get-ChildItem -LiteralPath $skillSource -Directory)) {
+    $destSkillDir = Join-Path $root ".agents\skills\$($skillDir.Name)"
+    New-Item -ItemType Directory -Path $destSkillDir -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $skillDir.FullName "SKILL.md") -Destination (Join-Path $destSkillDir "SKILL.md") -Force
+}
 # Deployed as working examples: they run as-is against this workspace's lib/minecraft.ts
 # and are the starting point for new drafts.
 foreach ($draft in $exampleDrafts) {

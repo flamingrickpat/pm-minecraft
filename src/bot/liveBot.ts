@@ -4,6 +4,7 @@ import type { RuntimeConfig } from "../config.js";
 import type { BotStateSnapshot } from "../server/state.js";
 import { createBotStateSnapshot } from "../state/botState.js";
 import { createChatInbox, type MinecraftMessage } from "../state/chatInbox.js";
+import { installPacketMonitor, type PacketMonitor } from "./packetMonitor.js";
 import type { RuntimeEvent } from "../server/http.js";
 import { controlNames, type CommandControls, type ControlName, type ControlStates } from "../commands/controls.js";
 import { createPhysicalCommandActions, installPathfinder, type PhysicalCommandActions } from "./actions.js";
@@ -24,6 +25,7 @@ export interface BotRuntime {
   status: BotStatus;
   commands: CommandControls;
   actions: PhysicalCommandActions;
+  packets: PacketMonitor;
   getState(): BotStateSnapshot;
   getMessages(): MinecraftMessage[];
   sendChat(text: string): Promise<void>;
@@ -54,6 +56,7 @@ export function createLiveBot(
     port: config.port,
     username: config.username,
     auth: "offline",
+    version: config.version ?? "1.19.4",
     viewDistance: config.viewDistance ?? 12
   });
   bot.once("inject_allowed", () => {
@@ -139,10 +142,19 @@ export function createLiveBot(
   return {
     bot,
     status,
+    packets: installPacketMonitor(bot, emit),
     commands: createCommandControls(bot, emit),
     actions: createPhysicalCommandActions(bot, {
       mineVisibilityIgnoreDistance: config.mineVisibilityIgnoreDistance,
-      maxChunkLimit: config.walkMaxChunks
+      maxChunkLimit: config.walkMaxChunks,
+      exactSearchBudgetMs: config.walkExactSearchTimeoutMs,
+      viewRadiusBlocks: Math.min(Math.round((config.viewDistance ?? 12) * 16 * Math.SQRT2), 256),
+      walkLog: (message) => {
+        emit({ type: "log", level: "info", message: `[walk] ${message}` });
+        // Also echo to stderr: the service wrapper captures it in body.log,
+        // which survives WebSocket-less debugging.
+        process.stderr.write(`[walk] ${message}\n`);
+      }
     }),
     getState: () => createBotStateSnapshot(bot, status),
     getMessages: () => chatInbox.messages(),

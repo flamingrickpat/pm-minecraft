@@ -11,11 +11,13 @@
  */
 export interface RuntimeConfig {
   minecraft: {
-    host: string; port: number; username: string; viewDistance?: number;
+    host: string; port: number; username: string; version: string; viewDistance?: number;
     /** mine_block skips its head-line-of-sight gate for targets within this many blocks (tunneling). */
     mineVisibilityIgnoreDistance: number;
-    /** Absolute cap (in chunks) on walk_to's search region; larger requested chunk_limit is rejected. */
+    /** Absolute cap (in chunks) on walk search regions; a requested chunk_limit above this is rejected. */
     walkMaxChunks: number;
+    /** A* compute budget in ms for walk_to_exact searches (the longest of the three walks). */
+    walkExactSearchTimeoutMs: number;
     /** A* compute budget in ms for each walk path search. */
     walkSearchTimeoutMs: number;
   };
@@ -32,6 +34,7 @@ export function parseRuntimeConfig(env: NodeJS.ProcessEnv): RuntimeConfig {
       host: textValue(env.MINECRAFT_HOST, "127.0.0.1", "MINECRAFT_HOST"),
       port: intValue(env.MINECRAFT_PORT, 55608, "MINECRAFT_PORT"),
       username: textValue(env.MINECRAFT_USERNAME, "turnbased-bot", "MINECRAFT_USERNAME"),
+      version: textValue(env.MINECRAFT_VERSION, "1.19.4", "MINECRAFT_VERSION"),
       viewDistance: intValue(env.MINECRAFT_VIEW_DISTANCE, 12, "MINECRAFT_VIEW_DISTANCE"),
       mineVisibilityIgnoreDistance: floatValue(
         env.MINECRAFT_MINE_VISIBILITY_IGNORE_DISTANCE,
@@ -42,6 +45,11 @@ export function parseRuntimeConfig(env: NodeJS.ProcessEnv): RuntimeConfig {
         env.MINECRAFT_WALK_MAX_CHUNKS,
         8,
         "MINECRAFT_WALK_MAX_CHUNKS"
+      ),
+      walkExactSearchTimeoutMs: intValue(
+        env.MINECRAFT_WALK_EXACT_SEARCH_TIMEOUT_MS,
+        8000,
+        "MINECRAFT_WALK_EXACT_SEARCH_TIMEOUT_MS"
       ),
       walkSearchTimeoutMs: intValue(
         env.MINECRAFT_WALK_SEARCH_TIMEOUT_MS,

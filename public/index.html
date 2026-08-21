@@ -598,7 +598,7 @@ function getCommandPayload(mode, target) {
     case 'look':
       return { url: '/api/command/look-at', body: { target: p }, name: 'look-at' };
     case 'walk':
-      return { url: '/api/command/walk-to', body: { target: p, tolerance: 1.5 }, name: 'walk-to' };
+      return { url: '/api/command/walk-to-visible', body: { target: p, tolerance: 1.5 }, name: 'walk-to-visible' };
     case 'mine':
       return { url: '/api/command/mine-block', body: { block: p, walkIntoRange: true }, name: 'mine-block' };
     case 'place':

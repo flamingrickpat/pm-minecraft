@@ -26,6 +26,17 @@ export interface HealthInput {
     lastSpawnAt?: string | null;
     lastError: string | null;
   };
+  /** Live packet-stream diagnostics from the packet monitor. */
+  network?: {
+    connected: boolean;
+    lastPacketAt: string | null;
+    lastPacketName: string | null;
+    packetsReceived: number;
+    lastWriteAt: string | null;
+    lastWriteName: string | null;
+    packetsWritten: number;
+    stalledMs: number | null;
+  };
   paper: { reachable: boolean; checkedAt: string | null; error: string | null };
   http?: { listening: boolean; host: string; port: number; url: string | null; error: string | null };
   webSocket?: { enabled: boolean; path: string; clients: number; error: string | null };
@@ -54,6 +65,7 @@ export interface HealthResponse {
     lastSpawnAt: string | null;
     lastError: string | null;
   };
+  network?: HealthInput["network"];
   paper: { reachable: boolean; checkedAt: string | null; error: string | null };
   http: { listening: boolean; host: string; port: number; url: string | null; error: string | null };
   webSocket: { enabled: boolean; path: string; clients: number; error: string | null };
@@ -85,6 +97,7 @@ export function serializeHealth(input: HealthInput): HealthResponse {
       lastDeathAt: input.bot.lastDeathAt ?? null,
       lastSpawnAt: input.bot.lastSpawnAt ?? null
     },
+    network: input.network ?? undefined,
     paper: input.paper,
     http,
     webSocket,

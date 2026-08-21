@@ -11,6 +11,7 @@ param(
 
     [string]$MinecraftHost = "127.0.0.1",
     [int]$MinecraftPort = 12345,
+    [string]$MinecraftVersion = "1.19.4",
     [string]$WebHost = "127.0.0.1",
     [int]$WebPort = 3000,
     [int]$ViewerPort = 3007,
@@ -19,7 +20,6 @@ param(
     [int]$ViewDistance = 24,
     [int]$MaxSkillCharacters = 50000,
     [float]$MineVisibilityIgnoreDistance = 3.0,
-    [float]$WalkToMaxDistance = 512.0,
     [float]$SkillTimeoutSeconds = 90.0,
     [switch]$EnableAntiStallGuard,
     [switch]$NoImages,
@@ -72,13 +72,13 @@ foreach ($port in @($WebPort, $ViewerPort, $McpPort)) {
 
 $arguments = @(
     "-m", $module, "--mc-host", $MinecraftHost, "--mc-port", $MinecraftPort,
+    "--mc-version", $MinecraftVersion,
     "--username", $Name, "--agent-home", $agentHome,
     "--artifact-root", $artifactRoot, "--web-host", $WebHost,
     "--web-port", $WebPort, "--viewer-port", $ViewerPort,
     "--mcp-host", $McpHost, "--mcp-port", $McpPort,
     "--max-skill-characters", $MaxSkillCharacters, "--view-distance", $ViewDistance,
     "--mine-visibility-ignore-distance", $MineVisibilityIgnoreDistance,
-    "--walk-to-max-distance", $WalkToMaxDistance,
     "--skill-timeout-seconds", $SkillTimeoutSeconds
 )
 if ($EnableAntiStallGuard) { $arguments += "--enable-anti-stall-guard" }

@@ -24,7 +24,7 @@ export interface FrameCaptureDependencies {
   viewer: Pick<ViewerStatus, "started" | "url" | "firstPerson" | "error">;
   bot: FrameBotSource | (() => FrameBotSource | null);
   minecraftVersion: () => string | null;
-  capturePng: (input: { url: string }) => Promise<CapturedPng>;
+  capturePng: (input: { url: string; hud?: string[] }) => Promise<CapturedPng>;
 }
 
 export interface FrameBotSource {
@@ -120,7 +120,7 @@ export function createFrameBundleCapture(dependencies: FrameCaptureDependencies)
 
       let captured: CapturedPng;
       try {
-        captured = await dependencies.capturePng({ url: dependencies.viewer.url });
+        captured = await dependencies.capturePng({ url: dependencies.viewer.url, hud: botHudLines(source.bot) });
       } catch (error) {
         return {
           ok: false,
@@ -163,6 +163,56 @@ export function createFrameBundleCapture(dependencies: FrameCaptureDependencies)
 
 function currentBot(source: FrameCaptureDependencies["bot"]): FrameBotSource | null {
   return typeof source === "function" ? source() : source;
+}
+
+const COMPASS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"] as const;
+
+/**
+ * Build the HUD lines rendered into every captured frame so the image alone
+ * answers "where am I, which way am I looking, am I about to die":
+ *   pos (70.5, 64.0, -215.3) | heading 143° SE | yaw 217.3° pitch -12.5°
+ *   biome savanna | day | hp 16.0/16 | food 18/20
+ * Yaw/pitch follow the same degree convention as the rotate tool (yaw [0,360)
+ * counterclockwise, pitch positive up); heading is the compass bearing.
+ */
+export function botHudLines(bot: Bot): string[] {
+  const entity = bot.entity;
+  if (!entity) return [];
+  const pos = entity.position;
+  const yawDeg = ((entity.yaw * 180 / Math.PI) % 360 + 360) % 360;
+  const pitchDeg = Math.max(-90, Math.min(90, entity.pitch * 180 / Math.PI));
+  // Compass bearing: mineflayer yaw 0 faces north (-Z), increasing
+  // counterclockwise, so the bearing is the negated yaw.
+  const headingDeg = Math.round((360 - yawDeg) % 360);
+  const cardinal = COMPASS[Math.round(headingDeg / 45) % 8];
+  const health = typeof bot.health === "number" ? bot.health : null;
+  const food = typeof bot.food === "number" ? bot.food : null;
+  const timeOfDay = (bot.time as { timeOfDay?: number } | undefined)?.timeOfDay;
+  const day = typeof timeOfDay === "number" ? (timeOfDay < 12542 || timeOfDay > 23459) : null;
+  const round = (v: number): number => Math.round(v * 10) / 10;
+  const line1 =
+    `pos (${round(pos.x)}, ${round(pos.y)}, ${round(pos.z)}) | ` +
+    `heading ${headingDeg}\u00b0 ${cardinal} | ` +
+    `yaw ${round(yawDeg)}\u00b0 pitch ${round(pitchDeg)}\u00b0`;
+  const parts = [`biome ${biomeAt(bot) ?? "?"}`];
+  if (day !== null) parts.push(day ? "day" : "night");
+  if (health !== null) parts.push(`hp ${round(health)}`);
+  if (food !== null) parts.push(`food ${food}`);
+  return [line1, parts.join(" | ")];
+}
+
+function biomeAt(bot: Bot): string | null {
+  try {
+    const world = (bot as Bot & { world?: { getBiome?: (p: Vec3) => number } }).world;
+    const registry = (bot as Bot & { registry?: { biomes?: Record<number, { name?: string }> } }).registry;
+    if (!world || typeof world.getBiome !== "function" || !registry?.biomes || !bot.entity) {
+      return null;
+    }
+    const biomeId = world.getBiome(bot.entity.position.floored());
+    return registry.biomes[biomeId]?.name ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function loadedWorldReference(bot: Bot): FrameMetadata["loadedWorld"] & { eye: FrameMetadata["botEyePosition"] } | null {

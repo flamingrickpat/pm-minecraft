@@ -7,7 +7,7 @@ import { createRuntimeHttpServer, type RuntimeEvent } from "./server/http.js";
 import type { HealthInput } from "./server/health.js";
 import { createViewerRuntime, type ViewerRuntime } from "./viewer/viewer.js";
 import { createBrowserFrameImageCapture } from "./viewer/browserCapture.js";
-import { createFrameBundleCapture } from "./targeting/frameBundle.js";
+import { botHudLines, createFrameBundleCapture } from "./targeting/frameBundle.js";
 import { createFrameMetadataFileStore, createPixelTargeting } from "./targeting/pixelTargeting.js";
 import { createInventoryService, type InventoryService } from "./inventory/inventoryService.js";
 import { createCraftingService, type CraftingService } from "./crafting/craftingService.js";
@@ -69,7 +69,10 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
         return null;
       }
       try {
-        const shot = await browserCapture.captureRaw({ url: viewer.status.url });
+        // The before/after evidence screenshots get the same crosshair + HUD
+        // overlay as the model-facing frames.
+        const hud = bot && bot.status.spawned && bot.bot.entity ? botHudLines(bot.bot) : undefined;
+        const shot = await browserCapture.captureRaw({ url: viewer.status.url, hud });
         return shot.png;
       } catch {
         return null;
@@ -152,11 +155,29 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
           }
           bot.actions.syncOrientation();
         },
-        walkTo: async (input, signal) => {
+        walkToVisible: async (input, signal) => {
           if (!bot || !bot.status.connected) {
             throw new Error("Bot is not connected.");
           }
-          return bot.actions.walkTo(input, signal);
+          return bot.actions.walkToVisible(input, signal);
+        },
+        walkToSurface: async (input, signal) => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.walkToSurface(input, signal);
+        },
+        walkToExact: async (input, signal) => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.walkToExact(input, signal);
+        },
+        scanHorizon: async (input) => {
+          if (!bot || !bot.status.connected) {
+            throw new Error("Bot is not connected.");
+          }
+          return bot.actions.scanHorizon(input);
         },
         findBlock: async (input) => {
           if (!bot || !bot.status.connected) {
@@ -315,6 +336,7 @@ function healthInput(
       version: null,
       lastError: "Mineflayer has not been started yet"
     },
+    network: bot ? bot.packets.stats() : undefined,
     paper,
     http: serverStatus.http,
     webSocket: serverStatus.webSocket,

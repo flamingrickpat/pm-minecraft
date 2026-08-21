@@ -1,5 +1,6 @@
 import type { Bot } from "mineflayer";
 import { Vec3 } from "vec3";
+import { globSuggest, hasWildcard } from "../bot/nameMatching.js";
 
 function vec3(x: number, y: number, z: number) {
   return new Vec3(x, y, z);
@@ -56,7 +57,17 @@ export function createCraftingService(bot: Bot): CraftingService {
     craftItem: async (itemName, repetitions) => {
       const registry = (bot as unknown as { registry?: { itemsByName?: Record<string, { id: number }> } }).registry;
       const item = registry?.itemsByName?.[itemName];
-      if (!item) return { ok: false, error: "unknown_item", message: `Unknown item name: ${itemName}.` };
+      if (!item) {
+        // Crafting stays exact ('craft *planks*' is genuinely ambiguous),
+        // but the failure teaches: list known items matching the pattern.
+        const known = Object.keys(registry?.itemsByName ?? {});
+        const suggestions = globSuggest(hasWildcard(itemName) ? itemName : `*${itemName}*`, known, 20);
+        return {
+          ok: false,
+          error: "unknown_item",
+          message: `Unknown item name: ${itemName}. Crafting needs an exact name.${suggestions.length > 0 ? ` Closest known items: ${suggestions.join(", ")}.` : ""}`
+        };
+      }
       const recipeBot = bot as unknown as {
         recipesFor: (itemType: number, metadata: number | null, minResultCount: number, craftingTable: unknown) => unknown[];
         craft: (recipe: unknown, count: number, craftingTable: unknown) => Promise<void>;

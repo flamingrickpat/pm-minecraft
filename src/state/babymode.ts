@@ -25,14 +25,29 @@ export interface BabymodeStatus {
 const BABYMODE_COMMAND = "/babymode status json";
 /** The mod answers instantly; a short timeout just avoids hanging forever when it is not installed. */
 const RESPONSE_TIMEOUT_MS = 1500;
+/**
+ * Minimum gap between real /babymode polls. State snapshots happen per command
+ * (before/after evidence), so unthrottled polling spams chat and vanilla
+ * servers kick the bot for spamming. The status drifts slowly; a short cache
+ * is invisible to consumers.
+ */
+const MIN_POLL_INTERVAL_MS = 2500;
+let lastPollAt = 0;
+let lastResult: BabymodeStatus | null = null;
 
 /** Ask the mod for its JSON status. Returns null when the mod is absent or unreachable. */
 export function fetchBabymodeStatus(bot: Bot): Promise<BabymodeStatus | null> {
+  const now = Date.now();
+  if (now - lastPollAt < MIN_POLL_INTERVAL_MS) {
+    return Promise.resolve(lastResult);
+  }
+  lastPollAt = now;
   return new Promise((resolve) => {
     let timer: NodeJS.Timeout | undefined;
     const onMessage = (message: string): void => {
       const parsed = parseBabymodeStatus(message);
       if (parsed) {
+        lastResult = parsed;
         stop();
         resolve(parsed);
       }

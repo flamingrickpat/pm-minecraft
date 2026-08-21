@@ -118,7 +118,19 @@ export function createRuntimeHttpServer(options: RuntimeHttpServerOptions): Runt
     webSocket: { enabled: true, path: "/ws", clients: 0, error: null }
   };
   const server = createServer((request, response) => {
-    void routeRequest(request, response, options);
+    routeRequest(request, response, options).catch((error) => {
+      // A route throwing (e.g. "Bot is not connected" right after a kick)
+      // must degrade to a 503, never kill the whole body process.
+      try {
+        writeJson(response, 503, {
+          ok: false,
+          error: "route_failed",
+          message: error instanceof Error ? error.message : String(error)
+        });
+      } catch {
+        // response already sent — nothing more we can do
+      }
+    });
   });
   server.on("upgrade", (request, socket) => {
     if (request.url !== "/ws") {
@@ -237,8 +249,16 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
     await syncOrientationCommand(response, options);
     return;
   }
-  if (request.method === "POST" && request.url === "/api/command/walk-to") {
-    await queuedAction(request, response, options, "walk_to", (body) => parseWalkTo(body, options.commands?.maxChunkLimit), (actions, input, signal) => actions.walkTo(input, signal));
+  if (request.method === "POST" && request.url === "/api/command/walk-to-visible") {
+    await queuedAction(request, response, options, "walk_to_visible", (body) => parseWalkToVisible(body, options.commands?.maxChunkLimit), (actions, input, signal) => actions.walkToVisible(input, signal));
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/command/walk-to-surface") {
+    await queuedAction(request, response, options, "walk_to_surface", parseWalkToSurface, (actions, input, signal) => actions.walkToSurface(input, signal));
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/command/walk-to-exact") {
+    await queuedAction(request, response, options, "walk_to_exact", parseWalkToExact, (actions, input, signal) => actions.walkToExact(input, signal));
     return;
   }
   if (request.method === "POST" && request.url === "/api/world/find-block") {
@@ -247,6 +267,10 @@ async function routeRequest(request: IncomingMessage, response: ServerResponse, 
   }
   if (request.method === "POST" && request.url === "/api/world/interactables") {
     await findInteractables(request, response, options);
+    return;
+  }
+  if (request.method === "POST" && request.url === "/api/world/scan-horizon") {
+    await scanHorizonCommand(request, response, options);
     return;
   }
   if (request.method === "POST" && request.url === "/api/command/mine-block") {
@@ -686,11 +710,8 @@ async function raycastCommand(request: IncomingMessage, response: ServerResponse
     writeJson(response, 400, { ok: false, error: "invalid_json", message: parsed.message });
     return;
   }
-  const maxDistance = typeof parsed.body.maxDistance === "number" && Number.isFinite(parsed.body.maxDistance)
-    ? parsed.body.maxDistance
-    : 64;
-  const result = await options.commands.actions.raycast(maxDistance);
-  await recordReadonlyCommand(options, "raycast", { maxDistance }, result);
+  const result = await options.commands.actions.raycast();
+  await recordReadonlyCommand(options, "raycast", {}, result);
   writeJson(response, result.ok ? 200 : 400, result);
 }
 
@@ -743,6 +764,32 @@ async function findInteractables(request: IncomingMessage, response: ServerRespo
 
   const result = await options.commands.actions.findInteractables(input.value);
   await recordReadonlyCommand(options, "find_interactables", input.value, result);
+  writeJson(response, 200, result);
+}
+
+async function scanHorizonCommand(request: IncomingMessage, response: ServerResponse, options: RuntimeHttpServerOptions): Promise<void> {
+  if (!options.commands) {
+    writeJson(response, 503, {
+      ok: false,
+      error: "commands_unavailable",
+      message: "Commands are unavailable because the bot runtime is not ready."
+    });
+    return;
+  }
+
+  const parsed = await readJson(request);
+  if (!parsed.ok) {
+    writeJson(response, 400, { ok: false, error: "invalid_json", message: parsed.message });
+    return;
+  }
+  const input = parseScanHorizon(parsed.body);
+  if (!input.ok) {
+    writeJson(response, 400, { ok: false, error: input.error, message: input.message });
+    return;
+  }
+
+  const result = await options.commands.actions.scanHorizon(input.value);
+  await recordReadonlyCommand(options, "scan_horizon", input.value, result);
   writeJson(response, 200, result);
 }
 
@@ -1042,16 +1089,18 @@ async function handleFurnaceSmelt(request: IncomingMessage, response: ServerResp
   const fuelItemName = typeof parsed.body.fuelItemName === "string" ? parsed.body.fuelItemName.trim() : "";
   const inputCount = parsed.body.inputCount;
   const fuelCount = parsed.body.fuelCount;
-  const timeoutMs = parsed.body.timeoutMs ?? 60000;
-  if (!inputItemName || !fuelItemName || !Number.isInteger(inputCount) || (inputCount as number) <= 0 || !Number.isInteger(fuelCount) || (fuelCount as number) <= 0 || !Number.isInteger(timeoutMs) || (timeoutMs as number) <= 0) {
+  if (!inputItemName || !fuelItemName || !Number.isInteger(inputCount) || (inputCount as number) <= 0 || !Number.isInteger(fuelCount) || (fuelCount as number) <= 0) {
     writeJson(response, 400, {
       ok: false,
       error: "invalid_smelting_request",
-      message: "inputItemName and fuelItemName must be non-empty; inputCount, fuelCount, and timeoutMs must be positive integers."
+      message: "inputItemName and fuelItemName must be non-empty; inputCount and fuelCount must be positive integers."
     });
     return;
   }
-  const outcome = await options.crafting.smelt(inputItemName, inputCount as number, fuelItemName, fuelCount as number, timeoutMs as number);
+  // Smelt time is deterministic server-side (10s per item plus margin); the
+  // timeout is a safety budget the caller never has to guess.
+  const timeoutMs = Math.max(60_000, (inputCount as number) * 10_000 + 30_000);
+  const outcome = await options.crafting.smelt(inputItemName, inputCount as number, fuelItemName, fuelCount as number, timeoutMs);
   writeJson(response, outcome.ok ? 200 : 400, outcome);
 }
 
@@ -1221,7 +1270,7 @@ async function resolvePixelTarget(request: IncomingMessage, response: ServerResp
     return;
   }
 
-  const result = await options.targeting.resolve(input.value);
+  const result = await options.targeting.resolve({ ...input.value, maxDistance: input.value.maxDistance ?? 256 });
   if (result.ok) {
     writeJson(response, 200, result);
     return;
@@ -1274,7 +1323,11 @@ function parseLook(body: Record<string, unknown>): Parsed<{ yaw: number; pitch: 
   return { ok: true, value: { yaw, pitch } };
 }
 
-function parseWalkTo(body: Record<string, unknown>, maxChunkLimit = 8): Parsed<{ target: Vector3; tolerance: number; chunkLimit: number }> {
+function parseScanHorizon(_body: Record<string, unknown>): Parsed<Record<string, never>> {
+  return { ok: true, value: {} };
+}
+
+function parseWalkToVisible(body: Record<string, unknown>, maxChunkLimit = 8): Parsed<{ target: Vector3; tolerance?: number; chunkLimit?: number }> {
   const target = parseVector(body.target, "target", false);
   if (!target.ok) {
     return target;
@@ -1283,7 +1336,7 @@ function parseWalkTo(body: Record<string, unknown>, maxChunkLimit = 8): Parsed<{
   if (!tolerance.ok) {
     return tolerance;
   }
-  const chunkLimit = (body.chunkLimit ?? 3) as unknown;
+  const chunkLimit = (body.chunkLimit ?? maxChunkLimit) as unknown;
   if (typeof chunkLimit !== "number" || !Number.isInteger(chunkLimit) || chunkLimit < 1) {
     return { ok: false, error: "invalid_chunk_limit", message: "chunkLimit must be a positive integer (chunks)." };
   }
@@ -1297,34 +1350,62 @@ function parseWalkTo(body: Record<string, unknown>, maxChunkLimit = 8): Parsed<{
   return { ok: true, value: { target: target.value, tolerance: tolerance.value, chunkLimit } };
 }
 
+function finiteCoordinate(body: Record<string, unknown>, field: string): Parsed<number> {
+  const value = body[field];
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return { ok: false, error: `invalid_${field.toLowerCase()}`, message: `${field} must be a finite number.` };
+  }
+  return { ok: true, value };
+}
+
+function parseWalkToSurface(body: Record<string, unknown>): Parsed<{ x: number; z: number; tolerance?: number }> {
+  const x = finiteCoordinate(body, "x");
+  if (!x.ok) {
+    return x;
+  }
+  const z = finiteCoordinate(body, "z");
+  if (!z.ok) {
+    return z;
+  }
+  const tolerance = optionalPositiveNumber(body.tolerance, 1.5, "invalid_tolerance", "tolerance must be a positive number.");
+  if (!tolerance.ok) {
+    return tolerance;
+  }
+  return { ok: true, value: { x: x.value, z: z.value, tolerance: tolerance.value } };
+}
+
+function parseWalkToExact(body: Record<string, unknown>): Parsed<{ target: Vector3; tolerance?: number }> {
+  const target = parseVector(body.target, "target", false);
+  if (!target.ok) {
+    return target;
+  }
+  const tolerance = optionalPositiveNumber(body.tolerance, 1.0, "invalid_tolerance", "tolerance must be a positive number.");
+  if (!tolerance.ok) {
+    return tolerance;
+  }
+  return { ok: true, value: { target: target.value, tolerance: tolerance.value } };
+}
+
 function parseMineBlock(body: Record<string, unknown>): Parsed<{ block: Vector3; walkIntoRange: boolean }> {
   const block = parseBlockTarget(body, "block");
   if (!block.ok) {
     return block;
   }
-  return { ok: true, value: { block: block.value, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
+  return { ok: true, value: { block: block.value, walkIntoRange: booleanValue(body.walkIntoRange, true) } };
 }
 
-function parseInteractables(body: Record<string, unknown>): Parsed<{ maxDistance: number }> {
-  const maxDistance = body.maxDistance ?? 16;
-  if (typeof maxDistance !== "number" || !Number.isFinite(maxDistance) || maxDistance < 1 || maxDistance > 64) {
-    return { ok: false, error: "invalid_max_distance", message: "maxDistance must be between 1 and 64." };
-  }
-  return { ok: true, value: { maxDistance } };
+function parseInteractables(_body: Record<string, unknown>): Parsed<Record<string, never>> {
+  return { ok: true, value: {} };
 }
 
-function parseFindBlock(body: Record<string, unknown>): Parsed<{ blockName: string; maxDistance: number; requireVisible: boolean }> {
+function parseFindBlock(body: Record<string, unknown>): Parsed<{ blockName: string }> {
   const blockName = typeof body.blockName === "string" ? body.blockName.trim() : "";
   if (!blockName) {
-    return { ok: false, error: "invalid_block_name", message: "blockName must be a non-empty string." };
-  }
-  const maxDistance = typeof body.maxDistance === "number" ? body.maxDistance : 32;
-  if (!Number.isFinite(maxDistance) || maxDistance < 1 || maxDistance > 256) {
-    return { ok: false, error: "invalid_max_distance", message: "maxDistance must be between 1 and 256." };
+    return { ok: false, error: "invalid_block_name", message: "blockName must be a non-empty string (globs like '*log*' allowed)." };
   }
   // Anti-x-ray is hard-locked server-side: callers (including skills, which
   // talk to this HTTP API directly) cannot disable line-of-sight filtering.
-  return { ok: true, value: { blockName, maxDistance, requireVisible: true } };
+  return { ok: true, value: { blockName } };
 }
 
 function parsePlaceBlock(body: Record<string, unknown>): Parsed<{ referenceBlock: Vector3; face: Vector3; walkIntoRange: boolean }> {
@@ -1339,7 +1420,7 @@ function parsePlaceBlock(body: Record<string, unknown>): Parsed<{ referenceBlock
   if (!isFace(face.value)) {
     return { ok: false, error: "invalid_face", message: "face must be an axis-aligned unit vector." };
   }
-  return { ok: true, value: { referenceBlock: referenceBlock.value, face: face.value, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
+  return { ok: true, value: { referenceBlock: referenceBlock.value, face: face.value, walkIntoRange: booleanValue(body.walkIntoRange, true) } };
 }
 
 function parseUseBlock(body: Record<string, unknown>): Parsed<{ block: Vector3; walkIntoRange: boolean }> {
@@ -1347,7 +1428,7 @@ function parseUseBlock(body: Record<string, unknown>): Parsed<{ block: Vector3; 
   if (!block.ok) {
     return block;
   }
-  return { ok: true, value: { block: block.value, walkIntoRange: booleanValue(body.walkIntoRange, false) } };
+  return { ok: true, value: { block: block.value, walkIntoRange: booleanValue(body.walkIntoRange, true) } };
 }
 
 function parseUseItem(body: Record<string, unknown>): Parsed<Record<string, never>> {
@@ -1370,19 +1451,15 @@ function parseChestInput(body: Record<string, unknown>): Parsed<{ itemName: stri
   return { ok: true, value: { itemName, count } };
 }
 
-function parseAttackEntity(body: Record<string, unknown>): Parsed<{ entityId: number; walkIntoRange: boolean; renavigationCount: number }> {
+function parseAttackEntity(body: Record<string, unknown>): Parsed<{ entityId: number; walkIntoRange?: boolean }> {
   const entityId = body.entityId;
   if (!Number.isInteger(entityId) || typeof entityId !== "number" || entityId < 0) {
     return { ok: false, error: "invalid_entity_id", message: "entityId must be a non-negative integer from a fresh observation." };
   }
-  const renavigationCount = optionalPositiveNumber(body.renavigationCount ?? 3, 3, "invalid_renavigation_count", "renavigationCount must be a positive number.");
-  if (!renavigationCount.ok) {
-    return renavigationCount;
-  }
-  return { ok: true, value: { entityId, walkIntoRange: booleanValue(body.walkIntoRange, false), renavigationCount: Math.round(renavigationCount.value) } };
+  return { ok: true, value: { entityId, walkIntoRange: booleanValue(body.walkIntoRange, true) } };
 }
 
-function parsePixelTarget(body: Record<string, unknown>): Parsed<{ frameId: string; x: number; y: number; maxDistance: number }> {
+function parsePixelTarget(body: Record<string, unknown>): Parsed<{ frameId: string; x: number; y: number; maxDistance?: number }> {
   const frameId = typeof body.frameId === "string" ? body.frameId.trim() : "";
   if (!/^[A-Za-z0-9_-]+$/.test(frameId)) {
     return { ok: false, error: "invalid_frame_id", message: "frameId must be a non-empty frame identifier." };
@@ -1392,10 +1469,11 @@ function parsePixelTarget(body: Record<string, unknown>): Parsed<{ frameId: stri
   if (typeof x !== "number" || typeof y !== "number" || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
     return { ok: false, error: "invalid_pixel", message: "x and y must be finite non-negative pixel coordinates." };
   }
-  const maxDistance = body.maxDistance;
-  if (typeof maxDistance !== "number" || !Number.isFinite(maxDistance) || maxDistance <= 0) {
-    return { ok: false, error: "invalid_max_distance", message: "maxDistance must be a positive number." };
-  }
+  // Ray length defaults to the full perception radius; callers never need to
+  // guess a distance.
+  const maxDistance = typeof body.maxDistance === "number" && Number.isFinite(body.maxDistance) && body.maxDistance > 0
+    ? body.maxDistance
+    : undefined;
   return { ok: true, value: { frameId, x, y, maxDistance } };
 }
 

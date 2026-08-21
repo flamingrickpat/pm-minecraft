@@ -2,7 +2,8 @@ import type { Bot } from "mineflayer";
 import pathfinderPackage from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
 import type { CommandResult } from "../commands/commandQueue.js";
-import type { AttackEntityInput, ChestInput, FindBlockInput, JumpPlaceBlockInput, MineBlockInput, PlaceBlockInput, UseBlockInput, Vector3, WalkToInput } from "../commands/types.js";
+import type { AttackEntityInput, ChestInput, FindBlockInput, JumpPlaceBlockInput, MineBlockInput, PlaceBlockInput, UseBlockInput, Vector3, WalkToExactInput, WalkToSurfaceInput, WalkToVisibleInput } from "../commands/types.js";
+import { describeMatches, globResolve, globSuggest, hasWildcard } from "./nameMatching.js";
 import { isVisibleFromHead } from "../perception/visibility.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
@@ -23,6 +24,10 @@ export interface NavigationReport {
   drops: number;
   stalled: boolean;
   diagnosis: string;
+  /** Closest standable position the search actually reached (failures only). */
+  closestApproach?: Vector3;
+  /** 3D distance from closestApproach to the requested target (failures only). */
+  remainingDistance?: number;
 }
 
 class NavigationFailure extends Error {
@@ -59,9 +64,12 @@ export interface PhysicalCommandActions {
   look(input: { yaw: number; pitch: number }): Promise<CommandResult>;
   getOrientation(): { yaw: number; pitch: number };
   syncOrientation(): void;
-  walkTo(input: WalkToInput, signal?: AbortSignal): Promise<CommandResult>;
+  walkToVisible(input: WalkToVisibleInput, signal?: AbortSignal): Promise<CommandResult>;
+  walkToSurface(input: WalkToSurfaceInput, signal?: AbortSignal): Promise<CommandResult>;
+  walkToExact(input: WalkToExactInput, signal?: AbortSignal): Promise<CommandResult>;
   findBlock(input: FindBlockInput): Promise<CommandResult>;
-  findInteractables(input: { maxDistance: number }): Promise<CommandResult>;
+  findInteractables(input: { maxDistance?: number }): Promise<CommandResult>;
+  scanHorizon(input: { maxDistance?: number }): Promise<CommandResult>;
   mineBlock(input: MineBlockInput): Promise<CommandResult>;
   placeBlock(input: PlaceBlockInput): Promise<CommandResult>;
   jumpPlaceBlock(input: JumpPlaceBlockInput): Promise<CommandResult>;
@@ -114,13 +122,20 @@ export function createPhysicalCommandActions(
   bot: Bot,
   options: {
     mineVisibilityIgnoreDistance: number;
-    /** Absolute cap (in chunks) on walk_to's reach; a requested chunk_limit above this is rejected. */
+    /** Absolute cap (in chunks) on walk search regions; a requested chunk_limit above this is rejected. */
     maxChunkLimit: number;
+    /** A* compute budget (ms) for walk_to_exact searches — the longest of the three walks. */
+    exactSearchBudgetMs?: number;
+    /** Perception radius in blocks (render distance x sqrt(2) chunk widths, capped 256). Derived by the body; never a model-facing parameter. */
+    viewRadiusBlocks?: number;
+    /** Optional structured logger for walk-family commands (gotoNear, hops, stalls, door retries). */
+    walkLog?: (message: string) => void;
   } = {
     mineVisibilityIgnoreDistance: 3.0,
     maxChunkLimit: 8
   }
 ): PhysicalCommandActions {
+  const wlog = options.walkLog ?? ((_message: string) => undefined);
   // Track intended yaw/pitch so getOrientation() is not affected by server
   // position corrections that overwrite bot.entity.yaw/pitch.
   //
@@ -186,24 +201,26 @@ export function createPhysicalCommandActions(
       // or when the UI needs to re-establish the baseline orientation.
       syncTrackedFromEntity();
     },
-    walkTo: async ({ target, tolerance, chunkLimit }, signal) => {
+    walkToVisible: async ({ target, tolerance = 1.5, chunkLimit }, signal) => {
       const startPosition = bot.entity.position;
+      wlog(`walk_to_visible start pos=${fmtVec(startPosition)} target=${fmtVec(target)} tolerance=${tolerance}`);
       // Already there? Return immediately without searching.
       if (distXZ(startPosition, target) <= tolerance) {
         return { ok: true, message: "Already within tolerance of target.", data: { status: "reached", position: vector(startPosition), target } };
       }
-      const limit = Math.min(Math.max(1, Math.round(chunkLimit ?? DEFAULT_CHUNK_LIMIT)), options.maxChunkLimit);
+      const limit = Math.min(Math.max(1, Math.round(chunkLimit ?? options.maxChunkLimit)), options.maxChunkLimit);
       const region = navigationRegion(bot, limit);
       // Fail instantly if the target is outside the search region.
       if (
         target.x < region.minX || target.x > region.maxX ||
         target.z < region.minZ || target.z > region.maxZ
       ) {
+        const clamped = clampToRegionXZ(vec(target), region);
         return {
           ok: false,
           reason: "target_too_far",
-          message: `Target is outside the ${limit}-chunk walk search region (limit: ${limit} chunk(s)). Move closer or raise chunk_limit.`,
-          data: { status: "too_far", position: vector(startPosition), target, chunkLimit: limit }
+          message: `target ${fmtVec(target)} is outside the ${limit}-chunk (${limit * CHUNK + 2}-block radius) walk search region around your position ${fmtVec(startPosition)}. this tool only walks within that region. use walk_to_surface(x, z) for long-range travel: it chains hops automatically and never fails on distance alone. closest coordinate valid for walk_to_visible from here: x: ${Math.round(clamped.x)}, z: ${Math.round(clamped.z)}.`,
+          data: { status: "too_far", position: vector(startPosition), target, chunkLimit: limit, clampedTarget: vector(clamped) }
         };
       }
       // Find safe standable cells in a sphere (radius 5) around the target,
@@ -213,19 +230,21 @@ export function createPhysicalCommandActions(
       // reachable nearby cell instead of failing outright.
       const candidates = findStandableCells(bot, target);
       if (candidates.length === 0) {
+        const report = checkStandability(bot, vec(target));
         return {
           ok: false,
           reason: "target_not_standable",
-          message: "No safe standable block was found near the target; nothing to walk to.",
-          data: { status: "not_standable", position: vector(startPosition), target }
+          message: `no safe standable cell within 5 blocks of ${fmtVec(target)}: target block ${report.floorBlock}, blocks above: [${report.blocksAbove.join(", ")}] (${describeStandabilityIssues(report.issues)}). pick a nearby coordinate on solid ground, or use walk_to_surface(x, z) which finds the surface for you.`,
+          data: { status: "not_standable", position: vector(startPosition), target, standability: report }
         };
       }
       // Try pathfinding to each candidate in proximity order and use the first
       // one that is actually reachable on foot.
-      const attempts: Array<{ standable: Vector3; reason: string; message: string }> = [];
+      const attempts: Array<{ standable: Vector3; reason: string; message: string; navigation?: NavigationReport }> = [];
       for (const cell of candidates) {
         try {
-          const navigation = await gotoNear(bot, cell, Math.min(tolerance, 1.5), region, signal);
+          wlog(`walk_to_visible attempting standable cell ${fmtVec(cell)} (${candidates.indexOf(cell) + 1}/${candidates.length})`);
+          const navigation = await gotoNear(bot, cell, Math.min(tolerance, 1.5), region, signal, undefined, wlog);
           const snapped = Math.floor(cell.x) !== Math.floor(target.x)
             || Math.floor(cell.y) !== Math.floor(target.y)
             || Math.floor(cell.z) !== Math.floor(target.z);
@@ -244,17 +263,21 @@ export function createPhysicalCommandActions(
             }
           };
         } catch (error) {
+          wlog(`walk_to_visible cell ${fmtVec(cell)} failed: ${navigationReason(error)}: ${errorMessage(error).slice(0, 160)}`);
           attempts.push({
             standable: vector(cell),
             reason: navigationReason(error),
-            message: error instanceof Error ? error.message : String(error)
+            message: errorMessage(error),
+            navigation: error instanceof NavigationFailure ? error.report : undefined
           });
         }
       }
+      const firstNav = attempts.find((a) => a.navigation)?.navigation;
+      const closest = firstNav?.closestApproach;
       return {
         ok: false,
         reason: "no_paths_findable",
-        message: `None of the ${candidates.length} safe standable cell(s) near the target are reachable on foot (e.g. across a ravine or wall). Use staircase/pillar or pick a different approach.`,
+        message: `no path found to any of the ${candidates.length} standable cell(s) near ${fmtVec(target)}. ${attempts.slice(0, 3).map((a, i) => `attempt ${i + 1} -> ${fmtVec(a.standable)}: ${a.message}`).join(" ")}${closest ? ` closest reachable standable position overall: ${fmtVec(closest)}, ${round1(firstNav?.remainingDistance ?? 0)} blocks (3D) from the target — a valid walk_to_exact target. ` : " "}${ravineHint(firstNav)}suggestions: approach from a different angle, staircase/pillar over the obstacle, or use walk_to_surface for a different landing spot.`,
         data: {
           status: "failed",
           position: vector(bot.entity.position),
@@ -265,25 +288,276 @@ export function createPhysicalCommandActions(
         }
       };
     },
-    findBlock: async ({ blockName, maxDistance }) => {
-      const registry = (bot as Bot & { registry?: { blocksByName?: Record<string, { id: number }> } }).registry;
-      const blockId = registry?.blocksByName?.[blockName]?.id;
-      if (typeof blockId !== "number") {
-        return failed("unknown_block", `Unknown block name: ${blockName}`, { blockName });
+    walkToSurface: async ({ x, z, tolerance = 1.5 }, signal) => {
+      const requested = { x, z };
+      const hops: Array<{ from: Vector3; to: Vector3; status: string; pathNodes: number; ascents: number; drops: number }> = [];
+      let lastDistance = distXZ(bot.entity.position, requested);
+      let noProgressHops = 0;
+      let initialDistance = lastDistance;
+      while (hops.length < SURFACE_MAX_HOPS) {
+        const position = bot.entity.position;
+        const distanceToRequested = distXZ(position, requested);
+        if (distanceToRequested <= tolerance) {
+          return {
+            ok: true,
+            message: `Reached the surface at ${fmtVec(position)} (${round1(distanceToRequested)} blocks from the requested point).`,
+            data: {
+              status: "reached",
+              position: vector(position),
+              requested: { x, z },
+              hops: hops.length,
+              hopLog: hops,
+              traveled: round1(initialDistance > distanceToRequested ? initialDistance - distanceToRequested : 0)
+            }
+          };
+        }
+        // Distant targets have unloaded chunks: the sky-scan cannot see the
+        // surface there yet. Walk toward an intermediate point well inside the
+        // loaded area and loop — the scan repeats once the terrain loads.
+        if (scanSurfaceColumn(bot, Math.floor(x), Math.floor(z)).status === "unloaded") {
+          const dx = x - position.x;
+          const dz = z - position.z;
+          const step = Math.min(distanceToRequested, INTERMEDIATE_HOP_BLOCKS);
+          const length = Math.hypot(dx, dz) || 1;
+          const intermediate = new Vec3(
+            position.x + (dx / length) * step,
+            position.y,
+            position.z + (dz / length) * step
+          );
+          const region = navigationRegion(bot, options.maxChunkLimit);
+          try {
+            const navigation = await gotoNear(bot, intermediate, 4, region, signal);
+            hops.push({
+              from: vector(position),
+              to: vector(intermediate),
+              status: navigation.pathStatus,
+              pathNodes: navigation.pathNodes,
+              ascents: navigation.ascents,
+              drops: navigation.drops
+            });
+            const newDistance = distXZ(bot.entity.position, requested);
+            if (newDistance >= lastDistance - 0.5) {
+              noProgressHops += 1;
+              if (noProgressHops >= SURFACE_MAX_NO_PROGRESS_HOPS) {
+                return failed("surface_no_progress", `walk_to_surface stopped making progress toward (${x}, ${z}): still ${round1(newDistance)} blocks away after ${hops.length} hop(s) — the target area is not loaded and intermediate hops stopped advancing. walk partway manually (walk_to_surface on a closer point) and retry.`, {
+                  status: "no_progress",
+                  position: vector(bot.entity.position),
+                  requested,
+                  hops: hops.length,
+                  hopLog: hops
+                });
+              }
+            } else {
+              noProgressHops = 0;
+            }
+            lastDistance = newDistance;
+            continue;
+          } catch (error) {
+            const navigation = error instanceof NavigationFailure ? error.report : undefined;
+            const closest = navigation?.closestApproach;
+            return failed(navigationReason(error), `no path found while approaching (${x}, ${z}) — its chunks are not loaded yet, so the walk routes over intermediate ground. ${errorMessage(error)}${closest ? ` closest reachable standable position: ${fmtVec(closest)} — a valid walk_to_exact target; from there, retry walk_to_surface(${x}, ${z}).` : ""} ${ravineHint(navigation)}progress: ${hops.length} hop(s) completed.`, {
+              status: "failed",
+              position: vector(bot.entity.position),
+              requested,
+              navigation,
+              hops: hops.length,
+              hopLog: hops
+            });
+          }
+        }
+        // Surface-scan the requested column, spiralling outward when it is
+        // water/lava/canopy. The scan runs in loaded chunks around the bot.
+        const surface = findSurfaceTarget(bot, Math.floor(x), Math.floor(z), SURFACE_SEARCH_RADIUS);
+        if (!surface.cell) {
+          return failed("no_standable_surface", describeSurfaceFailure(requested, surface.stats), {
+            status: "not_standable",
+            position: vector(position),
+            requested,
+            searchedRadius: SURFACE_SEARCH_RADIUS,
+            columnStats: surface.stats,
+            hops: hops.length,
+            hopLog: hops
+          });
+        }
+        // Terminal case: we are already standing as close as the terrain
+        // allows (the requested point itself is liquid/canopy).
+        if (distXZ(position, surface.cell) <= Math.min(tolerance, 1.5)) {
+          return {
+            ok: true,
+            message: `Reached the closest standable surface to (${x}, ${z}): standing at ${fmtVec(position)}, ${round1(distanceToRequested)} blocks away. the requested point itself is ${surface.surface.name} (${surface.surface.type}) and cannot be stood on.`,
+            data: {
+              status: "reached_nearest_standable",
+              position: vector(position),
+              requested,
+              standable: vector(surface.cell),
+              requestedSurface: surface.surface,
+              hops: hops.length,
+              hopLog: hops
+            }
+          };
+        }
+        // Clamp far goals to the current search region and keep hopping: the
+        // region re-centers on the bot after every hop, so distance alone
+        // never fails a walk_to_surface.
+        const region = navigationRegion(bot, options.maxChunkLimit);
+        const outside =
+          surface.cell.x < region.minX || surface.cell.x > region.maxX ||
+          surface.cell.z < region.minZ || surface.cell.z > region.maxZ;
+        const goal = outside ? clampToRegionXZ(surface.cell, region) : surface.cell;
+        try {
+          const navigation = await gotoNear(
+            bot,
+            goal,
+            outside ? 4 : Math.min(tolerance, 1.5),
+            region,
+            signal
+          );
+          hops.push({
+            from: vector(position),
+            to: vector(goal),
+            status: navigation.pathStatus,
+            pathNodes: navigation.pathNodes,
+            ascents: navigation.ascents,
+            drops: navigation.drops
+          });
+        } catch (error) {
+          const navigation = error instanceof NavigationFailure ? error.report : undefined;
+          const closest = navigation?.closestApproach;
+          return failed(
+            navigationReason(error),
+            `no path found while walking to the surface near (${x}, ${z})${outside ? " (goal clamped to the edge of the current search region)" : ""}. ${errorMessage(error)}${closest ? ` closest reachable standable position: ${fmtVec(closest)} — a valid walk_to_exact target; from there, retry walk_to_surface(${x}, ${z}).` : ""} ${ravineHint(navigation)}progress: ${hops.length} hop(s) completed, ${round1(initialDistance - distXZ(bot.entity.position, requested))} of ${round1(initialDistance)} blocks covered.`,
+            {
+              status: "failed",
+              position: vector(bot.entity.position),
+              requested,
+              standable: vector(surface.cell),
+              navigation,
+              hops: hops.length,
+              hopLog: hops
+            }
+          );
+        }
+        const newDistance = distXZ(bot.entity.position, requested);
+        if (newDistance >= lastDistance - 0.5) {
+          noProgressHops += 1;
+          if (noProgressHops >= SURFACE_MAX_NO_PROGRESS_HOPS) {
+            return failed("surface_no_progress", `walk_to_surface stopped making progress toward (${x}, ${z}): still ${round1(newDistance)} blocks away after ${hops.length} hop(s). the terrain between here and there probably needs digging, bridging, or pillaring (walk_to_visible to a closer point, then reassess). ${ravineHint(summarizeHopLog(hops))}`, {
+              status: "no_progress",
+              position: vector(bot.entity.position),
+              requested,
+              hops: hops.length,
+              hopLog: hops
+            });
+          }
+        } else {
+          noProgressHops = 0;
+        }
+        lastDistance = newDistance;
       }
+      return failed("surface_hop_limit", `walk_to_surface reached its ${SURFACE_MAX_HOPS}-hop limit while traveling to (${x}, ${z}): ${round1(distXZ(bot.entity.position, requested))} blocks remain. call walk_to_surface(${x}, ${z}) again to continue.`, {
+        status: "hop_limit",
+        position: vector(bot.entity.position),
+        requested,
+        hops: hops.length,
+        hopLog: hops
+      });
+    },
+    walkToExact: async ({ target, tolerance = 1.0 }, signal) => {
+      const startPosition = bot.entity.position;
+      wlog(`walk_to_exact start pos=${fmtVec(startPosition)} target=${fmtVec(target)} tolerance=${tolerance}`);
+      const cell = new Vec3(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z));
+      const exact = checkStandability(bot, cell);
+      let goal = cell;
+      let snapped: Vector3 | null = null;
+      if (!exact.standable) {
+        // The saved position may be off by a block (mined out, pillared up,
+        // flooded): look for a standable cell within 3 blocks of it.
+        const alternatives = findStandableCells(bot, vector(cell), 3)
+          .slice()
+          .sort((a, b) => a.distanceTo(cell) - b.distanceTo(cell));
+        if (alternatives.length === 0) {
+          return failed("target_not_standable", `target not standable: target block ${exact.floorBlock}, blocks above: [${exact.blocksAbove.join(", ")}] (${describeStandabilityIssues(exact.issues)}). no standable cell within 3 blocks either — the saved position is probably stale (mined out, pillared up, or flooded). re-observe the area, update your notes, and retry with corrected coordinates.`, {
+            status: "not_standable",
+            position: vector(startPosition),
+            target,
+            standability: exact,
+            searchedRadius: 3
+          });
+        }
+        goal = alternatives[0];
+        snapped = vector(goal);
+      }
+      const region = navigationRegion(bot, options.maxChunkLimit);
+      if (
+        goal.x < region.minX || goal.x > region.maxX ||
+        goal.z < region.minZ || goal.z > region.maxZ
+      ) {
+        const clamped = clampToRegionXZ(goal, region);
+        return failed("outside_pathfinding_range", `target ${fmtVec(goal)} is outside the ${options.maxChunkLimit}-chunk (${options.maxChunkLimit * CHUNK + 2}-block radius) pathfinding region around your position ${fmtVec(startPosition)}. get closer first — walk_to_surface(${Math.round(goal.x)}, ${Math.round(goal.z)}) travels any distance — then retry walk_to_exact. closest coordinate valid for pathfinding from here: x: ${Math.round(clamped.x)}, z: ${Math.round(clamped.z)}.`, {
+          status: "too_far",
+          position: vector(startPosition),
+          target,
+          goal: vector(goal),
+          clampedTarget: vector(clamped)
+        });
+      }
+      try {
+        const navigation = await gotoNear(bot, goal, Math.max(0.25, Math.min(tolerance, 1.0)), region, signal, {
+          searchBudgetMs: options.exactSearchBudgetMs,
+          goalMode: "3d"
+        }, wlog);
+        return {
+          ok: true,
+          message: snapped
+            ? `Reached ${fmtVec(goal)} — the nearest standable cell to the requested ${fmtVec(target)} (requested cell: ${exact.floorBlock}, blocks above: [${exact.blocksAbove.join(", ")}]).`
+            : `Reached exact target ${fmtVec(goal)}.`,
+          data: {
+            status: "reached",
+            position: vector(bot.entity.position),
+            target,
+            goal: vector(goal),
+            snapped,
+            navigation
+          }
+        };
+      } catch (error) {
+        wlog(`walk_to_exact failed: ${navigationReason(error)}: ${errorMessage(error).slice(0, 200)}`);
+        const navigation = error instanceof NavigationFailure ? error.report : undefined;
+        const closest = navigation?.closestApproach;
+        return failed(navigationReason(error), `walk_to_exact failed: ${errorMessage(error)}${closest ? ` closest reachable standable position: ${fmtVec(closest)}, ${round1(navigation?.remainingDistance ?? 0)} blocks (3D) from the target. walk there (walk_to_exact on ${fmtVec(closest)}), then re-assess the remaining obstruction. ${ravineHint(navigation)}` : ""}`, {
+          status: "failed",
+          position: vector(bot.entity.position),
+          target,
+          goal: vector(goal),
+          snapped,
+          navigation
+        });
+      }
+    },
+    findBlock: async ({ blockName }) => {
+      const registry = (bot as Bot & { registry?: { blocksByName?: Record<string, { id: number }> } }).registry;
+      const maxDistance = options.viewRadiusBlocks ?? 256;
+      const allNames = Object.keys(registry?.blocksByName ?? {});
+      const matches = globResolve(blockName, allNames);
+      if (matches.length === 0) {
+        const suggestions = globSuggest(`*${blockName}*`, allNames, 20);
+        return failed("unknown_block", `Unknown block name: ${blockName}.${suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}?` : ""} Patterns with * are allowed, e.g. '*log*' for any wood.`, { blockName, suggestions });
+      }
+      const ids = matches.map((name) => registry!.blocksByName![name].id);
       const found = bot.findBlock({
-        matching: blockId,
+        matching: ids,
         maxDistance,
         // Anti-x-ray is hard-locked here (not just at the HTTP/MCP layer): the
         // scan always requires head line-of-sight (360 degrees) or proximity.
         useExtraInfo: (block) => isVisibleOrNear(bot, block as Parameters<Bot["canSeeBlock"]>[0])
       });
       if (!found) {
-        return failed("block_not_found", `No head-ray-visible ${blockName} found within ${maxDistance} loaded blocks.`, { blockName, maxDistance, requireVisible: true });
+        const label = hasWildcard(blockName) ? `${blockName} (${matches.join(", ")})` : blockName;
+        return failed("block_not_found", `No head-ray-visible ${label} found within ${maxDistance} loaded blocks. If you can see it in a screenshot, raise your viewpoint or walk closer and retry; if it is underground/hidden, it will not be reported until an exposed face is in sight.`, { blockName, matches, maxDistance, requireVisible: true });
       }
       return {
         ok: true,
-        message: `Found ${found.name}.`,
+        message: `Found ${found.name}${found.name !== blockName ? ` (pattern ${blockName})` : ""}.`,
         data: {
           block: vector(found.position),
           blockName: found.name,
@@ -292,8 +566,8 @@ export function createPhysicalCommandActions(
         }
       };
     },
-    findInteractables: async ({ maxDistance }) => {
-      const range = Math.min(Math.max(4, maxDistance), 64);
+    findInteractables: async ({ maxDistance } = {}) => {
+      const range = Math.min(Math.max(4, maxDistance ?? options.viewRadiusBlocks ?? 64), 256);
       const finder = bot as Bot & { findBlocks?(options: Record<string, unknown>): Vec3[] };
       const positions = finder.findBlocks?.({
         matching: (block: unknown) => isInteractableName((block as BlockLike)?.name ?? ""),
@@ -333,15 +607,23 @@ export function createPhysicalCommandActions(
           return failed("block_not_found", "Target block no longer exists after walking into range.", { block: target });
         }
         // Head-line-of-sight is normally required for realistic perception, but
-        // in a 1-wide shaft the feet-level block directly ahead is not visible
-        // from the head. Within the configured tunnel distance we skip the gate
-        // so the bot can mine straight ahead (playtest finding 2c).
-        const withinTunnelRange =
+        // the exemption must use the same ruler as the reach check (eye to block
+        // center, mineflayer's canDigBlock radius): any block within interaction
+        // reach is one the body is standing next to and can plainly touch, so
+        // canopy leaves, shaft walls, or terrain cannot hide it. The configured
+        // tunnel distance stays as a floor covering canDigBlock-false cases
+        // (playtest finding 2c: feet-level block in a 1-wide shaft).
+        const eyeHeight = (bot.entity as typeof bot.entity & { eyeHeight?: number }).eyeHeight ?? 1.62;
+        const eyeDistance = bot.entity.position
+          .offset(0, eyeHeight, 0)
+          .distanceTo(centerOf(visibleTarget));
+        const withinExemptRange =
+          eyeDistance <= MINE_REACH_BLOCKS ||
           bot.entity.position.distanceTo(visibleTarget.position) <=
-          options.mineVisibilityIgnoreDistance;
+            options.mineVisibilityIgnoreDistance;
         if (
           !isVisibleFromHead(bot, visibleTarget as Parameters<Bot["canSeeBlock"]>[0])
-          && !withinTunnelRange
+          && !withinExemptRange
         ) {
           return failed("block_not_visible", "Target block is no longer visible from the player's head after walking into range.", {
             block: target,
@@ -726,22 +1008,35 @@ export function createPhysicalCommandActions(
       if (!window) {
         return failed("no_chest_window", "No container (chest/barrel) window is open. Open one first with use_block, then deposit.", { itemName });
       }
-      const itemId = registryItemId(bot, itemName);
-      if (typeof itemId !== "number") {
-        return failed("unknown_item", `Unknown item name: ${itemName}`, { itemName });
+      const inventoryItems = windowItemsInRange(window, window.inventoryStart, window.inventoryEnd);
+      const matches = globResolve(itemName, inventoryItems.map((entry) => entry.name));
+      if (matches.length === 0) {
+        return failed("unknown_item", `No inventory item matches: ${itemName}.${suggestFrom(inventoryItems.map((entry) => entry.name), itemName)}`, { itemName, inventory: inventoryItems });
       }
-      const available = typeof window.countRange === "function"
-        ? window.countRange(window.inventoryStart, window.inventoryEnd, itemId, 0)
-        : 0;
-      const toMove = count !== undefined && count > 0 ? Math.min(count, available) : available;
-      if (toMove <= 0) {
-        return failed("item_not_in_inventory", `No ${itemName} in the player inventory to deposit.`, { itemName });
+      let remaining = count !== undefined && count > 0 ? count : Number.POSITIVE_INFINITY;
+      const moved: Array<{ itemName: string; count: number }> = [];
+      for (const name of matches) {
+        if (remaining <= 0) break;
+        const itemId = registryItemId(bot, name);
+        if (typeof itemId !== "number") continue;
+        const available = typeof window.countRange === "function"
+          ? window.countRange(window.inventoryStart, window.inventoryEnd, itemId, 0)
+          : 0;
+        const toMove = Math.min(available, remaining);
+        if (toMove > 0) {
+          await window.deposit!(itemId, 0, toMove);
+          moved.push({ itemName: name, count: toMove });
+          remaining -= toMove;
+        }
       }
-      await window.deposit!(itemId, 0, toMove);
+      if (moved.length === 0) {
+        return failed("item_not_in_inventory", `No ${itemName} in the player inventory to deposit.`, { itemName, matches });
+      }
+      const total = moved.reduce((sum, entry) => sum + entry.count, 0);
       return {
         ok: true,
-        message: `Deposited ${toMove} × ${itemName} into the container.`,
-        data: { itemName, count: toMove, windowContents: containerContents(window) }
+        message: `Deposited ${total} item(s) into the container: ${describeMatches(moved.map((m) => ({ name: m.itemName, count: m.count })))}.`,
+        data: { pattern: itemName, moved, count: total, windowContents: containerContents(window) }
       };
     },
     chestWithdraw: async ({ itemName, count }) => {
@@ -749,25 +1044,42 @@ export function createPhysicalCommandActions(
       if (!window) {
         return failed("no_chest_window", "No container (chest/barrel) window is open. Open one first with use_block, then withdraw.", { itemName });
       }
-      const itemId = registryItemId(bot, itemName);
-      if (typeof itemId !== "number") {
-        return failed("unknown_item", `Unknown item name: ${itemName}`, { itemName });
+      const containerItems = windowItemsInRange(window, 0, window.inventoryStart);
+      const matches = globResolve(itemName, containerItems.map((entry) => entry.name));
+      if (matches.length === 0) {
+        return failed("unknown_item", `No item in the container matches: ${itemName}.${suggestFrom(containerItems.map((entry) => entry.name), itemName)}`, { itemName, container: containerItems });
       }
-      const available = typeof window.countRange === "function"
-        ? window.countRange(0, window.inventoryStart, itemId, 0)
-        : 0;
-      const toMove = count !== undefined && count > 0 ? Math.min(count, available) : available;
-      if (toMove <= 0) {
-        return failed("item_not_in_container", `No ${itemName} in the container to withdraw.`, { itemName });
+      let remaining = count !== undefined && count > 0 ? count : Number.POSITIVE_INFINITY;
+      const moved: Array<{ itemName: string; count: number }> = [];
+      for (const name of matches) {
+        if (remaining <= 0) break;
+        const itemId = registryItemId(bot, name);
+        if (typeof itemId !== "number") continue;
+        const available = typeof window.countRange === "function"
+          ? window.countRange(0, window.inventoryStart, itemId, 0)
+          : 0;
+        const toMove = Math.min(available, remaining);
+        if (toMove > 0) {
+          await window.withdraw!(itemId, 0, toMove);
+          moved.push({ itemName: name, count: toMove });
+          remaining -= toMove;
+        }
       }
-      await window.withdraw!(itemId, 0, toMove);
+      if (moved.length === 0) {
+        return failed("item_not_in_container", `No ${itemName} in the container to withdraw.`, { itemName, matches });
+      }
+      const total = moved.reduce((sum, entry) => sum + entry.count, 0);
       return {
         ok: true,
-        message: `Withdrew ${toMove} × ${itemName} from the container.`,
-        data: { itemName, count: toMove, windowContents: containerContents(window) }
+        message: `Withdrew ${total} item(s) from the container: ${describeMatches(moved.map((m) => ({ name: m.itemName, count: m.count })))}.`,
+        data: { pattern: itemName, moved, count: total, windowContents: containerContents(window) }
       };
     },
-    attackEntity: async ({ entityId, walkIntoRange, renavigationCount = 3, maxHits = 25 }) => {
+    attackEntity: async ({ entityId, walkIntoRange = true }) => {
+      // Tuning constants live here, not in the model-facing schema: the model
+      // cannot calibrate retry counts by vibes.
+      const renavigationCount = 3;
+      const maxHits = 25;
       const resolveTarget = (): (EntityLike & { id: number }) | null => {
         const entity = bot.entities?.[entityId] as EntityLike | undefined;
         return entity && entity !== bot.entity && entity.position
@@ -843,7 +1155,70 @@ export function createPhysicalCommandActions(
         }
       };
     },
-    raycast: async (maxDistance = 64) => {
+    scanHorizon: async ({ maxDistance } = {}) => {
+      const eyeHeight = (bot.entity as typeof bot.entity & { eyeHeight?: number }).eyeHeight ?? 1.62;
+      const start = bot.entity.position.offset(0, eyeHeight, 0);
+      const range = Math.min(Math.max(16, maxDistance ?? options.viewRadiusBlocks ?? 256), 256);
+      const world = (bot as Bot & { world?: { raycast?(origin: Vec3, dir: Vec3, range: number, matcher?: (b: unknown) => boolean): unknown } }).world;
+      if (!world?.raycast) {
+        return failed("world_unavailable", "World raycasting is not available.", {});
+      }
+      // Solids AND liquids: a distant water surface is exactly the signal a
+      // horizon scan wants (ocean directions), and lava glow is a landmark.
+      const match = (block: unknown): boolean => {
+        const b = block as { name?: string; boundingBox?: string } | null;
+        if (!b || !b.name) return false;
+        if (b.name === "air" || b.name === "cave_air" || b.name === "void_air") return false;
+        return b.boundingBox === "block" || isLiquidName(b.name);
+      };
+      const headings = 24; // every 15 degrees
+      const pitches = [15, 0, -15];
+      const results: Array<{
+        heading: number;
+        pitch: number;
+        hit: { blockName: string; position: Vector3; distance: number } | null;
+      }> = [];
+      for (let h = 0; h < headings; h++) {
+        const headingDeg = h * 15;
+        for (const pitchDeg of pitches) {
+          const headingRad = (headingDeg * Math.PI) / 180;
+          const pitchRad = (pitchDeg * Math.PI) / 180;
+          const dir = new Vec3(
+            Math.sin(headingRad) * Math.cos(pitchRad),
+            Math.sin(pitchRad),
+            -Math.cos(headingRad) * Math.cos(pitchRad)
+          ).normalize();
+          const hit = world.raycast(start, dir, range, match) as
+            | { name?: string; position?: Vec3 }
+            | null;
+          results.push({
+            heading: headingDeg,
+            pitch: pitchDeg,
+            hit: hit?.position
+              ? {
+                blockName: hit.name ?? "?",
+                position: vector(hit.position),
+                distance: round1(start.distanceTo(hit.position))
+              }
+              : null
+          });
+        }
+      }
+      return {
+        ok: true,
+        message: describeHorizonScan(start, range, results),
+        data: {
+          eye: vector(start),
+          range,
+          headings,
+          pitches,
+          results,
+          notable: notableHorizonHits(results)
+        }
+      };
+    },
+    raycast: async (maxDistance?: number) => {
+      const range = Math.min(Math.max(1, maxDistance ?? options.viewRadiusBlocks ?? 256), 256);
       // Read the current orientation in this module's degree convention. The
       // tracked degrees mirror lookAt/look so this matches where the crosshair
       // actually points.
@@ -857,7 +1232,6 @@ export function createPhysicalCommandActions(
       ).normalize();
       const eyeHeight = (bot.entity as typeof bot.entity & { eyeHeight?: number }).eyeHeight ?? 1.62;
       const start = bot.entity.position.offset(0, eyeHeight, 0);
-      const range = Math.min(Math.max(1, maxDistance), 200);
       const match = (block: unknown): boolean =>
         !!block && (block as { boundingBox?: string }).boundingBox === "block" &&
         (block as { name?: string }).name !== "air" &&
@@ -959,7 +1333,6 @@ export interface NavigationRegion {
   maxZ: number;
 }
 
-const DEFAULT_CHUNK_LIMIT = 3;
 // Search-region size for internal walks (attack range, drop pickup, walk-into
 // mining/placing range). These targets are normally right next to the bot.
 const INTERNAL_NAV_CHUNK_LIMIT = 8;
@@ -1038,20 +1411,437 @@ function findStandableCells(bot: Bot, target: Vector3, radius = 5): Vec3[] {
  * (2 air above feet for a 2-tall player), and not standing in or over a
  * liquid (lava/water) that would be unsafe to walk into. */
 function isSafeStandable(bot: Bot, cell: Vec3): boolean {
-  const at = bot.blockAt(cell);
-  const below = bot.blockAt(cell.offset(0, -1, 0));
-  const head = bot.blockAt(cell.offset(0, 1, 0));
-  const head2 = bot.blockAt(cell.offset(0, 2, 0));
-  if (!at || !below || !head || !head2) return false;
-  // Feet space (and body/head rows) must not be solid; the floor must be solid.
-  if (at.boundingBox === "block") return false;
-  if (below.boundingBox !== "block") return false;
-  if (head.boundingBox === "block" || head2.boundingBox === "block") return false;
-  // Refuse standing in or over liquids.
-  const liquid = (n: string | undefined): boolean =>
-    !!n && (n.includes("lava") || n.includes("water") || n === "flowing_lava" || n === "flowing_water");
-  if (liquid(at.name) || liquid(below.name) || liquid(head.name)) return false;
-  return true;
+  return checkStandability(bot, cell).standable;
+}
+
+export interface StandabilityIssue {
+  /** Where the problem is, relative to the candidate feet cell. */
+  location: "feet" | "body" | "head" | "floor";
+  blockName: string;
+  problem: "solid" | "liquid" | "not_solid" | "unloaded";
+  y: number;
+}
+
+export interface StandabilityReport {
+  standable: boolean;
+  issues: StandabilityIssue[];
+  /** Block at the feet cell. */
+  feetBlock: string | null;
+  /** Block that would be the floor (one below the feet cell). */
+  floorBlock: string | null;
+  /** [feet, body, head] block names above the floor. */
+  blocksAbove: string[];
+}
+
+const LIQUID_NAMES = new Set(["water", "lava", "flowing_water", "flowing_lava"]);
+
+function isLiquidName(name: string | undefined): boolean {
+  if (!name) return false;
+  if (LIQUID_NAMES.has(name)) return true;
+  return name.includes("lava") || name.includes("water");
+}
+
+/** Full standability verdict for a feet cell, with per-block diagnostics so
+ * failures can name the exact obstruction ("target dirt, blocks above:
+ * [air, leaves]") instead of a bare boolean. */
+export function checkStandability(bot: Bot, cell: Vec3): StandabilityReport {
+  const at = bot.blockAt(cell) as BlockLike | null;
+  const below = bot.blockAt(cell.offset(0, -1, 0)) as BlockLike | null;
+  const above1 = bot.blockAt(cell.offset(0, 1, 0)) as BlockLike | null;
+  const above2 = bot.blockAt(cell.offset(0, 2, 0)) as BlockLike | null;
+  const name = (b: BlockLike | null): string => b?.name ?? "?";
+  const issues: StandabilityIssue[] = [];
+  if (!at || !below || !above1 || !above2) {
+    issues.push({ location: "feet", blockName: name(at), problem: "unloaded", y: cell.y });
+  } else {
+    if (at.boundingBox === "block") {
+      issues.push({ location: "feet", blockName: at.name, problem: "solid", y: cell.y });
+    } else if (isLiquidName(at.name)) {
+      issues.push({ location: "feet", blockName: at.name, problem: "liquid", y: cell.y });
+    }
+    if (isLiquidName(below.name)) {
+      issues.push({ location: "floor", blockName: below.name, problem: "liquid", y: cell.y - 1 });
+    } else if (below.boundingBox !== "block") {
+      issues.push({ location: "floor", blockName: below.name, problem: "not_solid", y: cell.y - 1 });
+    }
+    if (above1.boundingBox === "block") {
+      issues.push({ location: "body", blockName: above1.name, problem: "solid", y: cell.y + 1 });
+    } else if (isLiquidName(above1.name)) {
+      issues.push({ location: "body", blockName: above1.name, problem: "liquid", y: cell.y + 1 });
+    }
+    if (above2.boundingBox === "block") {
+      issues.push({ location: "head", blockName: above2.name, problem: "solid", y: cell.y + 2 });
+    }
+  }
+  return {
+    standable: issues.length === 0,
+    issues,
+    feetBlock: name(at),
+    floorBlock: name(below),
+    blocksAbove: [name(at), name(above1), name(above2)]
+  };
+}
+
+function describeStandabilityIssues(issues: StandabilityIssue[]): string {
+  if (issues.length === 0) return "no issues";
+  return issues.map((i) => `${i.location} ${i.problem} (${i.blockName} at y=${i.y})`).join("; ");
+}
+
+// Vertical scan window for walk_to_surface: the full overworld build range
+// (1.18+). Columns are read top-down; the first solid-or-liquid block defines
+// the surface. blockAt() on a loaded chunk is an in-memory lookup, so a full
+// column scan is cheap.
+const WORLD_TOP_Y = 319;
+const WORLD_BOTTOM_Y = -64;
+// How far walk_to_surface spirals out from the requested column when the
+// requested surface cell itself is not standable (water, lava, canopy).
+const SURFACE_SEARCH_RADIUS = 12;
+// walk_to_surface loop guards: total hops and consecutive no-progress hops.
+const SURFACE_MAX_HOPS = 64;
+/** Mineflayer's canDigBlock reach: eye-to-block-center distance in blocks. */
+const MINE_REACH_BLOCKS = 5.1;
+const SURFACE_MAX_NO_PROGRESS_HOPS = 3;
+// When the requested column is in unloaded chunks, advance this many blocks
+// per intermediate hop (well inside the loaded area; the scan repeats after
+// each hop as new terrain streams in).
+const INTERMEDIATE_HOP_BLOCKS = 64;
+
+export interface SurfaceBlockInfo {
+  name: string;
+  type: number;
+  y: number;
+}
+
+export interface SurfaceColumnResult {
+  status: "standable" | "liquid" | "obstructed" | "no_ground" | "unloaded";
+  surface: SurfaceBlockInfo | null;
+  /** Feet cell standing on the surface block (status "standable" only). */
+  cell: Vec3 | null;
+  report: StandabilityReport | null;
+}
+
+/** Scan one column from the sky down: the first solid or liquid block is the
+ * surface. Liquids are reported as such (not standable); solids get a full
+ * standability check of the cell above them. */
+function scanSurfaceColumn(bot: Bot, x: number, z: number): SurfaceColumnResult {
+  for (let y = WORLD_TOP_Y; y > WORLD_BOTTOM_Y; y--) {
+    const block = bot.blockAt(new Vec3(x, y, z)) as BlockLike | null;
+    if (!block) {
+      // Column not loaded (outside view distance) or outside the world.
+      return { status: "unloaded", surface: null, cell: null, report: null };
+    }
+    const solid = block.boundingBox === "block";
+    const liquid = isLiquidName(block.name);
+    if (!solid && !liquid) continue; // torches, grass, signs, snow layers...
+    const surface: SurfaceBlockInfo = { name: block.name, type: block.type, y };
+    if (liquid) {
+      return { status: "liquid", surface, cell: null, report: null };
+    }
+    const cell = new Vec3(x, y + 1, z);
+    const report = checkStandability(bot, cell);
+    if (report.standable) {
+      return { status: "standable", surface, cell, report };
+    }
+    return { status: "obstructed", surface, cell, report };
+  }
+  return { status: "no_ground", surface: null, cell: null, report: null };
+}
+
+/** Offsets ordered as expanding square rings (Chebyshev radius), each ring
+ * sorted by Euclidean distance — a spiral outward from (0, 0). */
+function spiralOffsets(maxRadius: number): Array<{ dx: number; dz: number; ring: number }> {
+  const offsets: Array<{ dx: number; dz: number; ring: number }> = [];
+  for (let ring = 0; ring <= maxRadius; ring++) {
+    const ringCells: Array<{ dx: number; dz: number; ring: number }> = [];
+    for (let dx = -ring; dx <= ring; dx++) {
+      for (let dz = -ring; dz <= ring; dz++) {
+        if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) continue;
+        ringCells.push({ dx, dz, ring });
+      }
+    }
+    ringCells.sort((a, b) => (a.dx * a.dx + a.dz * a.dz) - (b.dx * b.dx + b.dz * b.dz));
+    offsets.push(...ringCells);
+  }
+  return offsets;
+}
+
+export interface SurfaceSearchStats {
+  sampled: number;
+  standable: number;
+  /** surface-block name -> {count, type} for liquid columns (water/lava). */
+  liquids: Record<string, { count: number; type: number }>;
+  /** first-obstruction name -> count for obstructed columns. */
+  obstructions: Record<string, { count: number; type: number }>;
+  unloaded: number;
+  noGround: number;
+}
+
+export interface SurfaceTargetResult {
+  cell: Vec3 | null;
+  surface: SurfaceBlockInfo;
+  report: StandabilityReport | null;
+  /** Chebyshev ring (blocks) at which the standable column was found. */
+  ring: number;
+  stats: SurfaceSearchStats;
+  nearestFailure: SurfaceColumnResult | null;
+  nearestFailureRing: number;
+}
+
+/** Find the standable surface column nearest to (x, z): the exact column
+ * first, then a spiral outward up to maxRadius. Always returns full column
+ * statistics for failure reporting. */
+function findSurfaceTarget(bot: Bot, x: number, z: number, maxRadius: number): SurfaceTargetResult {
+  const stats: SurfaceSearchStats = {
+    sampled: 0,
+    standable: 0,
+    liquids: {},
+    obstructions: {},
+    unloaded: 0,
+    noGround: 0
+  };
+  let nearestFailure: SurfaceColumnResult | null = null;
+  let nearestFailureRing = Number.POSITIVE_INFINITY;
+  const bump = (record: Record<string, { count: number; type: number }>, name: string, type: number): void => {
+    const entry = record[name] ?? { count: 0, type };
+    entry.count += 1;
+    record[name] = entry;
+  };
+  for (const { dx, dz, ring } of spiralOffsets(maxRadius)) {
+    const result = scanSurfaceColumn(bot, x + dx, z + dz);
+    stats.sampled += 1;
+    if (result.status === "standable") {
+      stats.standable += 1;
+      return {
+        cell: result.cell,
+        surface: result.surface!,
+        report: result.report,
+        ring,
+        stats,
+        nearestFailure,
+        nearestFailureRing
+      };
+    }
+    if (result.status === "liquid" && result.surface) {
+      bump(stats.liquids, result.surface.name, result.surface.type);
+    } else if (result.status === "obstructed") {
+      const cause = result.report?.issues[0]?.blockName ?? result.surface?.name ?? "unknown";
+      bump(stats.obstructions, cause, result.surface?.type ?? -1);
+    } else if (result.status === "unloaded") {
+      stats.unloaded += 1;
+    } else if (result.status === "no_ground") {
+      stats.noGround += 1;
+    }
+    if (ring < nearestFailureRing) {
+      nearestFailure = result;
+      nearestFailureRing = ring;
+    }
+  }
+  // No standable column anywhere in the spiral; surface fields describe the
+  // requested column itself when it was scannable.
+  const requestedColumn = nearestFailureRing === 0 ? nearestFailure : null;
+  return {
+    cell: null,
+    surface: requestedColumn?.surface ?? nearestFailure?.surface ?? { name: "unknown", type: -1, y: 0 },
+    report: requestedColumn?.report ?? null,
+    ring: -1,
+    stats,
+    nearestFailure,
+    nearestFailureRing
+  };
+}
+
+/** Render the walk_to_surface "nowhere to stand" failure with everything the
+ * scan learned: the most-hit obstruction, per-block counts, and a hint. */
+function describeSurfaceFailure(requested: { x: number; z: number }, stats: SurfaceSearchStats): string {
+  const liquidEntries = Object.entries(stats.liquids).sort((a, b) => b[1].count - a[1].count);
+  const obstructionEntries = Object.entries(stats.obstructions).sort((a, b) => b[1].count - a[1].count);
+  const parts: string[] = [];
+  if (liquidEntries.length > 0) {
+    parts.push(`liquid columns: ${liquidEntries.map(([name, v]) => `${name}(${v.type}) x${v.count}`).join(", ")}`);
+  }
+  if (obstructionEntries.length > 0) {
+    parts.push(`obstructed columns: ${obstructionEntries.map(([name, v]) => `${name}(${v.type}) x${v.count}`).join(", ")}`);
+  }
+  if (stats.unloaded > 0) {
+    parts.push(`unloaded columns: ${stats.unloaded}`);
+  }
+  if (stats.noGround > 0) {
+    parts.push(`empty columns: ${stats.noGround}`);
+  }
+  const mostHit = liquidEntries[0] ?? obstructionEntries[0];
+  let hint = "";
+  if (mostHit && (mostHit[0].includes("water") || mostHit[0].includes("lava"))) {
+    hint = " the area looks like open liquid — pick a target on land, or approach the shore from another direction.";
+  } else if (obstructionEntries.length > 0 && obstructionEntries.some(([name]) => name.includes("leaves") || name.includes("log"))) {
+    hint = " dense canopy — walk to the trunk with walk_to_visible and mine/pillar up through the leaves.";
+  } else if (stats.unloaded > 0) {
+    hint = " some columns are not loaded — walk closer with walk_to_surface toward an intermediate point first.";
+  }
+  return `no standable block found within ${SURFACE_SEARCH_RADIUS} blocks of (${requested.x}, ${requested.z}). sampled ${stats.sampled} columns: ${parts.join("; ") || "no surface data"}. most hit block: ${mostHit ? `${mostHit[0]}(${mostHit[1].type})` : "unknown"}.${hint}`;
+}
+
+/** Ravine/cliff heuristic from a navigation report: many more drops than
+ * ascents along the tried route. */
+function ravineHint(navigation: NavigationReport | undefined): string {
+  if (!navigation || navigation.drops < 6 || navigation.drops <= navigation.ascents * 2) return "";
+  return `warning: significant drop between here and the target on tried paths (${navigation.drops} drops vs ${navigation.ascents} ascents) — maybe a ravine or cliff. `;
+}
+
+/**
+ * Scan the straight line from a failed path's closest approach to the target
+ * (2D, at the approach's feet/head level) and name the first solid block in
+ * the way — the concrete reason a walk gave up. Door/gate blocks get an
+ * actionable "open it" hint.
+ */
+function blockerHint(bot: Bot, closest: Vec3, target: Vector3): string {
+  const dx = target.x - closest.x;
+  const dz = target.z - closest.z;
+  const length = Math.hypot(dx, dz);
+  if (length < 1) return "";
+  const steps = Math.max(1, Math.ceil(length * 2)); // sample every half block
+  for (let i = 1; i <= steps; i += 1) {
+    const t = i / steps;
+    const x = Math.floor(closest.x + dx * t);
+    const z = Math.floor(closest.z + dz * t);
+    if (x === Math.floor(closest.x) && z === Math.floor(closest.z)) continue;
+    for (const y of [Math.floor(closest.y), Math.floor(closest.y) + 1]) {
+      const block = bot.blockAt(new Vec3(x, y, z));
+      if (!block || block.name === "air" || block.boundingBox !== "block") continue;
+      const isDoorish = block.name.endsWith("_door") || block.name.endsWith("_gate") || block.name.endsWith("_trapdoor");
+      const hint = isDoorish
+        ? ` — door/gate in the way; open it manually with use_block on (${x}, ${y}, ${z}) and retry the walk`
+        : "";
+      return `path blocked by ${block.name} at (${x}, ${y}, ${z})${hint}. `;
+    }
+  }
+  return "";
+}
+
+/** Clamp a goal into a navigation region (with a small margin so the
+ * pathfinder has room around the clamped point). */
+function clampToRegionXZ(p: Vec3, region: NavigationRegion): Vec3 {
+  const margin = 4;
+  return new Vec3(
+    Math.min(Math.max(p.x, region.minX + margin), region.maxX - margin),
+    p.y,
+    Math.min(Math.max(p.z, region.minZ + margin), region.maxZ - margin)
+  );
+}
+
+function round1(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+const HORIZON_CARDINALS: Record<number, string> = {
+  0: "N", 45: "NE", 90: "E", 135: "SE", 180: "S", 225: "SW", 270: "W", 315: "NW"
+};
+
+// Blocks whose surface sightline is worth calling out even when the model
+// only skims the table: wood, village tells, ores, farming, and hazards.
+const NOTABLE_HORIZON_PATTERNS: RegExp[] = [
+  /_log$/,
+  /_planks$/,
+  /^stripped_/,
+  /^cobblestone/,
+  /^chest/,
+  /_ore$/,
+  /^hay_bale$/,
+  /^dirt_path$/,
+  /^wheat$/,
+  /^carrots$/,
+  /^potatoes$/,
+  /^water/,
+  /^lava/,
+  /_bed$/,
+  /^barrel$/,
+  /^composter$/,
+  /^crafting_table$/,
+  /^furnace$/,
+  /^blast_furnace$/,
+  /^campfire$/,
+  /^bell$/,
+  /^lantern$/,
+  /^bookshelf$/,
+  /^emerald_block$/,
+  /^diamond_block$/,
+  /^gold_block$/,
+  /^iron_block$/,
+  /^beacon$/,
+  /^obsidian$/,
+  /^netherrack$/,
+  /^spawner$/,
+  /^rail$/,
+  /^torch$/,
+  /^soul_sand$/,
+  /^moss_block$/
+];
+
+function isNotableHorizonBlock(name: string): boolean {
+  return NOTABLE_HORIZON_PATTERNS.some((pattern) => pattern.test(name));
+}
+
+function headingLabel(heading: number): string {
+  const cardinal = HORIZON_CARDINALS[heading];
+  const degrees = heading.toString().padStart(3, "0");
+  return cardinal ? `${degrees} ${cardinal}` : degrees;
+}
+
+function describeHorizonScan(
+  eye: Vec3,
+  range: number,
+  results: Array<{ heading: number; pitch: number; hit: { blockName: string; position: Vector3; distance: number } | null }>
+): string {
+  const byHeading = new Map<number, Array<{ pitch: number; hit: { blockName: string; position: Vector3; distance: number } | null }>>();
+  for (const entry of results) {
+    const list = byHeading.get(entry.heading) ?? [];
+    list.push({ pitch: entry.pitch, hit: entry.hit });
+    byHeading.set(entry.heading, list);
+  }
+  const rows: string[] = [];
+  for (const [heading, entries] of [...byHeading.entries()].sort((a, b) => a[0] - b[0])) {
+    // Order the row as +15 (sky) / 0 (horizon) / -15 (ground).
+    const cells = [...entries]
+      .sort((a, b) => b.pitch - a.pitch)
+      .map((entry) => (entry.hit ? `${entry.hit.blockName}@${entry.hit.distance}` : "sky"));
+    rows.push(`${headingLabel(heading)}: ${cells.join(" | ")}`);
+  }
+  const notable = notableHorizonHits(results);
+  const notableLine = notable.length > 0
+    ? ` notable: ${notable.map((n) => `${n.hit.blockName}@${n.hit.distance} at ${headingLabel(n.heading)} (${n.hit.position.x}, ${n.hit.position.y}, ${n.hit.position.z})`).join("; ")}`
+    : "";
+  return `horizon scan from (${round1(eye.x)}, ${round1(eye.y)}, ${round1(eye.z)}), range ${range} blocks, columns are pitch +15 (sky) | 0 (horizon) | -15 (ground), distances in blocks:\n${rows.join("\n")}.${notableLine} tip: aim with rotate(yaw_degrees=...) then minecraft_raytrace or walk_to_surface(x, z) to travel to anything listed here.`;
+}
+
+function notableHorizonHits(
+  results: Array<{ heading: number; pitch: number; hit: { blockName: string; position: Vector3; distance: number } | null }>
+): Array<{ heading: number; hit: { blockName: string; position: Vector3; distance: number } }> {
+  const notable = results
+    .filter((entry) => entry.hit && isNotableHorizonBlock(entry.hit.blockName))
+    .map((entry) => ({ heading: entry.heading, hit: entry.hit! }))
+    .sort((a, b) => a.hit.distance - b.hit.distance);
+  // Keep the nearest hit per (blockName, heading) so a forest row does not
+  // flood the list — the nearest visible instance is the actionable one.
+  const seen = new Set<string>();
+  const deduped = [];
+  for (const entry of notable) {
+    const key = `${entry.hit.blockName}@${Math.round(entry.heading / 15) * 15}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(entry);
+  }
+  return deduped;
+}
+
+/** Fold a hop log into a pseudo navigation report for ravineHint. */
+function summarizeHopLog(hops: Array<{ ascents: number; drops: number }> | undefined): NavigationReport | undefined {
+  if (!hops || hops.length === 0) return undefined;
+  let ascents = 0;
+  let drops = 0;
+  for (const hop of hops) {
+    ascents += hop.ascents;
+    drops += hop.drops;
+  }
+  return { pathStatus: "aggregated", pathNodes: hops.length, ascents, drops, stalled: false, diagnosis: "aggregated hop log" };
 }
 
 /** From the target, scan straight down (up to 64 blocks) for the first safe
@@ -1073,8 +1863,10 @@ function fmtVec(v: Vector3): string {
 
 /**
  * A Movements instance restricted to plain walking: no digging, placing,
- * parkour, towers, doors, or falls over one block — plus a spatial bound that
- * keeps the search inside the region.
+ * parkour, towers, or falls over one block — plus a spatial bound that
+ * keeps the search inside the region. Doors are passable: the pathfinder
+ * activates them itself (canOpenDoors) and they must be registered as
+ * openable (upstream only auto-registers fence gates).
  */
 function makeWalkMovements(bot: Bot, region: NavigationRegion): InstanceType<typeof Movements> {
   const movements = new Movements(bot);
@@ -1082,7 +1874,29 @@ function makeWalkMovements(bot: Bot, region: NavigationRegion): InstanceType<typ
   movements.allowParkour = false;
   movements.allow1by1towers = false;
   movements.scafoldingBlocks = [];
-  movements.canOpenDoors = false;
+  movements.canOpenDoors = false; // upstream's useOne door-clicking loops ("Causes issues") — we open doors ourselves in gotoNear
+  for (const block of bot.registry.blocksArray) {
+    if (block.name.endsWith("_door") && block.name !== "iron_door") {
+      movements.openable.add(block.id);
+    }
+  }
+  // Doors must be PASSABLE in the search (upstream's getMoveForward only
+  // exempts the door's LOWER half; the upper half sits in the head cell and
+  // safeOrBreak would return 100 with canDig=false). Patch safeOrBreak so
+  // openable blocks count as safe: the walk layer opens them before passing.
+  const originalSafeOrBreak = movements.safeOrBreak.bind(movements) as unknown as
+    (block: BlockLike, toBreak: unknown[]) => number;
+  (movements as unknown as {
+    safeOrBreak: (block: BlockLike, toBreak: unknown[]) => number;
+  }).safeOrBreak = (block, toBreak) => {
+    if (block && movements.openable.has(block.type)) {
+      return originalSafeOrBreak(
+        { ...block, safe: true, physical: false, boundingBox: "empty" } as unknown as BlockLike,
+        toBreak
+      );
+    }
+    return originalSafeOrBreak(block, toBreak);
+  };
   movements.maxDropDown = 1;
   movements.infiniteLiquidDropdownDistance = false;
   movements.allowSprinting = true;
@@ -1099,12 +1913,108 @@ function makeWalkMovements(bot: Bot, region: NavigationRegion): InstanceType<typ
   return movements;
 }
 
+interface GotoOptions {
+  /** A* compute budget override (ms); defaults to the pathfinder's thinkTimeout. */
+  searchBudgetMs?: number;
+  /** "xz" (GoalNearXZ, default) or "3d" (GoalNear) for exact 3D targets. */
+  goalMode?: "xz" | "3d";
+}
+
+/** Blocks whose right-click toggles passage. Iron doors/gates need redstone. */
+function isHandOpenableDoor(name: string): boolean {
+  if (name === "iron_door" || name === "iron_trapdoor") return false;
+  return name.endsWith("_door") || name.endsWith("_gate") || name.endsWith("_trapdoor");
+}
+
+function doorIsOpen(bot: Bot, position: Vec3): boolean {
+  const block = bot.blockAt(position) as (BlockLike & { _properties?: { open?: boolean } }) | null;
+  return block?._properties?.open === true;
+}
+
+/** The closed door/gate/trapdoor nearest the bot's feet (search box 5x3x5). */
+function findNearbyClosedDoor(bot: Bot): BlockLike | undefined {
+  const feet = bot.entity.position.floored();
+  let best: { block: BlockLike; dist: number } | undefined;
+  for (let dx = -2; dx <= 2; dx += 1) {
+    for (let dz = -2; dz <= 2; dz += 1) {
+      for (const dy of [0, 1, -1]) {
+        const position = new Vec3(feet.x + dx, feet.y + dy, feet.z + dz);
+        const block = bot.blockAt(position) as (BlockLike & { _properties?: { open?: boolean } }) | null;
+        if (!block || !isHandOpenableDoor(block.name)) continue;
+        if (block._properties?.open === true) continue; // already open
+        const dist = position.distanceTo(bot.entity.position);
+        if (!best || dist < best.dist) best = { block, dist };
+      }
+    }
+  }
+  return best?.block;
+}
+
+/** Right-click the block and wait until the world reports it open. */
+async function openDoorAndWait(bot: Bot, door: BlockLike): Promise<boolean> {
+  const activator = (bot as unknown as {
+    activateBlock(block: unknown): Promise<void>;
+  }).activateBlock;
+  if (typeof activator !== "function") return false;
+  try {
+    await activator(door);
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + 1500;
+  while (Date.now() < deadline) {
+    if (doorIsOpen(bot, door.position)) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+/**
+ * Walk near a target, opening doors/gates that stall the way. The underlying
+ * walk treats doors as passable (see makeWalkMovements) but cannot open them,
+ * so a closed door makes the walk stall within NO_PROGRESS_TIMEOUT_MS; here we
+ * detect that, open the culprit, and retry the walk. Each retry makes progress
+ * up to the next door, so a hallway of doors costs one retry per door.
+ */
 async function gotoNear(
   bot: Bot,
   target: Vector3,
   tolerance: number,
   region: NavigationRegion,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  opts: GotoOptions = {},
+  wlog: (message: string) => void = () => undefined
+): Promise<NavigationReport> {
+  const MAX_DOOR_RETRIES = 8;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_DOOR_RETRIES; attempt += 1) {
+    try {
+      return await gotoNearOnce(bot, target, tolerance, region, signal, opts, wlog);
+    } catch (error) {
+      lastError = error;
+      const stalled = (error instanceof NavigationFailure && error.report.stalled)
+        || (error as { name?: string })?.name === "PathStopped";
+      if (!stalled || signal?.aborted) throw error;
+      const door = findNearbyClosedDoor(bot);
+      wlog(`walk stalled (attempt ${attempt + 1}); nearby closed door: ${door ? `${door.name} at ${fmtVec(door.position)}` : "none"}`);
+      if (!door) throw error;
+      const opened = await openDoorAndWait(bot, door);
+      wlog(`door open attempt on ${door.name} at ${fmtVec(door.position)}: ${opened ? "opened, retrying walk" : "failed"}`);
+      if (!opened) throw error;
+      // Door opened — retry the walk from the new state.
+    }
+  }
+  throw lastError;
+}
+
+async function gotoNearOnce(
+  bot: Bot,
+  target: Vector3,
+  tolerance: number,
+  region: NavigationRegion,
+  signal?: AbortSignal,
+  opts: GotoOptions = {},
+  wlog: (message: string) => void = () => undefined
 ): Promise<NavigationReport> {
   const pathfinderBot = bot as Bot & {
     pathfinder?: {
@@ -1132,7 +2042,14 @@ async function gotoNear(
   let update: PathfinderUpdate = { status: "searching", path: [] };
   let stallReason = "The path was stopped before it could be completed.";
 
-  const bad = (name: string, message: string): Error => {
+  const bad = (name: string, message: string, report?: NavigationReport): Error => {
+    if (report) {
+      // NavigationFailure carries the report (closest approach, route stats)
+      // while keeping the conventional name so navigationReason() classifies it.
+      const failure = new NavigationFailure(message, report);
+      (failure as Error & { name: string }).name = name;
+      return failure;
+    }
     const err = new Error(message);
     (err as Error & { name: string }).name = name;
     return err;
@@ -1146,8 +2063,11 @@ async function gotoNear(
 
   // GoalNearXZ: aim at the horizontal target and let the pathfinder choose
   // whichever standable Y is reachable (the caller already validated that a
-  // standable cell exists nearby).
-  const goal = new goals.GoalNearXZ(target.x, target.z, tolerance);
+  // standable cell exists nearby). GoalNear (3d) pins the vertical too, for
+  // walk_to_exact.
+  const goal = opts.goalMode === "3d"
+    ? new goals.GoalNear(target.x, target.y, target.z, tolerance)
+    : new goals.GoalNearXZ(target.x, target.z, tolerance);
 
   // Phase 1 — resolve the search to a verdict WITHOUT moving. Mineflayer's
   // incremental pathfinder can start walking partial paths while the search is
@@ -1155,13 +2075,30 @@ async function gotoNear(
   // search ended in noPath. By settling the search first and only handing the
   // goal to the walker once a path is confirmed, a noPath/timeout verdict now
   // leaves the bot exactly where it started.
-  const searchBudget = pathfinderBot.pathfinder.thinkTimeout ?? 1000;
+  const searchBudget = opts.searchBudgetMs ?? pathfinderBot.pathfinder.thinkTimeout ?? 1000;
   const searchResult = await settleSearch(pathfinderBot, movements, goal, searchBudget, signal);
-  if (searchResult.status === "noPath") {
-    throw bad("NoPath", "No walkable path to the target within the search region: the way is blocked or the target is unreachable on foot.");
-  }
-  if (searchResult.status === "timeout") {
-    throw bad("Timeout", "Pathfinding timed out before finding a route; the target may be too complex to reach on foot. Try moving closer.");
+  wlog(`search verdict=${searchResult.status} nodes=${searchResult.path.length} visited=${searchResult.visitedNodes ?? "?"} budget=${searchBudget}ms`);
+  if (searchResult.status === "noPath" || searchResult.status === "timeout") {
+    // The A* "bestNode" path is the closest standable position the search
+    // actually reached — reconstruct it for the failure report so the caller
+    // can suggest a valid walk_to_exact target.
+    const closest = searchResult.path.length > 0
+      ? vector(searchResult.path[searchResult.path.length - 1])
+      : start;
+    const remaining = Math.hypot(closest.x - target.x, closest.y - target.y, closest.z - target.z);
+    const partial = summarizeNavigation({ status: searchResult.status, path: searchResult.path }, start, target, false);
+    const report: NavigationReport = {
+      ...partial,
+      closestApproach: closest,
+      remainingDistance: round1(remaining)
+    };
+    const ravine = ravineHint(report).trim();
+    const blocker = blockerHint(bot, new Vec3(closest.x, closest.y, closest.z), target).trim();
+    throw bad(
+      searchResult.status === "noPath" ? "NoPath" : "Timeout",
+      `${searchResult.status === "noPath" ? "no path found" : "path search timed out"}. closest encountered standable position: (${round1(closest.x)}, ${round1(closest.y)}, ${round1(closest.z)}). distance to target (3d): ${round1(remaining)} blocks — a valid walk_to_exact target. route so far: +${partial.ascents} up / -${partial.drops} down over ${searchResult.path.length} nodes (${partial.pathNodes} visited).${blocker ? " " + blocker : ""}${ravine ? " " + ravine : ""}`,
+      report
+    );
   }
   update = { status: searchResult.status, path: searchResult.path ?? [] };
   (update as PathfinderUpdate & { visitedNodes?: number }).visitedNodes = searchResult.visitedNodes;
@@ -1173,7 +2110,6 @@ async function gotoNear(
   return await new Promise<NavigationReport>((resolve, reject) => {
     let settled = false;
     let stalled = false;
-    let sawMovement = false;
     let lastPosition = bot.entity.position.clone();
     let lastMovedAt = Date.now();
     let backstop: ReturnType<typeof setInterval> | undefined;
@@ -1184,6 +2120,7 @@ async function gotoNear(
     const onReached = (): void => finish(null);
     const onUpdate = (value: PathfinderUpdate): void => {
       update = value;
+      wlog(`path_update status=${value.status} nodes=${value.path.length}`);
       if (value.status === "noPath") {
         finish(bad("NoPath", "No walkable path to the target within the search region: the way is blocked or the target is unreachable on foot."));
       } else if (value.status === "timeout") {
@@ -1242,6 +2179,7 @@ async function gotoNear(
     backstop = setInterval(() => {
       const position = bot.entity.position;
       if (distXZ(position, target) <= tolerance) {
+        wlog(`backstop: within tolerance of ${fmtVec(target)} — success`);
         finish(null);
         return;
       }
@@ -1249,10 +2187,22 @@ async function gotoNear(
       if (moved >= MIN_PROGRESS_DISTANCE) {
         lastPosition = position.clone();
         lastMovedAt = Date.now();
-        sawMovement = true;
-      } else if (sawMovement && Date.now() - lastMovedAt >= NO_PROGRESS_TIMEOUT_MS) {
+      } else if (Date.now() - lastMovedAt >= NO_PROGRESS_TIMEOUT_MS) {
+        // Fires whether or not the walk ever moved: a walk that never starts
+        // moving (blocked immediately, e.g. by a closed door) must also fail
+        // fast instead of hanging until the command timeout.
         stalled = true;
-        stallReason = "The bot stopped moving during the walk; the path may have been invalidated (e.g. falling gravel or changed blocks). Try again or pick a closer target.";
+        stallReason = "The bot stopped moving during the walk; the path may have been invalidated (e.g. falling gravel or changed blocks) or blocked (e.g. a closed door). Try again or pick a closer target.";
+        const feet = bot.entity.position.floored();
+        const front = [new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)]
+          .map((dir) => {
+            const block = bot.blockAt(feet.offset(dir.x, 1, dir.z));
+            const doorish = block && (block.name.endsWith("_door") || block.name.endsWith("_gate") || block.name.endsWith("_trapdoor"));
+            return `${dir.x},${dir.z}:${block ? block.name : "?"}${doorish ? "(door)" : ""}`;
+          })
+          .join(" ");
+        const below = bot.blockAt(feet.offset(0, -1, 0));
+        wlog(`backstop: stalled at ${fmtVec(bot.entity.position)} with no movement for ${NO_PROGRESS_TIMEOUT_MS}ms; pos=${fmtVec(bot.entity.position)} target=${fmtVec(target)}; blocks around head level: ${front}; block under feet: ${below ? below.name : "?"}`);
         finish(bad("PathStopped", stallReason));
       }
     }, 250);
@@ -1336,7 +2286,7 @@ async function walkToBlockRange(bot: Bot, block: BlockLike): Promise<void> {
   await gotoNear(bot, vector(block.position), 2.0, defaultNavigationRegion(bot));
 }
 
-async function ensureRange(bot: Bot, block: BlockLike, walkIntoRange: boolean): Promise<CommandResult | { ok: true }> {
+async function ensureRange(bot: Bot, block: BlockLike, walkIntoRange = true): Promise<CommandResult | { ok: true }> {
   if (inReach(bot, block)) {
     return { ok: true };
   }
@@ -1591,6 +2541,27 @@ function openedContainerWindow(bot: Bot): ContainerWindowLike | null {
 function containerContents(window: ContainerWindowLike): Array<{ name: string; count: number; slot: number }> {
   if (typeof window.containerItems !== "function") return [];
   return window.containerItems().map((item) => ({ name: item.name, count: item.count, slot: item.slot }));
+}
+
+/** Aggregate items within a window slot range (used for glob matching). */
+function windowItemsInRange(window: ContainerWindowLike, start: number, end: number): Array<{ name: string; count: number }> {
+  const totals = new Map<string, number>();
+  if (typeof window.countRange !== "function") return [];
+  // Iterate the visible slots to discover which item names are present.
+  const slots = (window as unknown as { slots?: Array<{ name?: string; count?: number } | null> }).slots ?? [];
+  for (let slot = start; slot < Math.min(end, slots.length); slot++) {
+    const item = slots[slot];
+    if (item?.name) {
+      totals.set(item.name, (totals.get(item.name) ?? 0) + (item.count ?? 1));
+    }
+  }
+  return [...totals.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Suggest close names for a failed pattern, e.g. 'logg' -> oak_log, spruce_log. */
+function suggestFrom(candidates: string[], pattern: string): string {
+  const suggestions = globSuggest(`*${pattern}*`, candidates, 10);
+  return suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}? Patterns with * are allowed, e.g. '*log*' for any wood.` : " Patterns with * are allowed, e.g. '*log*' for any wood.";
 }
 
 function registryItemId(bot: Bot, itemName: string): number | undefined {

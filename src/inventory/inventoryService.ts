@@ -1,6 +1,7 @@
 import type { Bot } from "mineflayer";
 import type { BotRuntime } from "../bot/liveBot.js";
 import type { InventoryItemSummary } from "../server/state.js";
+import { globResolve, globSuggest } from "../bot/nameMatching.js";
 
 /**
  * Inventory operations need a live Mineflayer source; read and select slots through one service.
@@ -116,10 +117,32 @@ export function createInventoryService(bot: Bot): InventoryService {
       const slots = bot.inventory.slots ?? [];
       const normalized = itemName.trim().toLowerCase();
 
+      // Exact name wins outright; wildcards ('*log*') resolve against what is
+      // actually in the inventory. Ambiguous patterns are a cheap, teaching
+      // failure: they list the matches so the next call is exact.
+      const inventoryNames = [...new Set(
+        slots
+          .filter((item): item is NonNullable<typeof item> => !!item?.name)
+          .map((item) => item.name as string)
+      )];
+      const matches = globResolve(normalized, inventoryNames);
+      if (matches.length > 1) {
+        const counts = new Map<string, number>();
+        for (const item of slots) {
+          if (item?.name) counts.set(item.name, (counts.get(item.name) ?? 0) + (item.count ?? 1));
+        }
+        return {
+          ok: false,
+          error: "ambiguous_item_pattern",
+          message: `Ambiguous item pattern '${itemName}': matching inventory items are ${matches.map((name) => `${name} x${counts.get(name) ?? 0}`).join(", ")}. Pass an exact name.`
+        };
+      }
+      const targetName = matches.length === 1 ? matches[0] : normalized;
+
       // Search for the item
       for (let i = 0; i < slots.length; i++) {
         const item = slots[i];
-        if (item && item.name && typeof item.name === "string" && item.name.toLowerCase() === normalized) {
+        if (item && item.name && typeof item.name === "string" && item.name.toLowerCase() === targetName) {
           try {
             // Use bot.equip() which handles hotbar/main inventory correctly
             console.log("[EQUIP] Before equip - heldItem:", bot.heldItem?.name, "quickBarSlot:", bot.quickBarSlot);
@@ -143,10 +166,15 @@ export function createInventoryService(bot: Bot): InventoryService {
         }
       }
 
+      const suggestions = globSuggest(`*${normalized}*`, inventoryNames, 10);
+      const registryNames = Object.keys(
+        (bot as unknown as { registry?: { itemsByName?: Record<string, unknown> } }).registry?.itemsByName ?? {}
+      );
+      const registrySuggestions = suggestions.length > 0 ? suggestions : globSuggest(`*${normalized}*`, registryNames, 10);
       return {
         ok: false,
         error: "item_not_found",
-        message: `No item named '${itemName}' in inventory.`
+        message: `No item matching '${itemName}' in inventory.${registrySuggestions.length > 0 ? ` Known items close to that: ${registrySuggestions.join(", ")}.` : ""} Patterns with * are allowed, e.g. '*log*' for any wood. Inventory: ${inventoryNames.join(", ") || "empty"}.`
       };
     }
   };

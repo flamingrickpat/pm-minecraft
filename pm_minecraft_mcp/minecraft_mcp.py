@@ -56,7 +56,18 @@ MATERIAL_ACTIONS = frozenset(
         "pillar_up",
         "place_block",
         "smelt",
-        "walk_to",
+        "walk_to_visible",
+        "walk_to_surface",
+        "walk_to_exact",
+    }
+)
+# The three surface navigation walks; treated uniformly by the progress
+# tracker and the material (no-gain) circuit breaker.
+WALK_ACTIONS = frozenset(
+    {
+        "walk_to_visible",
+        "walk_to_surface",
+        "walk_to_exact",
     }
 )
 MATERIAL_NO_GAIN_REASSESSMENT_THRESHOLD = 2
@@ -79,9 +90,6 @@ DEFAULT_ANTI_STALL_GUARD = False
 # bot can tunnel forward from a 1-wide shaft without first mining the head
 # cell (playtest finding 2c).
 DEFAULT_MINE_VISIBILITY_IGNORE_DISTANCE = 3.0
-# walk_to is deliberately capped at one chunk (16 blocks) so a failed call is
-# cheap to diagnose; longer routes are split into hops by the caller.
-DEFAULT_WALK_TO_MAX_DISTANCE = 512.0
 MATERIAL_ATTEMPT_FAILURE_REASONS = frozenset(
     {
         "dig_failed",
@@ -235,6 +243,17 @@ def drafts_source_dir() -> Path:
         return repository
     raise FileNotFoundError(
         f"Example drafts not found (looked in {packaged} and {repository})"
+    )
+
+
+def agent_skills_source_dir() -> Path:
+    """Directory of markdown agent skills (each <name>/SKILL.md) to deploy into
+    the workspace's .agents/skills for the pm-coder harness."""
+    repository = PACKAGE_DIR / "deploy" / "agent_skills"
+    if repository.is_dir() and any(repository.glob("*/SKILL.md")):
+        return repository
+    raise FileNotFoundError(
+        f"Agent skills not found under {repository}"
     )
 
 
@@ -422,6 +441,7 @@ class ServerConfig(BaseModel):
     minecraft_host: str
     minecraft_port: int = Field(ge=1, le=65535)
     username: str
+    version: str = "1.19.4"
     agent_home: Path
     artifact_root: Path
     web_host: str
@@ -437,10 +457,10 @@ class ServerConfig(BaseModel):
     view_distance: int = Field(ge=1)
     anti_stall_guard: bool = False
     mine_visibility_ignore_distance: float = Field(default=3.0, ge=0)
-    walk_to_max_distance: float = Field(default=16.0, gt=0)
     # Absolute cap on walk_to's chunk_limit (search region), and the A* budget.
     max_chunk_limit: int = Field(default=8, ge=1)
     walk_search_timeout_ms: int = Field(default=1000, ge=100)
+    walk_exact_search_timeout_ms: int = Field(default=8000, ge=100)
     skill_timeout_seconds: float = Field(default=90.0, ge=1)
     event_notifications: EventNotifications = Field(
         default_factory=EventNotifications
@@ -668,7 +688,10 @@ class BodyApi:
     ACTION_ROUTES: ClassVar[dict[str, tuple[str, str]]] = {
         "find_block": ("POST", "/api/world/find-block"),
         "find_interactables": ("POST", "/api/world/interactables"),
-        "walk_to": ("POST", "/api/command/walk-to"),
+        "scan_horizon": ("POST", "/api/world/scan-horizon"),
+        "walk_to_visible": ("POST", "/api/command/walk-to-visible"),
+        "walk_to_surface": ("POST", "/api/command/walk-to-surface"),
+        "walk_to_exact": ("POST", "/api/command/walk-to-exact"),
         "mine_block": ("POST", "/api/command/mine-block"),
         "place_block": ("POST", "/api/command/place-block"),
         "jump_place_block": ("POST", "/api/command/jump-place-block"),
@@ -702,45 +725,40 @@ class BodyApi:
 
     ACTION_SCHEMAS: ClassVar[dict[str, dict[str, Any]]] = {
         "find_block": {
-            "blockName": "string",
-            "maxDistance": "positive integer",
-            "requireVisible": "must be true; line-of-sight search is enforced",
+            "blockName": "exact registry name, or a glob pattern like '*log*' matching any wood",
         },
-        "find_interactables": {
-            "maxDistance": "positive number 1..64 (default 16); lists right-click-able blocks (doors, gates, buttons, levers, chests, etc.)",
-        },
-        "walk_to": {
+        "find_interactables": {},
+        "scan_horizon": {},
+        "walk_to_visible": {
             "target": {"x": "number", "y": "number", "z": "number"},
-            "tolerance": "positive number",
-            "chunk_limit": "positive integer (chunks); walk search region size, default 3, capped by the server's configured max",
+        },
+        "walk_to_surface": {
+            "x": "number",
+            "z": "number",
+        },
+        "walk_to_exact": {
+            "target": {"x": "number", "y": "number", "z": "number"},
         },
         "mine_block": {
             "block": {"x": "integer", "y": "integer", "z": "integer"},
-            "walkIntoRange": "boolean",
         },
         "place_block": {
             "referenceBlock": {"x": "integer", "y": "integer", "z": "integer"},
             "face": {"x": "-1|0|1", "y": "-1|0|1", "z": "-1|0|1"},
-            "walkIntoRange": "boolean",
         },
         "jump_place_block": {
             "referenceBlock": {"x": "integer", "y": "integer", "z": "integer"},
             "face": {"x": "-1|0|1", "y": "-1|0|1", "z": "-1|0|1"},
-            "walkIntoRange": "boolean",
         },
         "pillar_up": {},
         "use_block": {
             "block": {"x": "integer", "y": "integer", "z": "integer"},
-            "walkIntoRange": "boolean",
         },
         "use_item": {
             "heldItem": "the currently equipped item is used/consumed: food is eaten, throwables are thrown, potions/milk are drunk",
         },
         "attack_entity": {
             "entityId": "non-negative integer from a fresh observation",
-            "walkIntoRange": "boolean",
-            "renavigationCount": "positive integer; max re-walks to the moving target, default 3",
-            "maxHits": "positive integer; max swings before giving up, default 25",
         },
         "chest_deposit": {
             "itemName": "exact Mineflayer item name to move into the open container",
@@ -781,13 +799,11 @@ class BodyApi:
             "inputCount": "positive integer",
             "fuelItemName": "string",
             "fuelCount": "positive integer",
-            "timeoutMs": "positive integer",
         },
         "resolve_pixel": {
             "frameId": "string",
             "x": "pixel x",
             "y": "pixel y",
-            "maxDistance": "positive number",
         },
         "chat": {"text": "ordinary chat or informational command only"},
     }
@@ -795,7 +811,9 @@ class BodyApi:
     ACTION_ALIASES: ClassVar[dict[str, str]] = {
         "findBlock": "find_block",
         "findInteractables": "find_interactables",
-        "walkTo": "walk_to",
+        "walkToVisible": "walk_to_visible",
+        "walkToSurface": "walk_to_surface",
+        "walkToExact": "walk_to_exact",
         "mineBlock": "mine_block",
         "placeBlock": "place_block",
         "jumpPlaceBlock": "jump_place_block",
@@ -1063,6 +1081,7 @@ class BodySupervisor:
                 "MINECRAFT_HOST": self.config.minecraft_host,
                 "MINECRAFT_PORT": str(self.config.minecraft_port),
                 "MINECRAFT_USERNAME": self.config.username,
+                "MINECRAFT_VERSION": self.config.version,
                 "MINECRAFT_VIEW_DISTANCE": str(self.config.view_distance),
                 "WEB_HOST": self.config.web_host,
                 "WEB_PORT": str(self.config.web_port),
@@ -1078,14 +1097,14 @@ class BodySupervisor:
                 "MINECRAFT_MINE_VISIBILITY_IGNORE_DISTANCE": str(
                     self.config.mine_visibility_ignore_distance
                 ),
-                "MINECRAFT_WALK_TO_MAX_DISTANCE": str(
-                    self.config.walk_to_max_distance
-                ),
                 "MINECRAFT_WALK_MAX_CHUNKS": str(
                     self.config.max_chunk_limit
                 ),
                 "MINECRAFT_WALK_SEARCH_TIMEOUT_MS": str(
                     self.config.walk_search_timeout_ms
+                ),
+                "MINECRAFT_WALK_EXACT_SEARCH_TIMEOUT_MS": str(
+                    self.config.walk_exact_search_timeout_ms
                 ),
             }
         )
@@ -1450,7 +1469,7 @@ class MinecraftMcpRuntime:
         action = material_action_name(action_key)
         if action not in MATERIAL_ACTIONS:
             walked_to_new_material_context = (
-                action == "walk_to"
+                action in WALK_ACTIONS
                 and position_distance(
                     delta["positionBefore"],
                     delta["positionAfter"],
@@ -1470,7 +1489,7 @@ class MinecraftMcpRuntime:
                     >= float(delta["positionBefore"]["y"]) + 0.99
                     or any(change < 0 for change in inventory_changes.values())
                 )
-            elif action in {"fine_control", "walk_to"}:
+            elif action in WALK_ACTIONS | {"fine_control"}:
                 before_cell = navigation_cell(delta["positionBefore"])
                 after_cell = navigation_cell(delta["positionAfter"])
                 if before_cell is not None:
@@ -2374,7 +2393,8 @@ class MinecraftMcpRuntime:
                 else:
                     snapshot = await self.snapshot(include_image)
                     if (
-                        material_action_name(progress_action) == "walk_to"
+                        material_action_name(progress_action)
+                        == "walk_to_visible"
                         and self._claim_no_frontier_recovery_walk(
                             snapshot["observation"],
                             parameters,
@@ -2601,7 +2621,8 @@ class MinecraftMcpRuntime:
             raise ValueError(
                 "timeout_seconds must be at most "
                 f"{self.skill_timeout_seconds:g} (the configured skill timeout; "
-                "raise it with minecraft_set_skill_timeout)"
+                "the operator sets it via --skill-timeout-seconds or "
+                "MINECRAFT_SKILL_TIMEOUT_SECONDS)"
             )
         if heartbeat_seconds <= 0:
             raise ValueError("heartbeat_seconds must be positive")
@@ -3478,7 +3499,7 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
             "Returned state is compact: coordinates, distances, and angles carry one decimal; "
             "a nearbyBlocks entry names canHarvestWithHeldItem and needsHarvestTool only when the held item cannot harvest it; "
             "localAirspace.openBlocksByDirection is open blocks per compass direction and boundaryDetail lists only boundaries that are not an ordinary wall; "
-            "localAirspace.navigation waypoints are standable {x,y,z,clearance,openNeighbors} cells you can pass straight to walk_to; "
+            "localAirspace.navigation waypoints are standable {x,y,z,clearance,openNeighbors} cells you can pass straight to walk_to_exact; "
             "runStatus is reported only once this character is no longer active. "
             f"Every tool call is logged as one actions/<timestamp>_<tool>.yaml; raw world states live under "
             f"{STATES_DIR_NAME}/ (each storing only chat messages first seen in that state, screenshots are linked, "
@@ -3536,7 +3557,6 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
             "capabilities": runtime.list_capabilities(),
             "timeouts": {
                 "skillTimeoutSeconds": runtime.skill_timeout_seconds,
-                "hint": "Use minecraft_set_skill_timeout to raise/lower the max skill duration to match your client's requestTimeoutMs; keep it below your agent harness's request timeout or long skills will run server-side past your client window.",
             },
             "runStatus": runtime.run_status(),
             "health": health,
@@ -3647,72 +3667,70 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
     async def minecraft_call(
         action: str,
         parameters: dict[str, Any],
-        timeout_seconds: float = 30,
         include_image: bool = False,
     ) -> ToolResult:
-        """Call a named Minecraft action using the exact schema from minecraft_info. Returns the raw body result plus links to the before/after state and screenshot files (beforeStatePath/afterStatePath/beforeScreenshotPath/afterScreenshotPath); read those files to see what changed."""
         safe_parameters = dict(parameters)
-        if action == "find_block":
-            safe_parameters["requireVisible"] = True
-        return await runtime.call_tool(
-            action, safe_parameters, timeout_seconds, include_image
-        )
+        return await runtime.call_tool(action, safe_parameters, 300, include_image)
 
     @mcp.tool
     @log_action(runtime, 'find_interactables')
-    async def minecraft_find_interactables(
-        max_distance: int = 16,
-        include_image: bool = False,
-    ) -> ToolResult:
-        """List all right-click/use interactable blocks within `max_distance` (1..64, default 16): doors, fence gates, trapdoors, buttons, levers, chests/barrels, furnaces, crafting tables, anvils, beds, hoppers, etc. Good for finding entrances/gates to get into fenced or walled areas. Returns name, position, and distance for each."""
-        safe_max = min(max(1, int(max_distance)), 64)
-        return await runtime.call_tool(
-            "find_interactables",
-            {"maxDistance": safe_max},
-            15,
-            include_image,
-        )
+    async def minecraft_find_interactables(include_image: bool = False) -> ToolResult:
+        return await runtime.call_tool("find_interactables", {}, 60, include_image)
 
     @mcp.tool
     @log_action(runtime, 'find_block')
     async def minecraft_find_block(
         block_name: str,
-        max_distance: int = 64,
         include_image: bool = False,
     ) -> ToolResult:
-        """Find the nearest instance of an exact block. It ONLY returns blocks with an unobstructed head-ray line of sight (requireVisible is hard-locked to true â€” no x-ray; walled/underground targets return block_not_found), so you must explore or get a better viewpoint first. Returns a single nearest result; """
-        require_visible = True
+        return await runtime.call_tool("find_block", {"blockName": block_name}, 60, include_image)
+
+    @mcp.tool
+    @log_action(runtime, 'scan_horizon')
+    async def minecraft_scan_horizon(include_image: bool = False) -> ToolResult:
+        return await runtime.call_tool("scan_horizon", {}, 60, include_image)
+
+    @mcp.tool
+    @log_action(runtime, 'walk_to_visible')
+    async def minecraft_walk_to_visible(
+        x: float,
+        y: float,
+        z: float,
+        include_image: bool = False,
+    ) -> ToolResult:
         return await runtime.call_tool(
-            "find_block",
-            {
-                "blockName": block_name,
-                "maxDistance": max_distance,
-                "requireVisible": require_visible,
-            },
-            15,
+            "walk_to_visible",
+            {"target": {"x": x, "y": y, "z": z}},
+            300,
             include_image,
         )
 
     @mcp.tool
-    @log_action(runtime, 'walk_to')
-    async def minecraft_walk_to(
+    @log_action(runtime, 'walk_to_surface')
+    async def minecraft_walk_to_surface(
+        x: float,
+        z: float,
+        include_image: bool = False,
+    ) -> ToolResult:
+        return await runtime.call_tool(
+            "walk_to_surface",
+            {"x": x, "z": z},
+            900,
+            include_image,
+        )
+
+    @mcp.tool
+    @log_action(runtime, 'walk_to_exact')
+    async def minecraft_walk_to_exact(
         x: float,
         y: float,
         z: float,
-        tolerance: float = 1.5,
-        chunk_limit: int = 3,
-        timeout_seconds: float = 60,
         include_image: bool = False,
     ) -> ToolResult:
-        """Walk on foot to a point (flat x, y, z coordinates, NOT a position/block object). Only walks: no digging, no placing, no parkour, no towers, no doors, and no falls over one block. Searches only within a start-centered region of `chunk_limit` chunks (default 3; the server caps this). Stops within `tolerance` blocks. If there is no on-foot path it fails fast (blocked/unreachable or search budget exhausted) instead of sitting around."""
         return await runtime.call_tool(
-            "walk_to",
-            {
-                "target": {"x": x, "y": y, "z": z},
-                "tolerance": tolerance,
-                "chunkLimit": chunk_limit,
-            },
-            timeout_seconds,
+            "walk_to_exact",
+            {"target": {"x": x, "y": y, "z": z}},
+            300,
             include_image,
         )
 
@@ -3722,15 +3740,12 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         x: int,
         y: int,
         z: int,
-        walk_into_range: bool = True,
-        timeout_seconds: float = 60,
         include_image: bool = False,
     ) -> ToolResult:
-        """Mine the block at exact world coordinates (flat x, y, z, NOT a block dict) and verify the resulting block change. Set walk_into_range=False only when the target is already in front of you and within reach; otherwise leave it true so the body walks adjacent (and can collect the drop). Correct-tool harvesting is enforced."""
         return await runtime.call_tool(
             "mine_block",
-            {"block": {"x": x, "y": y, "z": z}, "walkIntoRange": walk_into_range},
-            timeout_seconds,
+            {"block": {"x": x, "y": y, "z": z}},
+            300,
             include_image,
         )
 
@@ -3742,9 +3757,8 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
 
     @mcp.tool
     @log_action(runtime, 'use_item')
-    async def minecraft_use_item(timeout_seconds: float = 10, include_image: bool = False) -> ToolResult:
-        """Use the currently equipped item as if right-clicking: food/milk/potions are eaten/drunk (waits for consumption), eggs/ender pearls/chorus fruit are thrown, and other activatable items are triggered. Verify the effect (food hunger, inventory delta, thrown entity) from the returned state. Returns food_full when the hunger bar is already full."""
-        return await runtime.call_tool("use_item", {}, timeout_seconds, include_image)
+    async def minecraft_use_item(include_image: bool = False) -> ToolResult:
+        return await runtime.call_tool("use_item", {}, 120, include_image)
 
     @mcp.tool
     @log_action(runtime, 'chest_deposit')
@@ -3775,22 +3789,17 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         item_name: str,
         count: int,
         ctx: Context,
-        max_distance: int = 48,
-        timeout_seconds: float | None = None,
     ) -> ToolResult:
-        """Repeatedly find and mine an exact block until after-state proves the requested inventory delta. Uses only this body's ordinary find/mine primitives, not collectblock."""
         if count <= 0:
             raise ValueError("count must be positive")
-        effective_timeout = timeout_seconds if timeout_seconds is not None else runtime.skill_timeout_seconds
         return await runtime.execute_typescript(
             str(COLLECT_BLOCKS_PRIMITIVE),
             {
                 "blockName": block_name,
                 "itemName": item_name,
                 "count": count,
-                "maxDistance": max_distance,
             },
-            effective_timeout,
+            runtime.skill_timeout_seconds,
             15,
             ctx,
             {"kind": "inventory_delta_min", "item": item_name, "count": count},
@@ -3799,14 +3808,11 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
 
     @mcp.tool
     @log_action(runtime, 'craft_item')
-    async def minecraft_craft_item(
-        item_name: str, repetitions: int = 1, timeout_seconds: float = 60
-    ) -> ToolResult:
-        """Craft an exact item recipe through Mineflayer's normal survival crafting API and verify inventory after-state."""
+    async def minecraft_craft_item(item_name: str, repetitions: int = 1) -> ToolResult:
         return await runtime.call_tool(
             "craft_item",
             {"itemName": item_name, "repetitions": repetitions},
-            timeout_seconds,
+            120,
             False,
         )
 
@@ -3817,9 +3823,10 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         input_count: int,
         fuel_item_name: str,
         fuel_count: int = 1,
-        timeout_seconds: float = 180,
     ) -> ToolResult:
-        """Smelt ordinary inventory items in a nearby furnace and return verified after-state."""
+        # Smelt time is deterministic (10s per item plus margin): the timeout
+        # is computed, never guessed.
+        effective_timeout = max(60.0, input_count * 10.0 + 30.0)
         return await runtime.call_tool(
             "smelt",
             {
@@ -3827,20 +3834,16 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
                 "inputCount": input_count,
                 "fuelItemName": fuel_item_name,
                 "fuelCount": fuel_count,
-                "timeoutMs": round(timeout_seconds * 1000),
             },
-            timeout_seconds,
+            effective_timeout,
             False,
         )
 
     @mcp.tool
     @log_action(runtime, 'equip')
-    async def minecraft_equip(
-        item_name: str, timeout_seconds: float = 15, include_image: bool = False
-    ) -> ToolResult:
-        """Equip an inventory item by exact Mineflayer item name."""
+    async def minecraft_equip(item_name: str, include_image: bool = False) -> ToolResult:
         return await runtime.call_tool(
-            "inventory_equip", {"itemName": item_name}, timeout_seconds, include_image
+            "inventory_equip", {"itemName": item_name}, 60, include_image
         )
 
     @mcp.tool
@@ -3855,13 +3858,8 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
 
     @mcp.tool
     @log_action(runtime, 'raytrace')
-    async def minecraft_raytrace(
-        max_distance: float = 64, include_image: bool = False
-    ) -> ToolResult:
-        """Raycast from the player's head along the current view direction and return the exact block and coordinates being looked at (the first solid block hit up to max_distance). Use it to confirm what the crosshair is pointing at before walking/mining, e.g. whether you're looking at a village structure (cobblestone/planks) or a distant landmark."""
-        return await runtime.call_tool(
-            "raycast", {"maxDistance": max_distance}, 10, include_image
-        )
+    async def minecraft_raytrace(include_image: bool = False) -> ToolResult:
+        return await runtime.call_tool("raycast", {}, 30, include_image)
 
     @mcp.tool
     @log_action(runtime, 'kill_command')
@@ -3911,20 +3909,14 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         postcondition: PostconditionSpec,
         arguments: dict[str, Any] | None = None,
         timeout_seconds: float | None = None,
-        heartbeat_seconds: float = 15,
         include_image: bool = False,
     ) -> ToolResult:
-        """Execute a local TypeScript skill in drafts/ or skills/. Normal exit counts as success only if the mandatory after-state `postcondition` also passes.
-
-        postcondition kinds (pick ONE): inventory_min{item,count}, inventory_delta_min{item,count}, held_item{item}, entity_id_absent{entity_id}, block_at{block:{x,y,z},item}, y_min/y_max/health_min/position_changed_min{value}, distance_max{target:{x,y,z},value}. To compose several, pass a single object with only an `all` array (NO kind key): {"all":[{...},{...}]}.
-
-        Runs up to timeout_seconds (default = the server's skillTimeoutSeconds; raise with minecraft_set_skill_timeout) in its own subprocess and returns a heartbeat every heartbeat_seconds. If it completes, Returns the result; if the caller times out first the skill keeps running server-side (call minecraft_observe to track, minecraft_stop/minecraft_kill_skill to halt it). Keep skillTimeoutSeconds at or below your client's requestTimeoutMs."""
         effective_timeout = timeout_seconds if timeout_seconds is not None else runtime.skill_timeout_seconds
         return await runtime.execute_typescript(
             path,
             arguments or {},
             effective_timeout,
-            heartbeat_seconds,
+            15,
             ctx,
             postcondition.as_dict(),
             include_image,
@@ -3960,18 +3952,6 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
         }
 
     @mcp.tool
-    @log_action(runtime, 'set_skill_timeout')
-    async def minecraft_set_skill_timeout(seconds: float) -> dict[str, Any]:
-        """Set the maximum allowed skill/collect_blocks duration (1..3600 s) for this server instance, so you can match it to your client's requestTimeoutMs. Long skills that run past your client's request window will be terminated server-side at their own timeout; minecraft_stop / minecraft_kill_skill halt them sooner (cooperative kill-signal + hard kill)."""
-        async with runtime.lock:
-            new = runtime.set_skill_timeout(seconds)
-        return {
-            "ok": True,
-            "skillTimeoutSeconds": new,
-            "runStatus": runtime.run_status(),
-        }
-
-    @mcp.tool
     @log_action(runtime, 'remember')
     async def minecraft_remember(
         kind: Literal[
@@ -3990,12 +3970,8 @@ def build_mcp(runtime: MinecraftMcpRuntime) -> FastMCP:
 
     @mcp.tool
     @log_action(runtime, 'suicide')
-    async def minecraft_suicide(
-        reason: str,
-        timeout_seconds: float = 30,
-    ) -> ToolResult:
-        """Kill and respawn only this avatar, with observed death evidence."""
-        return await runtime.suicide_avatar(reason, timeout_seconds)
+    async def minecraft_suicide(reason: str) -> ToolResult:
+        return await runtime.suicide_avatar(reason, 120)
 
     @mcp.tool
     @log_action(runtime, 'retire_character')
@@ -4023,6 +3999,7 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--mc-host", default="127.0.0.1")
     parser.add_argument("--mc-port", type=int, required=True)
     parser.add_argument("--username", required=True)
+    parser.add_argument("--mc-version", default="1.19.4", help="Minecraft protocol version string (e.g. 1.19.4)")
     parser.add_argument("--agent-home", type=Path, required=True)
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--web-host", default="127.0.0.1")
@@ -4047,12 +4024,6 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         help="mine_block skips its head-line-of-sight gate for targets within this many blocks (default 3, for tunneling).",
     )
     parser.add_argument(
-        "--walk-to-max-distance",
-        type=float,
-        default=DEFAULT_WALK_TO_MAX_DISTANCE,
-        help="Reject walk_to targets farther than this many blocks (default 16, one chunk).",
-    )
-    parser.add_argument(
         "--max-chunk-limit",
         type=int,
         default=8,
@@ -4065,10 +4036,16 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         help="A* compute budget in ms for each walk path search (default 1000).",
     )
     parser.add_argument(
+        "--walk-exact-search-timeout-ms",
+        type=int,
+        default=8000,
+        help="A* compute budget in ms for walk_to_exact searches, the longest of the three walks (default 8000).",
+    )
+    parser.add_argument(
         "--skill-timeout-seconds",
         type=float,
         default=DEFAULT_SKILL_TIMEOUT_SECONDS,
-        help=f"Maximum duration in seconds for a skill / collect_blocks run; agent can raise/lower it later with minecraft_set_skill_timeout (default {DEFAULT_SKILL_TIMEOUT_SECONDS:g}).",
+        help=f"Maximum duration in seconds for a skill / collect_blocks run (default {DEFAULT_SKILL_TIMEOUT_SECONDS:g}).",
     )
     parser.add_argument(
         "--no-images",
@@ -4080,6 +4057,7 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         minecraft_host=args.mc_host,
         minecraft_port=args.mc_port,
         username=args.username,
+        version=args.mc_version,
         agent_home=args.agent_home.expanduser().resolve(),
         artifact_root=args.artifact_root.expanduser().resolve(),
         web_host=args.web_host,
@@ -4095,9 +4073,9 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         view_distance=args.view_distance,
         anti_stall_guard=args.enable_anti_stall_guard,
         mine_visibility_ignore_distance=args.mine_visibility_ignore_distance,
-        walk_to_max_distance=args.walk_to_max_distance,
         max_chunk_limit=args.max_chunk_limit,
         walk_search_timeout_ms=args.walk_search_timeout_ms,
+        walk_exact_search_timeout_ms=args.walk_exact_search_timeout_ms,
         skill_timeout_seconds=args.skill_timeout_seconds,
     )
 
@@ -4158,6 +4136,16 @@ def init_character(
     shutil.copy2(SDK_PATH, root / "lib" / "minecraft.ts")
     for draft in drafts:
         shutil.copy2(draft, root / "drafts" / draft.name)
+    # Markdown agent skills (survival, housing, ...) -> .agents/skills/<name>/SKILL.md
+    for skill_dir in sorted(agent_skills_source_dir().glob("*")):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        dest = root / ".agents" / "skills" / skill_dir.name / "SKILL.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(skill_md, dest)
     draft_list = "\n".join(f"  - drafts/{draft.name}" for draft in drafts)
     (root / "AGENTS.md").write_text(_character_instructions(draft_list), encoding="utf-8")
     for memory_name in ("WORLD", "PLACES", "ROUTES", "CHESTS", "FAILURES", "JOURNAL"):

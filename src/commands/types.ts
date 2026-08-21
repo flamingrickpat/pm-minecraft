@@ -4,15 +4,32 @@ export interface Vector3 {
   z: number;
 }
 
-export interface WalkToInput {
+/** walk_to_visible: approximate target, snapped to the nearest standable cell within a small sphere. */
+export interface WalkToVisibleInput {
   target: Vector3;
-  tolerance: number;
-  /** Search-region size in chunks (default 3). Validated against the server's max. */
+  tolerance?: number;
+  /** Search-region size in chunks. Defaults to the server's maximum; validated against it. */
   chunkLimit?: number;
 }
 
+/** walk_to_surface: sky-scan the surface at (x, z), spiralling outward when the exact column is not standable, then walk there over any number of internal hops. */
+export interface WalkToSurfaceInput {
+  x: number;
+  z: number;
+  /** Success radius around the requested point (default 1.5). */
+  tolerance?: number;
+}
+
+/** walk_to_exact: precise coordinates known (or saved) to be standable; exact cell first, snap only within 3 blocks. */
+export interface WalkToExactInput {
+  target: Vector3;
+  /** 3D success radius around the target cell (default 1). */
+  tolerance?: number;
+}
+
 export interface BlockCommandOptions {
-  walkIntoRange: boolean;
+  /** Defaults to true: the body walks adjacent before acting. */
+  walkIntoRange?: boolean;
 }
 
 export interface MineBlockInput extends BlockCommandOptions {
@@ -20,9 +37,8 @@ export interface MineBlockInput extends BlockCommandOptions {
 }
 
 export interface FindBlockInput {
+  /** Exact registry name, or a glob pattern like "*log*" matching any wood. */
   blockName: string;
-  maxDistance: number;
-  requireVisible?: boolean;
 }
 
 export interface PlaceBlockInput extends BlockCommandOptions {
@@ -38,10 +54,6 @@ export interface UseBlockInput extends BlockCommandOptions {
 
 export interface AttackEntityInput extends BlockCommandOptions {
   entityId: number;
-  /** How many times to re-walk to the entity's current position when it moves out of range (default 3). */
-  renavigationCount?: number;
-  /** Maximum swings before giving up (default 25). The bot hits until the target is dead/gone. */
-  maxHits?: number;
 }
 
 export interface ChestInput {

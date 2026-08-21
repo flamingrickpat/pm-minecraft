@@ -74,18 +74,18 @@ export interface MinecraftContext {
   executionId: string;
   call(action: string, parameters?: Record<string, unknown>, timeoutSeconds?: number): Promise<MinecraftResponse>;
   observe(): Promise<MinecraftObservation>;
-  findBlock(blockName: string, maxDistance?: number): Promise<MinecraftResponse>;
-  walkTo(target: Vector3, tolerance?: number, timeoutSeconds?: number, chunkLimit?: number): Promise<MinecraftResponse>;
+  findBlock(blockName: string): Promise<MinecraftResponse>;
+  walkTo(target: Vector3, tolerance?: number, timeoutSeconds?: number): Promise<MinecraftResponse>;
   mineBlock(block: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
   placeBlock(referenceBlock: Vector3, face: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
   useBlock(block: Vector3, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
   useItem(): Promise<MinecraftResponse>;
   chestDeposit(itemName: string, count?: number, timeoutSeconds?: number): Promise<MinecraftResponse>;
   chestWithdraw(itemName: string, count?: number, timeoutSeconds?: number): Promise<MinecraftResponse>;
-  attackEntity(entityId: number, walkIntoRange?: boolean, timeoutSeconds?: number, renavigationCount?: number, maxHits?: number): Promise<MinecraftResponse>;
+  attackEntity(entityId: number, walkIntoRange?: boolean, timeoutSeconds?: number): Promise<MinecraftResponse>;
   equip(itemName: string): Promise<MinecraftResponse>;
   craft(itemName: string, repetitions?: number): Promise<MinecraftResponse>;
-  smelt(inputItemName: string, inputCount: number, fuelItemName: string, fuelCount?: number, timeoutSeconds?: number): Promise<MinecraftResponse>;
+  smelt(inputItemName: string, inputCount: number, fuelItemName: string, fuelCount?: number): Promise<MinecraftResponse>;
   rotate(yaw: number, pitch?: number): Promise<MinecraftResponse>;
   stop(): Promise<MinecraftResponse>;
   /** Send ordinary chat. Only communication and informational slash commands are accepted. */
@@ -104,7 +104,19 @@ export interface SkillResult {
 }
 
 export function itemCount(observation: MinecraftObservation, itemName: string): number {
-  return observation.inventory.items.find((item) => item.name === itemName)?.count ?? 0;
+  // Exact name first; wildcard patterns ('*log*') count across all matches.
+  const exact = observation.inventory.items.find((item) => item.name === itemName);
+  if (exact) return exact.count;
+  if (itemName.includes("*") || itemName.includes("?")) {
+    const regex = new RegExp(
+      `^${itemName.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`,
+      "i"
+    );
+    return observation.inventory.items
+      .filter((item) => regex.test(item.name))
+      .reduce((sum, item) => sum + item.count, 0);
+  }
+  return 0;
 }
 
 export function requireSuccessful(response: MinecraftResponse, operation: string): MinecraftResponse {

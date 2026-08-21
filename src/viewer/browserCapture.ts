@@ -26,11 +26,18 @@ export interface BrowserFrameImageCaptureOptions {
   fovDegrees?: number;
 }
 
+export interface BrowserFrameCaptureInput {
+  url: string;
+  /** HUD text lines rendered into the top-left of the captured frame (pose,
+   *  biome, vitals). Omit to capture without the HUD strip. */
+  hud?: string[];
+}
+
 export interface BrowserFrameCapture {
   /** Quality-gated capture: retries until the frame shows usable terrain. */
-  capture(input: { url: string }): Promise<CapturedPng>;
+  capture(input: BrowserFrameCaptureInput): Promise<CapturedPng>;
   /** Single-shot capture without retries; returns the frame regardless of quality. */
-  captureRaw(input: { url: string }): Promise<CapturedPng>;
+  captureRaw(input: BrowserFrameCaptureInput): Promise<CapturedPng>;
   close(): Promise<void>;
 }
 
@@ -142,9 +149,12 @@ export function createBrowserFrameImageCapture(options: BrowserFrameImageCapture
     return page;
   };
 
-  const screenshotOnce = async (url: string): Promise<{ png: Buffer; width: number; height: number; quality: FrameQualityAssessment }> => {
+  const screenshotOnce = async (input: BrowserFrameCaptureInput): Promise<{ png: Buffer; width: number; height: number; quality: FrameQualityAssessment }> => {
     const attempt = async (): Promise<{ png: Buffer; width: number; height: number; quality: FrameQualityAssessment }> => {
-      const currentPage = await ensurePage(url);
+      const currentPage = await ensurePage(input.url);
+      // Crosshair (always, centered on the look direction) + optional HUD
+      // strip, both drawn as DOM overlay so every captured PNG carries them.
+      await injectOverlay(currentPage, input.hud);
       const dimensions = await currentPage.evaluate(() => {
         const canvas = document.querySelector("canvas");
         return {
@@ -191,14 +201,14 @@ export function createBrowserFrameImageCapture(options: BrowserFrameImageCapture
   };
 
   return {
-    capture: ({ url }) => serialize(async () => {
+    capture: ({ url, hud }) => serialize(async () => {
       let lastQuality: FrameQualityAssessment | null = null;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         if (attempt > 0) {
           // Wait for more terrain to render before retrying
           await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
         }
-        const shot = await screenshotOnce(url);
+        const shot = await screenshotOnce({ url, hud });
         lastQuality = shot.quality;
         if (shot.quality.usable) {
           return toCapturedPng(shot);
@@ -210,12 +220,68 @@ export function createBrowserFrameImageCapture(options: BrowserFrameImageCapture
         `Byte size: ${lastQuality?.byteSize}, BG fraction: ${(lastQuality?.backgroundFraction ?? 0).toFixed(2)}`
       );
     }),
-    captureRaw: ({ url }) => serialize(async () => toCapturedPng(await screenshotOnce(url))),
+    captureRaw: ({ url, hud }) => serialize(async () => toCapturedPng(await screenshotOnce({ url, hud }))),
     close: () => serialize(async () => {
       closed = true;
       await disposeBrowser();
     })
   };
+}
+
+/**
+ * Draw the agent overlay into the viewer page: an X crosshair centered on the
+ * canvas (the first-person camera follows the look direction, so dead center
+ * is exactly what minecraft_raytrace resolves) and, when HUD lines are given,
+ * a monospace strip in the top-left corner carrying pose/biome/vitals so the
+ * image is self-describing. Idempotent: creates the overlay once, then only
+ * updates the HUD text.
+ */
+async function injectOverlay(page: import("puppeteer-core").Page, hud?: string[]): Promise<void> {
+  await page.evaluate((lines: string[]) => {
+    try {
+      const OVERLAY_ID = "agent-capture-overlay";
+      const HUD_ID = "agent-capture-hud";
+      let overlay = document.getElementById(OVERLAY_ID);
+      if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.id = OVERLAY_ID;
+        overlay.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;";
+        // Crosshair X: two stacked strokes (black outline under white) for
+        // contrast on any background, centered on the viewport = canvas center.
+        const cross = document.createElement("div");
+        cross.style.cssText =
+          "position:absolute;left:50%;top:50%;width:44px;height:44px;transform:translate(-50%,-50%);";
+        for (const [color, width] of [["#000", 5], ["#fff", 2]] as const) {
+          for (const angle of [45, -45]) {
+            const line = document.createElement("div");
+            line.style.cssText =
+              `position:absolute;left:50%;top:50%;width:${width === 5 ? 46 : 42}px;height:${width}px;` +
+              `background:${color};border-radius:${width / 2}px;transform:translate(-50%,-50%) rotate(${angle}deg);`;
+            cross.appendChild(line);
+          }
+        }
+        overlay.appendChild(cross);
+        document.body.appendChild(overlay);
+      }
+      let hud = document.getElementById(HUD_ID);
+      if (lines.length > 0) {
+        if (!hud) {
+          hud = document.createElement("div");
+          hud.id = HUD_ID;
+          hud.style.cssText =
+            "position:absolute;left:8px;top:8px;font:13px/1.45 ui-monospace,Consolas,monospace;" +
+            "color:#fff;background:rgba(0,0,0,0.55);padding:4px 8px;border-radius:4px;white-space:pre;";
+          overlay.appendChild(hud);
+        }
+        hud.textContent = lines.join("\n");
+        hud.style.display = "block";
+      } else if (hud) {
+        hud.style.display = "none";
+      }
+    } catch (err) {
+      console.warn("Overlay injection failed (non-fatal): " + String(err));
+    }
+  }, hud ?? []);
 }
 
 /**

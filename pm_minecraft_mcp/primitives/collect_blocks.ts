@@ -6,8 +6,10 @@ import {
 } from "../sdk/minecraft.js";
 
 export async function run(ctx: MinecraftContext, raw: unknown): Promise<unknown> {
-  const input = raw as { blockName: string; itemName?: string; count: number; maxDistance?: number };
+  const input = raw as { blockName: string; itemName?: string; count: number };
   if (!input.blockName || !Number.isInteger(input.count) || input.count <= 0) throw new Error("blockName and positive integer count are required");
+  // itemName may be a glob ('*log*'): itemCount sums across every matching
+  // drop, so mixed-wood collection counts correctly.
   const itemName = input.itemName ?? input.blockName;
   const start = itemCount(await ctx.observe(), itemName);
   const attempts: unknown[] = [];
@@ -17,7 +19,9 @@ export async function run(ctx: MinecraftContext, raw: unknown): Promise<unknown>
   await ensureHarvestTool(ctx, input.blockName);
 
   while (itemCount(await ctx.observe(), itemName) - start < input.count) {
-    const found = requireSuccessful(await ctx.findBlock(input.blockName, input.maxDistance ?? 48), `find ${input.blockName}`);
+    // blockName may be a glob too: find_block resolves it against the
+    // registry (nearest match of any kind).
+    const found = requireSuccessful(await ctx.findBlock(input.blockName), `find ${input.blockName}`);
     await ensureHarvestTool(ctx, input.blockName);
     const mined = requireSuccessful(await ctx.mineBlock(responseBlock(found), true, 60), `mine ${input.blockName}`);
     attempts.push({ found: found.data, mined: mined.data });
@@ -38,7 +42,12 @@ export async function run(ctx: MinecraftContext, raw: unknown): Promise<unknown>
 async function ensureHarvestTool(ctx: MinecraftContext, blockName: string): Promise<void> {
   const observation = await ctx.observe();
   const held = observation.inventory.heldItem?.name ?? null;
-  const entry = observation.surroundings?.nearbyBlocks?.find((block) => block.name === blockName);
+  const pattern = blockName.includes("*") || blockName.includes("?")
+    ? new RegExp(`^${blockName.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i")
+    : null;
+  const entry = observation.surroundings?.nearbyBlocks?.find((block) =>
+    pattern ? pattern.test(block.name) : block.name === blockName
+  );
   if (!entry) {
     // No visible block of this kind in the scan; cannot decide a tool.
     return;
