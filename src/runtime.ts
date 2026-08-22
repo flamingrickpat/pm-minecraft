@@ -11,6 +11,7 @@ import { botHudLines, createFrameBundleCapture } from "./targeting/frameBundle.j
 import { createFrameMetadataFileStore, createPixelTargeting } from "./targeting/pixelTargeting.js";
 import { createInventoryService, type InventoryService } from "./inventory/inventoryService.js";
 import { createCraftingService, type CraftingService } from "./crafting/craftingService.js";
+import { reconnectDelayMs } from "./bot/reconnectPolicy.js";
 import { createEvidenceStore, type EvidenceStore } from "./evidence/index.js";
 import { createActionLogger } from "./logging/actionLogger.js";
 import { buildLLMState } from "./state/llmState.js";
@@ -46,8 +47,18 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
   let bot: BotRuntime | null = null;
   const viewer = createViewerRuntime(config.viewer, config.web.host);
   const screenshotDirectory = join(config.evidence.directory, "screenshots");
+  // Auto-reconnect: how long to wait (ms) between attempts, with exponential
+  // backoff. The body holds exactly ONE Mineflayer bot; when its connection
+  // dies (kick, keepalive timeout, network drop) we tear it down and build a
+  // fresh one so the process never sits disconnected forever.
+  const RECONNECT_BASE_MS = 1000;
+  const RECONNECT_MAX_MS = 15_000;
   let viewerHooked = false;
   let stateBroadcastTimer: NodeJS.Timeout | null = null;
+  let reconnectTimer: NodeJS.Timeout | null = null;
+  let reconnectAttempt = 0;
+  let reconnecting = false;
+  let stopping = false;
   const evidenceStore = createEvidenceStore(join(config.evidence.directory, "evidence.db"));
   const browserCapture = createBrowserFrameImageCapture({
     width: config.viewer.captureWidth,
@@ -274,6 +285,76 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
     server.broadcast(event);
   };
 
+  /** Build a fresh bot, then rebuild every component that snapshotted the old
+   *  Mineflayer object by reference (inventory, crafting, viewer hook). The HTTP
+   *  action handlers read `bot` through live arrow closures, so they pick up the
+   *  new value automatically. */
+  async function spawnBot(): Promise<void> {
+    if (reconnecting) {
+      return;
+    }
+    reconnecting = true;
+    try {
+      // If a previous bot exists, give it a clean stop so the new one can bind
+      // the same viewer port and there are no lingering listeners or goals.
+      const stale = bot;
+      if (stale) {
+        await stale.stop().catch(() => undefined);
+        // Close any viewer HTTP server the old bot attached so the new viewer
+        // can re-bind the same port on its next spawn.
+        const viewable = (stale.bot as unknown as { viewer?: { close?: () => void } }).viewer;
+        viewable?.close?.();
+        viewer.status.started = false;
+      }
+      const nextBot = createLiveBot(config.minecraft, emit, { walkSearchTimeoutMs: config.minecraft.walkSearchTimeoutMs });
+      // The Mineflayer link can die for many reasons (kick, keepalive timeout,
+      // ECONNRESET). Watch both terminal events and rebuild on any of them.
+      nextBot.bot.on("end", (reason?: string) => {
+        if (!stopping && !reconnecting) {
+          scheduleReconnect(typeof reason === "string" && reason.length > 0 ? reason : "end");
+        }
+      });
+      nextBot.bot.on("kicked", (reason?: string) => {
+        if (!stopping && !reconnecting) {
+          scheduleReconnect(typeof reason === "string" && reason.length > 0 ? reason : "kicked");
+        }
+      });
+      // Once this bot connects for real, reset the backoff so the next fault
+      // starts from a short delay again.
+      nextBot.bot.once("spawn", () => {
+        reconnectAttempt = 0;
+      });
+      bot = nextBot;
+      inventoryService = createInventoryService(nextBot.bot);
+      craftingService = createCraftingService(nextBot.bot);
+      viewerHooked = false;
+      hookViewerOnSpawn(nextBot, viewer, emit, () => viewerHooked, (value) => {
+        viewerHooked = value;
+      });
+    } finally {
+      reconnecting = false;
+    }
+  }
+
+  /** When the Mineflayer link dies, tear down and rebuild the bot with
+   *  exponential backoff so a flaky server or a transient network drop recovers
+   *  on its own instead of silently wedging the process. */
+  function scheduleReconnect(reason: string): void {
+    if (stopping || reconnectTimer || reconnecting) {
+      return;
+    }
+    const delay = reconnectDelayMs(reconnectAttempt, RECONNECT_BASE_MS, RECONNECT_MAX_MS);
+    reconnectAttempt += 1;
+    emit({ type: "log", level: "warn", message: `Mineflayer disconnected (${reason}); reconnecting in ${delay}ms.` });
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void spawnBot().catch((error) => {
+        emit({ type: "error", message: `Bot spawn during reconnect failed: ${error instanceof Error ? error.message : String(error)}` });
+        scheduleReconnect(String(error));
+      });
+    }, delay);
+  }
+
   return {
     start: async () => {
       if (artifactRoot) {
@@ -290,12 +371,7 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
         );
       }
       paper = await checkPaperReachable(config.minecraft.host, config.minecraft.port, Math.min(config.command.timeoutMs, 5000));
-      bot = createLiveBot(config.minecraft, emit, { walkSearchTimeoutMs: config.minecraft.walkSearchTimeoutMs });
-      inventoryService = createInventoryService(bot.bot);
-      craftingService = createCraftingService(bot.bot);
-      hookViewerOnSpawn(bot, viewer, emit, () => viewerHooked, (value) => {
-        viewerHooked = value;
-      });
+      await spawnBot();
       await server.start();
       stateBroadcastTimer = setInterval(() => {
         server.broadcast({ type: "state", data: bot ? bot.getState() : disconnectedState(config.minecraft.username) });
@@ -304,9 +380,14 @@ export function createRuntime(options: RuntimeOptions = {}): Runtime {
       logStartup(config, paper, viewer);
     },
     stop: async () => {
+      stopping = true;
       if (stateBroadcastTimer) {
         clearInterval(stateBroadcastTimer);
         stateBroadcastTimer = null;
+      }
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
       await browserCapture.close().catch(() => undefined);
       await server.stop();
