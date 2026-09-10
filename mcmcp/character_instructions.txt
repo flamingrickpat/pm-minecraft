@@ -1,0 +1,166 @@
+# Minecraft character workspace
+
+This directory is the agent's writable Minecraft workspace. You are a single
+survival player on a normal Minecraft server. Everything you do must use the
+ordinary survival mechanics below — never creative mode, never `/give`,
+never teleportation, and never operator commands.
+
+- Connect to the minecraft MCP server configured in `.mcp.json`. Start every
+  session with `minecraft_observe` so you can see the world, and read
+  `minecraft_info` for the authoritative schemas and limits.
+- `minecraft_observe(include_image=true)` returns the compact state plus a real
+  PNG camera frame. Frames accumulate under `frames/` and `body.log` holds the
+  body log of this character. Use the live viewer (printed by the start script)
+  to watch and verify progress.
+- Durable notes live under `memory/` (one JSONL file per kind: `world`,
+  `places`, `routes`, `chests`, `failures`, `journal`). Write them with
+  `minecraft_remember` and search them with `minecraft_recall`.
+
+## Tool reference (the MCP cheatsheet)
+
+### See & understand
+- `minecraft_observe(include_image=true)` — fresh world state plus a screenshot
+  (default). The snapshot covers camera, position, health/food, inventory,
+  hotbar, held item, nearby blocks, and nearby entities.
+- `minecraft_info` — the authoritative capability map and fixed limits. Re-read
+  it whenever a parameter shape is unclear.
+- `minecraft_find_block(block, max_distance)` — nearest instance of a block
+  with line of sight. Walled-off/underground targets are invisible; explore or
+  mine exposed faces first.
+- `minecraft_inspect_block(position)` — read one known position directly.
+- `minecraft_find_interactables(pattern)` — list right-click/use blocks nearby
+  (doors, gates, trapdoors, buttons, levers, chests, furnaces, crafting
+  tables, beds).
+- `minecraft_raytrace` / `minecraft_scan_horizon` — what is under the crosshair
+  / what the horizon looks like in every heading.
+- `minecraft_analyze_area(start, end)` — report over a box of the world.
+- `minecraft_recipe_search(item_names, craftable_now)` — which recipes exist
+  and which you can craft right now.
+- `minecraft_count_inventory(pattern)` / `minecraft_distance(a, b)` /
+  `minecraft_relative(...)` — small state helpers.
+
+### Move & aim
+- `minecraft_walk_to_visible(x, y, z)` — walk to a spot you can see.
+- `minecraft_walk_to_surface(x, z)` — walk to the surface at column (x, z).
+- `minecraft_walk_to_exact(x, y, z, ...)` — walk to an exact cell (long walk).
+- `minecraft_find_path(x, y, z)` — preview a path without walking it.
+- `minecraft_rotate(yaw_degrees, pitch_degrees, absolute)` — turn. Positive yaw
+  = right, positive pitch = up.
+- `minecraft_look_at(x, y, z)` — aim the camera at a point.
+- `minecraft_fine_control(controls, duration_ms)` — raw key presses for moments
+  the walker cannot express (bridging, edge work).
+- `minecraft_pillar_up()` — ascend exactly one block: jump and place the held
+  solid block beneath. Equip a block first.
+
+### Change the world
+- `minecraft_mine_block(position)` — mine the block at a known position.
+  Correct-tool harvesting is enforced; walk to uncollected drops.
+- `minecraft_mine_vein(block)` — mine the connected vein around a target block.
+- `minecraft_harvest_tree(base?)` — fell one tree and collect the logs.
+- `minecraft_is_safe_to_dig(position)` — check a cell for water/lava hazards
+  before digging into it.
+- `minecraft_use_block(position)` — right-click a block: open a door/chest/
+  furnace/crafting table, press a button, sleep in a bed.
+- `minecraft_build(...)` / `minecraft_fill_from_inventory(...)` — place blocks
+  from your inventory over a region.
+- `minecraft_staircase_down(depth, torch)` — carve a walkable staircase down.
+  NEVER dig straight down; use this or a draft.
+
+### Items, food & crafting
+- `minecraft_equip(item)` — put an item in hand by exact Mineflayer name.
+- `minecraft_equip_best_tool(target)` — equip the best tool for a block.
+- `minecraft_use_item()` — use the equipped item: food is eaten, potions drunk,
+  eggs/pearls thrown, other activatables triggered.
+- `minecraft_eat_best()` — eat the best food in the inventory.
+- `minecraft_craft_item(item, repetitions)` / `minecraft_craft_max(item)` —
+  craft via the normal survival recipe API and verify the after-state.
+- `minecraft_smelt_item(input, count, fuel, ...)` — smelt in a nearby furnace.
+
+### Containers
+- `minecraft_chest_deposit(position, item, count)` — move items into a chest.
+- `minecraft_chest_withdraw(position, item, count)` — take items out.
+- `minecraft_drop_item(item, count)` / `minecraft_discard_items(...)` — get rid
+  of items.
+
+### Combat & survival
+- Each nearby entity in a fresh observation has an `id`.
+- `minecraft_attack_entity(entity_id)` — swing until the target dies or the hit
+  limit is reached.
+- `minecraft_sleep(bed?)` — sleep to skip the night and reset spawn.
+- `minecraft_suicide(reason)` — kill and respawn only this avatar.
+
+### Reusable skills
+- `minecraft_list_capabilities()` — list reusable TypeScript skills for this
+  character. Prefer a matching skill over writing a new draft.
+- `minecraft_execute_typescript(path, postcondition, arguments?)` — run a draft
+  in `drafts/` or a skill in `skills/`. Success requires the after-state
+  postcondition to pass.
+
+### Memory
+- `minecraft_remember(kind, markdown)` — append a durable note (`world`,
+  `places`, `routes`, `chests`, `failures`, `journal`). Record coordinates,
+  dimension, evidence, and uncertainty.
+- `minecraft_recall(pattern)` — search the durable notes.
+- `minecraft_add_waypoint(description, position?)` and
+  `minecraft_list_waypoints()` — short-lived coordinates (an ore vein, a
+  staircase entry) with a small capacity; the oldest is evicted first.
+
+## Common tasks, fast
+
+- **Open a door / gate:** `minecraft_find_interactables()` to locate it, then
+  `minecraft_use_block` on it. Use it again to close.
+- **Eat something:** `minecraft_eat_best()` (or equip food, then
+  `minecraft_use_item`) and confirm food rose.
+- **Mine something:** `minecraft_find_block` → `minecraft_equip_best_tool` →
+  `minecraft_mine_block(position)`. Walk to any uncollected drop.
+- **Craft something:** gather ingredients, `minecraft_recipe_search`, then
+  `minecraft_craft_item(name)`. For table-only recipes, place a crafting table
+  (`minecraft_build` or the `place_crafting_table` draft) and use it.
+- **Use a chest:** `minecraft_chest_deposit`/`minecraft_chest_withdraw` with the
+  chest position. Remember chest locations with `minecraft_remember("chests", …)`.
+- **Kill something:** get its `id` from a fresh observation, then
+  `minecraft_attack_entity`. Verify with a fresh observation.
+- **Get up/down:** `minecraft_pillar_up()` to ascend; `minecraft_staircase_down`
+  or the `staircase_down` draft to descend — never dig straight down.
+
+## Rules & safety
+
+- **NEVER dig straight down.** You can fall into lava or get trapped. Carve a
+  staircase or a safe path instead.
+- **Probe before you dig.** `minecraft_is_safe_to_dig` reports water/lava
+  hazards; check the next cell before tunneling.
+- `minecraft_find_block` is anti-x-ray by design: no line of sight, no result.
+  Explore or expose the block first, and remember locations with waypoints or
+  `minecraft_remember`.
+- **Held-tool drift:** a climb-y action can leave a placeable block in hand.
+  Re-equip your tool right before using it.
+- **Drops:** walk to uncollected item entities; `minecraft_mine_block` does not
+  chase them for you.
+- Long work belongs in skills: `minecraft_execute_typescript` gives a skill a
+  600 second budget and keeps the tool call alive. Keep single MCP tool calls
+  below your client's `requestTimeoutMs`.
+
+## Optional mods
+
+- **pm-agentic-babymode may be installed.** If it is, you have extra survival
+  rules (sleepiness that only a bed resets, grain/protein/produce nutrition,
+  slower movement, etc.). Adapt your goals and reading of health/food
+  accordingly when the mod is present on the server.
+
+## Working with drafts
+
+- Before you write a behavior, call `minecraft_list_capabilities` and inspect
+  matching skills. Use one when its assumptions fit the fresh state.
+- If no skill fits, write a short TypeScript draft in `drafts/`. Export one
+  async default function `run(api, args)` and compose the generic body actions
+  (`api.observe()`, `api.mineBlock({position})`, `api.walkVisible({target,...})`,
+  `api.equip({item})`, `api.craft({item, repetitions})`, ...) into the required
+  behavior. Return a plain object describing what happened.
+- Run it with `minecraft_execute_typescript` and one deterministic
+  postcondition; if it passes and the behavior is reusable, copy it into
+  `skills/` as a named skill.
+- These drafts ship with the workspace and run as-is. Read one before writing a
+  new draft; some carry world-specific constants (coordinates, tool names) that
+  must be checked against fresh state first.
+
+@@DRAFT_LIST@@

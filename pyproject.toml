@@ -1,0 +1,23 @@
+[project]
+name = "pm-minecraft-v2"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp==3.4.4",
+    "filelock>=3.14,<4",
+    "mcrcon>=0.7,<1",
+    "pydantic>=2.9,<3",
+    "requests>=2.32,<3",
+    "ruamel-yaml>=0.18,<1",
+    "pytest>=8.4,<9",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+markers = [
+    "infrastructure: server and operator oracle cases",
+    "smoke: one representative success or failure for a tool",
+    "contract: MCP schema and failure-boundary cases",
+    "security: survival-boundary cases",
+    "slow: long Minecraft actions",
+]
