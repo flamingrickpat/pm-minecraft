@@ -1255,7 +1255,11 @@ export class MinecraftBody {
   async mine(position: Vector): Promise<MineResult> {
     const bot = this.bot!;
     const block = bot.blockAt(new Vec3(position.x, position.y, position.z))!;
-    if (block.boundingBox === "empty") throw new Error("target is not a solid block");
+    // Collision bounds do not determine whether a block can be dug.
+    // Grass and tall grass have empty bounds but support normal digging.
+    if (["air", "cave_air", "void_air"].includes(block.name)) {
+      return { ok: false, reason: "target_changed", block: { position, name: block.name, display_name: block.displayName, replaceable: true }, tool_used: bot.heldItem?.name ?? null, can_harvest: false, drops: [] };
+    }
     await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true);
     const tool = bot.heldItem?.name ?? null;
     const canHarvest = (block as any).canHarvest(bot.heldItem?.type ?? null) === true;

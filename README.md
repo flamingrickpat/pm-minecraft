@@ -110,6 +110,13 @@ runtime. It does not stream state or provide a live view.
 Read each tool description before you call a tool. The descriptions state the
 argument schema, survival limits, and returned data.
 
+`minecraft_mine_block` can dig breakable vegetation, including grass and tall grass.
+`minecraft_inspect_block.is_solid` describes collision bounds.
+Grass and tall grass have empty bounds and support digging.
+The body uses Mineflayer's normal digging path and checks the resulting block.
+If the target becomes air before digging starts, the body reports `target_changed`.
+The Python tool still rejects an air target observed before the action as `not_found`.
+
 Examples:
 
 ```json
