@@ -911,6 +911,10 @@ class MinecraftRuntime:
                 duration_ms=(time.monotonic() - started) * 1000,
             )
 
+        if material_name.endswith("_door"):
+            return self._build_doors(shape, material, material_name, cells, in_range, out_of_range,
+                                     bounds, state, generation, started)
+
         blocks = self.body.blocks(in_range).blocks
         occupied = [
             PlacedCell(position=block.position, block_name=block.name)
@@ -974,6 +978,47 @@ class MinecraftRuntime:
             image=None,
             duration_ms=(time.monotonic() - started) * 1000,
         )
+
+    def _build_doors(self, shape, material, material_name, cells, in_range, out_of_range,
+                     bounds, state, generation, started) -> BuildResult:
+        """Use one inventory door per lower cell and retain both actual halves.
+
+        A request may name the lower cell or both cells. Native placement
+        creates the upper half. It never uses server-assisted default states.
+        """
+        placed, occupied, handled = [], [], set()
+        missing = 0
+        failure, message = None, None
+        for cell in sorted(in_range, key=lambda point: (point.x, point.z, point.y)):
+            key = (cell.x, cell.y, cell.z)
+            if key in handled:
+                continue
+            if generation != self._stop_generation:
+                failure, message = "stopped", "Door construction was stopped before its next placement."
+                break
+            block = self.body.blocks([cell]).blocks[0]
+            if not block.replaceable:
+                occupied.append(PlacedCell(position=cell, block_name=block.name))
+                continue
+            if _inventory_counts(self.body.state().inventory).get(material_name, 0) == 0:
+                missing += 1
+                continue
+            result = self.body.place_door(cell, material_name)
+            if not result.ok:
+                failure, message = result.reason, f"Native door placement failed: {result.reason}."
+                break
+            for position in (result.position, result.upper_position):
+                handled.add((position.x, position.y, position.z))
+                placed.append(PlacedCell(position=position, block_name=material_name))
+        complete = (failure is None and not occupied and not out_of_range and not missing
+                    and all((cell.x, cell.y, cell.z) in handled for cell in cells))
+        reason = failure or ("occupied" if occupied and not placed else None if complete else "partial")
+        return BuildResult(ok=complete, reason=reason, message=message, shape=shape,
+            material_requested=material, material_resolved=material_name, bounds=bounds,
+            planned_cells=len(cells), placed_count=len(placed), placed=placed, occupied=occupied,
+            out_of_range=out_of_range, missing_material_cells=missing,
+            inventory_delta=_inventory_delta(state.inventory, self.body.state().inventory),
+            candidates=None, image=None, duration_ms=(time.monotonic() - started) * 1000)
 
     def minecraft_rotate(
         self,

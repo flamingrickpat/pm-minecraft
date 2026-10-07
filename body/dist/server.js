@@ -45,6 +45,11 @@ export function startServer(body, host, port, token) {
             writeJson(response, 200, body.catalog());
             return;
         }
+        if (request.method === "POST" && request.url === "/place_door") {
+            const value = await readJson(request);
+            writeJson(response, 200, await body.placeDoor(value.position, value.material));
+            return;
+        }
         if (request.method === "POST" && request.url === "/blocks") {
             const value = await readJson(request);
             writeJson(response, 200, { blocks: body.blocks(value.positions) });

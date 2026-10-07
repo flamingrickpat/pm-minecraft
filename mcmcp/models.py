@@ -952,9 +952,10 @@ class PlacedCell(BaseModel):
 class BuildResult(ToolOutcome):
     """Outcome of a programmatic build (wall/floor/box/staircase/...).
 
-    The bot does not look or aim; it spawns blocks directly at the requested
-    cells with server-assisted placement. Every placement consumes an
-    inventory block. The tool never replaces a solid block. Skipped cells
+    Ordinary blocks use server-assisted placement and consume inventory.
+    Doors use native placement: one item creates lower and upper cells.
+    The placed list includes the automatic upper cell even when only the lower
+    cell was requested. The tool never replaces a solid block. Skipped cells
     are grouped as occupied, out of range, or missing material.
     """
 

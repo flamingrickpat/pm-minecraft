@@ -26,6 +26,7 @@ from .body_models import (
     BodyCraft,
     BodyCraftMax,
     BodyDrop,
+    BodyDoorPlacement,
     BodyEat,
     BodyEquip,
     BodyEquipBest,
@@ -248,6 +249,11 @@ class MinecraftBody:
 
     def craft(self, item: str, repetitions: int) -> BodyCraft:
         return BodyCraft.model_validate(self._request("POST", "/craft", {"item": item, "repetitions": repetitions}, timeout=30))
+
+    def place_door(self, position: Vec3i, material: str) -> BodyDoorPlacement:
+        """Place both door halves through one ordinary Mineflayer action."""
+        return BodyDoorPlacement.model_validate(self._request("POST", "/place_door", {
+            "position": position.model_dump(), "material": material}))
 
     def mine(self, position: Vec3i) -> BodyMine:
         return BodyMine.model_validate(self._request("POST", "/mine", {"position": position.model_dump()}, timeout=65))

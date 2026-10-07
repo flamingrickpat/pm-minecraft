@@ -259,6 +259,15 @@ class BodyCraft(BaseModel):
     table: Vec3i | None
 
 
+class BodyDoorPlacement(BaseModel):
+    """One native placement and its automatically created upper door cell."""
+
+    ok: bool
+    reason: str | None
+    position: Vec3i
+    upper_position: Vec3i
+
+
 class BodyMine(BaseModel):
     ok: bool
     reason: Literal["unharvestable", "target_changed"] | None

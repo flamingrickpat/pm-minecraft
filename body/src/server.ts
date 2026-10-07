@@ -58,6 +58,11 @@ export function startServer(
       writeJson(response, 200, body.catalog());
       return;
     }
+    if (request.method === "POST" && request.url === "/place_door") {
+      const value = await readJson(request) as { position: Vector; material: string };
+      writeJson(response, 200, await body.placeDoor(value.position, value.material));
+      return;
+    }
     if (request.method === "POST" && request.url === "/blocks") {
       const value = await readJson(request) as { positions: Vector[] };
       writeJson(response, 200, { blocks: body.blocks(value.positions) });

@@ -555,6 +555,45 @@ export class MinecraftBody {
         const risk = hazards.length > 0 ? "warning" : "low_risk";
         return { risk, hazards, will_fall: willFall ? true : false, fall_depth: fallDepth };
     }
+    async placeDoor(position, material) {
+        // One door item creates two block states through native placement.
+        // Setting a default block state creates an incomplete lower half.
+        const bot = this.bot;
+        const lower = new Vec3(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z));
+        const upper = lower.offset(0, 1, 0);
+        const result = (ok, reason) => ({
+            ok, reason, position: vector(lower), upper_position: vector(upper),
+        });
+        const item = bot.inventory.items().find((candidate) => candidate.name === material);
+        if (item === undefined)
+            return result(false, "missing_material");
+        const floor = bot.blockAt(lower.offset(0, -1, 0));
+        const lowerBlock = bot.blockAt(lower);
+        const upperBlock = bot.blockAt(upper);
+        if (floor === null || floor.boundingBox === "empty")
+            return result(false, "no_support");
+        if (lowerBlock === null || upperBlock === null)
+            return result(false, "unloaded");
+        if (lowerBlock.boundingBox !== "empty" || upperBlock.boundingBox !== "empty")
+            return result(false, "occupied");
+        if (bot.entity.position.offset(0, 1.62, 0).distanceTo(lower.offset(0.5, 0.5, 0.5)) > 5)
+            return result(false, "out_of_range");
+        await bot.equip(item, "hand");
+        await bot.lookAt(floor.position.offset(0.5, 1, 0.5), true);
+        await bot.placeBlock(floor, new Vec3(0, 1, 0));
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) {
+            const placedLower = bot.blockAt(lower);
+            const placedUpper = bot.blockAt(upper);
+            if (placedLower?.name === material && placedUpper?.name === material
+                && placedLower.getProperties().half === "lower" && placedUpper.getProperties().half === "upper") {
+                await delay(100);
+                return result(true, null);
+            }
+            await delay(50);
+        }
+        return result(false, "state_sync_failed");
+    }
     async craftMax(itemName, limit) {
         const bot = this.bot;
         const item = bot.registry.itemsByName[itemName];

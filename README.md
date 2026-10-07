@@ -147,6 +147,13 @@ snapshot after each body action. Debug mode is slower.
 
 ## Development
 
+The build tool uses native placement for doors. Request the lower cell.
+One door item creates lower and upper halves. The result lists both cells,
+including the automatic upper cell outside a one-cell request.
+Fresh inspection checks both halves. The block interaction tool opens or
+closes the door. Ordinary block shapes keep their existing server assistance
+and inventory consumption.
+
 Build the body after a TypeScript change:
 
 ```powershell
