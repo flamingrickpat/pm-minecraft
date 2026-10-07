@@ -21,7 +21,7 @@ from typing import Any, Literal, get_type_hints
 from fastmcp import FastMCP
 from fastmcp.tools import ToolResult
 from mcp.types import ImageContent, TextContent
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, validate_call
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -33,6 +33,7 @@ from .models import ImageRef, ToolOutcome
 from .runtime import MinecraftRuntime
 from .startup import initialize_agent_home
 from .tools import MinecraftTools
+from .body_fence import BodyFence
 
 
 PATH = "/mcp"
@@ -55,15 +56,22 @@ class ConcurrentToolCallResult(ToolOutcome):
 
 
 class CommandGate:
-    def __init__(self) -> None:
+    def __init__(self, fence: BodyFence | None = None) -> None:
         self.mutex = threading.Lock()
+        self.idle = threading.Condition(self.mutex)
+        self.fence = fence
         self.running: tuple[str, float] | None = None
 
     def call(self, method: Any, *args: Any, **kwargs: Any) -> Any:
         if method.__name__ in CONCURRENT_TOOLS:
+            if self.fence is not None:
+                with self.mutex:
+                    self.fence.validate(method.__name__, getattr(self.fence.local, "token", None))
             return method(*args, **kwargs)
         # Hold the mutex only while checking/updating ownership. Never queue commands.
         with self.mutex:
+            if self.fence is not None:
+                self.fence.validate(method.__name__, getattr(self.fence.local, "token", None))
             if self.running is not None:
                 name, started = self.running
                 budget = COMMAND_BUDGETS.get(name)
@@ -80,6 +88,7 @@ class CommandGate:
         finally:
             with self.mutex:
                 self.running = None
+                self.idle.notify_all()
 
 
 def _round_floats(value: Any) -> Any:
@@ -194,10 +203,48 @@ def build_server(configuration: Configuration) -> FastMCP:
         lifespan=lifespan,
     )
     frame_directory = configuration.agent_home / "frames"
-    gate = CommandGate()
+    fence = BodyFence(configuration.agent_home / "body-epoch.json")
+    gate = CommandGate(fence)
+    owned_tools = {}
     for name, method in inspect.getmembers(tools, inspect.ismethod):
         if name.startswith("minecraft_"):
-            mcp.tool(output_schema=_tool_output_schema(method))(_wrap_tool(method, frame_directory, gate, runtime))
+            wrapper = _wrap_tool(method, frame_directory, gate, runtime)
+            owned_tools[name] = validate_call(wrapper)
+            mcp.tool(output_schema=_tool_output_schema(method))(wrapper)
+
+    @mcp.tool()
+    def minecraft_body_claim(owner: str, epoch: int, session: str) -> dict:
+        """Fence a replacement session after all earlier commands finish."""
+        if not owner or not session or epoch < 1:
+            raise ValueError("A body claim needs an owner, session, and positive epoch.")
+        with gate.idle:
+            gate.idle.wait_for(lambda: gate.running is None)
+            token = {"owner": owner, "epoch": epoch, "session": session, "active": True}
+            if epoch == fence.state["epoch"]:
+                fence.validate("claim", token)
+                return {"ok": True, **fence.state}
+            if epoch < fence.state["epoch"]:
+                raise PermissionError("Stale Minecraft body epoch.")
+            return fence.commit(token)
+
+    @mcp.tool()
+    def minecraft_body_release(owner: str, epoch: int, session: str) -> dict:
+        """Retain the epoch after its owner finishes external cleanup."""
+        with gate.idle:
+            gate.idle.wait_for(lambda: gate.running is None)
+            fence.validate("release", {"owner": owner, "epoch": epoch, "session": session})
+            return fence.commit({**fence.state, "active": False})
+
+    @mcp.tool()
+    def minecraft_body_call(owner: str, epoch: int, session: str, tool: str, arguments: dict) -> ToolResult:
+        """Validate the epoch and original tool arguments before body dispatch."""
+        if tool not in owned_tools:
+            raise ValueError("The fenced call names an unknown Minecraft tool.")
+        fence.local.token = {"owner": owner, "epoch": epoch, "session": session}
+        try:
+            return owned_tools[tool](**arguments)
+        finally:
+            fence.local.token = None
     if configuration.test_mode:
         @mcp.custom_route("/test/body/start", methods=["POST"], include_in_schema=False)
         async def start_test_body(request: Request) -> Response:
@@ -206,6 +253,9 @@ def build_server(configuration: Configuration) -> FastMCP:
 
         @mcp.custom_route("/test/body/stop", methods=["POST"], include_in_schema=False)
         async def stop_test_body(request: Request) -> Response:
+            with gate.mutex:
+                if fence.state["active"]:
+                    fence.commit({**fence.state, "active": False, "interrupted": "body_disconnect"})
             runtime.stop_body()
             return JSONResponse({"ok": True})
 

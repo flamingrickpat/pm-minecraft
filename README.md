@@ -147,6 +147,32 @@ snapshot after each body action. Debug mode is slower.
 
 ## Development
 
+### Body ownership and restart
+
+PM's actor uses one shared operating-system lease per MCP endpoint.
+The server retains the matching epoch in `MCMCP_AGENT_HOME/body-epoch.json`.
+`minecraft_body_claim(owner, epoch, session)` waits for an active command, then commits a higher epoch.
+`minecraft_body_call(owner, epoch, session, tool, arguments)` validates that token before calling the original typed tool.
+`minecraft_body_release(owner, epoch, session)` waits for cleanup and retains an inactive epoch.
+An identical active claim is idempotent.
+An old epoch, changed session, or inactive equal epoch fails before body access.
+
+Original tool arguments and results keep their existing schemas.
+Direct observations remain available.
+Direct mutations require the token while an owner holds the body.
+The concurrent stop tool validates the same token before cancelling its command.
+A client disconnect does not release an active server command.
+A replacement claim waits until that command finishes.
+MCP startup invalidates any retained active token and preserves its high-water epoch.
+The test-controlled body stop does the same before disconnecting the character.
+
+Keep the character directory across server restarts.
+Keep PM's shared lease registry across application restarts.
+All local PM instances must use the same registry and one endpoint per avatar.
+The protocol assumes trusted local clients and one MCP service per avatar.
+Epochs reject stale commands; they do not authenticate clients or restore world effects.
+The [A12 application manual](https://github.com/flamingrickpat/pm_next_v2/blob/main/docs/subsystems/body-recovery.md) documents explicit recovery and retained evidence.
+
 The build tool uses native placement for doors. Request the lower cell.
 One door item creates lower and upper halves. The result lists both cells,
 including the automatic upper cell outside a one-cell request.
