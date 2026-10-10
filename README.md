@@ -117,6 +117,29 @@ The body uses Mineflayer's normal digging path and checks the resulting block.
 If the target becomes air before digging starts, the body reports `target_changed`.
 The Python tool still rejects an air target observed before the action as `not_found`.
 
+`minecraft_recipe_search` checks every ingredient variant for each matching item.
+It reports a recipe that uses available inventory when one is usable.
+Otherwise, it reports the variant with the smallest ingredient deficit.
+Failed `minecraft_craft_item` calls use that same deficit rule for missing ingredients.
+Birch planks can therefore satisfy a stick recipe without requiring oak planks.
+The `craftable_now` field also requires a nearby crafting table for a 3 by 3 recipe.
+The table search uses the same four-block range as `minecraft_craft_item`.
+The optional filter selects available or unavailable items; it does not change that field's meaning.
+This search reads the recipe registry, inventory, and loaded terrain. It does not consume items.
+
+Block searches allow 30 seconds for the body HTTP response.
+Broad patterns inspect exposed faces across the full search box and can exceed the two-second timeout used for status reads.
+The result retains its actual search coverage and matching block count.
+
+Each walk uses one deadline for path search, partial-route search, movement, and replanning.
+Surface shaft approaches use the time left in that same deadline.
+A timed-out or stopped approach returns its current position and camera.
+The internal HTTP grace period can then receive the normal failure result.
+
+Player oxygen comes from the player's own air metadata on the 0 to 20 bubble scale.
+Mineflayer 4.38 can overwrite its global oxygen value when another entity's metadata arrives.
+That global value does not establish the player's air supply.
+
 Examples:
 
 ```json
@@ -199,7 +222,130 @@ Every test returns the world to the checkpoint baseline before it starts. See
 `test_infrastructure/README.md` and `tests/CONTRACT.md` for the test rules.
 # Required server mod
 
+`minecraft_observe` includes the public `body_session` identity and `death_count`.
+`minecraft_info.server_rules` contains the server's current `babymode help` response.
+This read does not change world or player state.
+Check natural regeneration and enabled nutrition effects before choosing health recovery.
+Equipping closes an open container window before selecting the player-inventory item.
+The equip HTTP request allows thirty seconds for Mineflayer's bounded inventory update.
+The count increases when Mineflayer reports the player's death.
+A new Node body process starts a new session and counter.
+Respawn does not undo a death or prove that a hazard was survived.
+The body log appends a session marker so later body startup preserves earlier logs.
+
 Agentic Babymode 0.5.0 or newer is required. MCP checks the version at startup.
 Mined loot enters the miner's inventory. Only overflow drops at the block.
 Normal loot, tool requirements, enchantments, and durability apply.
 The separate pickup-range mod is obsolete. Custom gameplay requires a custom fork.
+
+The staircase helper checks loaded solid support below each notch before digging.
+It preserves that floor and uses the normal pathfinder for one exact landing.
+Only a grounded one-block descent in the same life counts as a step.
+Unknown support, an unstable floor, changed clearance, failed movement, cancellation, or death stops the descent.
+Partial descent returns `ok=false` with a reason and retained dug-block quantities.
+The result includes the body session and death counters before and after the action.
+Inventory loss across death does not prove block placement or ingredient consumption.
+
+Run the captured staircase boundaries after building the body:
+
+```powershell
+node --test body/test/staircase-boundary.test.mjs
+```
+
+These checks use captured real-server geometry and an actual failed descent.
+The positive one-step control is a contract projection, not a live gameplay pass.
+
+## Harvesting prerequisites and occupied body space
+
+M3-34 accepted the revised respawn reconciliation through verifier 111.
+This fifth certificate does not establish native healing.
+The next actor rebuilt ordinary wood stock but repeatedly tried to mine exposed iron with a stick.
+Its block search reported false harvestability.
+The exact inspector returned empty tools, null harvesting eligibility, empty drops, and null hardness.
+Those omitted fields failed the inspector contract.
+
+The body now supplies tool names sorted by actual breaking time, current held-tool harvestability, registry drops, and hardness.
+The MCP inspector publishes those typed facts.
+After two wrong-tool failures, the gateway requires a fresh true harvestability read for each requested target.
+Changing coordinates or writing another diagnosis cannot override false or missing eligibility.
+A fresh block search can also provide exact-target eligibility.
+Reads must follow the latest wrong-tool failure and belong to the current actor source.
+Other prerequisite actions remain available, subject to the existing recovery guards.
+Historical tool certificates remain valid evidence of earlier work; they do not prove current ownership after death.
+
+The same actor dug below its body and placed birch planks inside its feet cell.
+The server recorded `tdd_player suffocated in a wall`.
+Its final observation reported one death and an empty inventory.
+The body now refuses mining below every horizontal column touched by the player's 0.6-block width.
+The MCP build path rejects an entire request that overlaps the standing 1.8-block body before any placement or inventory consumption.
+The check includes a door's upper half.
+A floor ending at the feet and construction from a supported side remain permitted.
+Crouching uses the conservative standing-height bound.
+These guards use fresh production body positions rather than an old journal pose.
+
+`a13-harvesting-body-space.json` retains the original reads, false-tool calls, placement, death observation, and source digests.
+Minecraft's `a13-body-space.json` retains the actual pose and affected cells.
+Captured and projected boundary tests are engineering checks; they do not establish repaired native behavior.
+No inventory, world, or accepted specification was restored to conceal either death.
+M3 remains pending and must continue from M3-34 in the same retained world.
+
+Equipment now reports fresh held-tool eligibility and a registry-based theoretical craft hint.
+Success can mean the already-held item remains suitable; it does not establish resource progress.
+The companion pauses repeated equipment no-ops after two calls.
+M3-36 exercised real inspection, support refusal, and adjacent soil gains, but did not complete the iron chain.
+
+## Bounded smelting and retained furnace contents
+
+M3-37 mined three fresh raw iron and independently verified the mining leaf.
+Its next actor requested three smelts with one birch log, then hit a body HTTP timeout.
+The original body waited indefinitely for all requested output.
+One log or plank smelts 1.5 items; three iron require two logs or planks.
+
+Smelting now stops after observed fuel exhaustion or a 90-second body wait.
+Partial output and unused input and fuel return to inventory.
+`furnace_before` records actual slots before the action.
+`recovered_output` reports existing output separately from the new batch.
+The body collects retained contents before loading another batch and closes the window in its final cleanup.
+A protocol error can still leave inserted items; closing the window does not undo them.
+The next call must inspect retained effects rather than repeat the original count blindly.
+The public result preserves partial quantities and the actual failure reason.
+Captured and projected checks use `body/test/fixtures/a13-smelt-timeout.json`; they do not establish native acceptance.
+
+M3-39 independently opened that furnace and observed two raw iron and one ingot, with no fuel.
+Its actor then passed the furnace to chest withdrawal, causing an unsupported-container exception.
+Storage transfer now validates the current block type and five-block distance before opening.
+Invalid targets return `not_storage_container`, `out_of_range`, or `target_changed` without transfer.
+The public tools require an explicit chest, barrel, or shulker-box cell.
+Colored shulker boxes remain supported.
+Furnaces use `minecraft_smelt_item`, which collects previous output and smelts the remaining input with supplied fuel.
+`a13-furnace-storage-target.json` retains the real inspection, window, wrong tool calls, and original error.
+
+M3-41 used the correct smelting tool and recovered two raw iron and one ingot.
+The tool then reported missing input because Mineflayer's main inventory remained stale until the furnace window closed.
+Smelting now counts player inventory directly from the live window's inventory range.
+Furnace slots remain separate, so retained input cannot count twice.
+The actual reply and subsequent observations remain in `body/test/fixtures/a13-window-inventory.json`.
+The reply records recovered output and no new smelt; later observations confirm the real inventory gains.
+These captures and window-count boundaries establish the repair contract. Fresh native completion remains pending.
+
+## Observed block activation
+
+M3-58 completed and independently accepted the roof and construction story.
+Its next actor stopped at the entrance after a tool reported `door_opened` while independent server reads still showed a closed door.
+The reply also attached the old furnace window as a chest window at the door.
+Later native interactions left the door open before shutdown. Those effects remain preserved.
+
+The Node body's `useBlock` now closes the previous container window before another activation.
+Doors, gates, and trapdoors require an observed change in their `open` property.
+Container activation requires a new window. Other interaction kinds retain their existing packet-activation contract.
+One ten-second wait bounds confirmation; the Python body client allows fifteen seconds for that request.
+`activation_unconfirmed` returns `ok=false` and no claimed action.
+The public result includes `open_before` and `open_after` when the target has this property.
+A delayed server effect can still occur after an unconfirmed result; inspect current state before retrying.
+
+The real `a13-block-activation60` probe opened the furnace and toggled the same door twice.
+Independent server reads confirmed both door halves after each toggle.
+The door reply contained no stale window. Position, inventory, and vitals remained unchanged.
+Both toggles returned the door to its initial observed state through ordinary tool calls.
+The original mismatch and successful probe remain in `body/test/fixtures/a13-block-activation.json`.
+These protocol results do not establish native entry or complete M3 acceptance.

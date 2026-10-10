@@ -37,6 +37,15 @@ class ServerAssist:
         )
         return "Agentic Babymode" in reply
 
+    def server_rules(self) -> str:
+        """Read current Babymode rules without changing player or world state.
+
+        The server owns these rules. Local defaults cannot establish whether
+        food restores health or which nutrition effects are enabled.
+        An unavailable RCON connection raises its original error.
+        """
+        return self._command("babymode help")
+
     def kill_player(self) -> str:
         """Kill the configured player through the server console."""
         return self._command(f"kill {self.configuration.player_name}")

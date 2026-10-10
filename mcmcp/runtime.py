@@ -47,7 +47,7 @@ from .constants import (
     VISIBLE_AREA_UP_BLOCKS,
     WAYPOINT_CAPACITY,
 )
-from .geometry import build_cells
+from .geometry import build_cells, player_intersects_cell
 from .memory import AgentMemory
 from .models import (
     AddWaypointResult,
@@ -302,6 +302,7 @@ class MinecraftRuntime:
         state = None if self.body is None else self.body.state()
         return InfoResult(
             ok=True,
+            server_rules=self.assist.server_rules(),
             username=configuration.player_name,
             server=f"{configuration.minecraft_host}:{configuration.minecraft_port}",
             body_url=f"http://{configuration.body_host}:{configuration.body_port}",
@@ -381,6 +382,8 @@ class MinecraftRuntime:
             ok=True,
             camera=snapshot.camera,
             player=snapshot.player,
+            body_session=self.body.session_id,
+            death_count=snapshot.death_count,
             held_item=snapshot.held_item,
             hotbar=snapshot.hotbar,
             inventory=snapshot.inventory,
@@ -468,6 +471,8 @@ class MinecraftRuntime:
                 position=position,
                 block_name="air",
                 display_name="Air",
+                properties=center_block.properties,
+                collision_shapes=center_block.collision_shapes,
                 is_solid=False,
                 exposed_faces=[],
                 neighbors=[],
@@ -505,9 +510,15 @@ class MinecraftRuntime:
             position=position,
             block_name=center_block.name,
             display_name=center_block.display_name,
+            properties=center_block.properties,
+            collision_shapes=center_block.collision_shapes,
             is_solid=not center_block.replaceable,
             exposed_faces=exposed,
             neighbors=neighbors,
+            best_tools=center_block.best_tools,
+            can_harvest_with_held=center_block.can_harvest_with_held,
+            drops=center_block.drops,
+            hardness=center_block.hardness,
             image=self.body.screenshot() if include_image else None,
         )
 
@@ -738,40 +749,56 @@ class MinecraftRuntime:
         fuel: str | None = None,
         fuel_count: int = 1,
     ) -> SmeltItemResult:
+        """Smelt owned input and preserve actual partial and retained effects.
+
+        Inspect the chosen furnace before checking supplies. Its input slot
+        can contain owned items from an interrupted request. The body collects
+        retained output separately and returns unused input and fuel. A fuel
+        shortage returns a partial result instead of waiting without a bound.
+        Protocol errors remain uncertain; closing a window cannot undo them.
+        """
         before = self._require_body()
         input_matches = matching(input, before.inventory)
+        if not input_matches:
+            input_matches = matching(input, self.body.catalog().items)
         fuel_matches = matching(fuel or "coal", before.inventory)
         if len(input_matches) != 1 or len(fuel_matches) != 1:
             ambiguous = len(input_matches) > 1 or len(fuel_matches) > 1
             return SmeltItemResult(ok=False, reason="ambiguous" if ambiguous else "missing", message="Input and fuel must each match one inventory item.", furnace=None, input_item=None, input_consumed=0, fuel_item=None, fuel_consumed=0, output=None, inventory_delta=None, duration_ms=0, missing=None)
         input = input_matches[0].name
         fuel_name = fuel_matches[0].name
+        furnaces = self.minecraft_find_interactables("furnace")
+        nearby_furnaces = [entry for entry in furnaces.results if entry.distance <= FURNACE_DISTANCE_BLOCKS] if furnaces.ok else []
+        if not nearby_furnaces:
+            return SmeltItemResult(ok=False, reason="furnace_not_found", message="No furnace was found within range.", furnace=None, input_item=input, input_consumed=0, fuel_item=fuel_name, fuel_consumed=0, output=None, inventory_delta=None, duration_ms=0, missing=None)
+        furnace = nearby_furnaces[0].position
+        self.minecraft_walk_to_visible(furnace.x, furnace.y, furnace.z)
+        retained = self.body.use_block(furnace, "furnace").window
         available = _inventory_counts(before.inventory)
+        if retained is not None:
+            for slot in retained.slots:
+                if slot.slot in (0, 1) and slot.item:
+                    available[slot.item] = available.get(slot.item, 0) + slot.count
         missing = []
         if available.get(input, 0) < input_count:
             missing.append(__import__("mcmcp.models", fromlist=["IngredientNeed"]).IngredientNeed(item=input, display_name=input.replace("_", " "), required=input_count, have=available.get(input, 0), missing=input_count - available.get(input, 0)))
         if available.get(fuel_name, 0) < fuel_count:
             missing.append(__import__("mcmcp.models", fromlist=["IngredientNeed"]).IngredientNeed(item=fuel_name, display_name=fuel_name.replace("_", " "), required=fuel_count, have=available.get(fuel_name, 0), missing=fuel_count - available.get(fuel_name, 0)))
         if missing:
-            return SmeltItemResult(ok=False, reason="missing", message="Input or fuel is missing.", furnace=None, input_item=input, input_consumed=0, fuel_item=fuel_name, fuel_consumed=0, output=None, inventory_delta=None, duration_ms=0, missing=missing)
-        furnaces = self.minecraft_find_interactables("furnace")
-        if not furnaces.ok:
-            return SmeltItemResult(ok=False, reason="furnace_not_found", message="No nearby furnace was found.", furnace=None, input_item=input, input_consumed=0, fuel_item=fuel_name, fuel_consumed=0, output=None, inventory_delta=None, duration_ms=0, missing=None)
-        nearby_furnaces = [
-            entry for entry in furnaces.results
-            if entry.distance <= FURNACE_DISTANCE_BLOCKS
-        ]
-        if not nearby_furnaces:
-            return SmeltItemResult(ok=False, reason="furnace_not_found", message="No furnace was found within range.", furnace=None, input_item=input, input_consumed=0, fuel_item=fuel_name, fuel_consumed=0, output=None, inventory_delta=None, duration_ms=0, missing=None)
-        furnace = nearby_furnaces[0].position
-        self.minecraft_walk_to_visible(furnace.x, furnace.y, furnace.z)
+            return SmeltItemResult(ok=False, reason="missing", message="Input or fuel is missing. furnace_before includes retained input and previous output; request only the remaining input count.", furnace=furnace, furnace_before=retained, input_item=input, input_consumed=0, fuel_item=fuel_name, fuel_consumed=0, output=None, inventory_delta=None, duration_ms=0, missing=missing)
         started = time.monotonic()
         result = self.body.smelt(furnace, input, input_count, fuel_name, fuel_count)
         after = self.body.state()
-        if not result.ok:
-            return SmeltItemResult(ok=False, reason="target_changed", message="The furnace target changed during the action.", furnace=furnace, input_item=input, input_consumed=result.input_consumed, fuel_item=fuel_name, fuel_consumed=result.fuel_consumed, output=None, inventory_delta=_inventory_delta(before.inventory, after.inventory), duration_ms=(time.monotonic() - started) * 1000, missing=None)
-        output = result.output
-        return SmeltItemResult(ok=True, furnace=furnace, input_item=input, input_consumed=result.input_consumed, fuel_item=fuel_name, fuel_consumed=result.fuel_consumed, output=output, inventory_delta=_inventory_delta(before.inventory, after.inventory), duration_ms=(time.monotonic() - started) * 1000, missing=None)
+        return SmeltItemResult(ok=result.ok, reason=result.reason,
+            message=None if result.ok else (
+                "Previous furnace contents were collected, but the requested input or fuel is missing. Observe inventory and choose the remaining batch."
+                if result.reason == "missing" else
+                "The smelt stopped. Inspect partial output and inventory_delta. Unused input and fuel returned to inventory; increase fuel for the remaining batch."),
+            furnace=furnace, input_item=input, input_consumed=result.input_consumed,
+            fuel_item=fuel_name, fuel_consumed=result.fuel_consumed, output=result.output,
+            recovered_output=result.recovered_output, furnace_before=result.furnace_before,
+            inventory_delta=_inventory_delta(before.inventory, after.inventory),
+            duration_ms=(time.monotonic() - started) * 1000, missing=None)
 
     def minecraft_mine_block(self, position: Vec3i) -> MineBlockResult:
         before = self._require_body()
@@ -785,6 +812,8 @@ class MinecraftRuntime:
         result = self.body.mine(position)
         after = self.body.state()
         mined = BlockRef(position=position, block_name=block.name, display_name=block.display_name)
+        if result.reason == "unsafe_support":
+            return MineBlockResult(ok=False, reason="unsafe_support", message="No block was dug. Move to a supported side before mining below a column touched by your body.", block=mined, tool_used=result.tool_used, can_harvest=result.can_harvest, pickup=None, inventory_delta=None, image=None, duration_ms=(time.monotonic() - started) * 1000)
         if result.reason == "target_changed":
             return MineBlockResult(ok=False, reason="target_changed", message="The target block changed during mining.", block=mined, tool_used=result.tool_used, can_harvest=result.can_harvest, pickup=None, inventory_delta=_inventory_delta(before.inventory, after.inventory), image=self.body.screenshot(), duration_ms=(time.monotonic() - started) * 1000)
         if not result.can_harvest:
@@ -815,6 +844,18 @@ class MinecraftRuntime:
         generation = self._stop_generation
         state = self._require_body()
         cells, bounds = build_cells(shape, start, end, ref)
+        # Server-assisted placement bypasses normal collision checks. Reject
+        # the whole request before its first effect, including a door's top.
+        body_cells = cells + ([Vec3i(x=cell.x, y=cell.y + 1, z=cell.z) for cell in cells]
+                              if material.endswith("_door") else [])
+        if any(player_intersects_cell(state.camera.feet_position, cell) for cell in body_cells):
+            return BuildResult(ok=False, reason="occupied_by_player",
+                message="No blocks were placed or consumed. Step out of the requested feet/head cells before building. A bridge or scaffold floor belongs below your feet.",
+                shape=shape, material_requested=material, material_resolved=None,
+                bounds=bounds, planned_cells=len(cells), placed_count=0,
+                placed=[], occupied=[], out_of_range=[], missing_material_cells=0,
+                inventory_delta=None, candidates=None, image=None,
+                duration_ms=(time.monotonic() - started) * 1000)
         if len(cells) > BUILD_CELL_LIMIT:
             return BuildResult(
                 ok=False,
@@ -1167,6 +1208,13 @@ class MinecraftRuntime:
         return self._walk_result(result)
 
     def minecraft_use_block(self, position: Vec3i) -> UseBlockResult:
+        """Activate a nearby block and retain its observed interaction result.
+
+        The body closes the previous window before activation. Doors, gates,
+        and trapdoors require an observed open-state change. Containers require
+        a new window. Unconfirmed effects return a failure after ten seconds;
+        this does not prove that a delayed server effect cannot occur.
+        """
         state = self._require_body()
         block = self.body.blocks([position]).blocks[0]
         reference = BlockRef(
@@ -1207,8 +1255,12 @@ class MinecraftRuntime:
             )
         used = self.body.use_block(position, kind)
         return UseBlockResult(
-            ok=True,
+            ok=used.ok,
+            reason=used.reason,
+            message=None if used.ok else "The server did not confirm the block activation within ten seconds. Inspect its current state before retrying.",
             block=reference,
+            open_before=used.open_before,
+            open_after=used.open_after,
             action=used.action,
             window=used.window,
             image=None,
@@ -1217,6 +1269,12 @@ class MinecraftRuntime:
     def minecraft_chest_deposit(
         self, item: str, count: int | None = None, chest: Vec3i | None = None
     ) -> ChestMoveResult:
+        """Move owned items into an explicit nearby storage cell.
+
+        The body checks its current type and five-block range before opening.
+        Expected target failures return a typed result without transfer.
+        Protocol exceptions retain uncertain effects for later observation.
+        """
         before = self._require_body()
         if chest is None:
             return ChestMoveResult(ok=False, reason="no_chest_window", message="Open a chest first or provide its position.", item=None, moved_count=0, window=None, inventory_delta=None, candidates=None)
@@ -1230,6 +1288,8 @@ class MinecraftRuntime:
         result = self.body.chest_move(chest, selected.name, moved, "deposit")
         after = self.body.state()
         actual = selected.count - _inventory_counts(after.inventory).get(selected.name, 0)
+        if result.reason:
+            return ChestMoveResult(ok=False, reason=result.reason, message="Inspect the storage target and approach within five blocks. Furnaces use minecraft_smelt_item with the remaining input count and enough fuel.", item=selected.name, moved_count=actual, window=result.window, inventory_delta=_inventory_delta(before.inventory, after.inventory), candidates=None)
         if result.window is None:
             return ChestMoveResult(ok=False, reason="no_chest_window", message="The chest did not stay open.", item=selected.name, moved_count=actual, window=None, inventory_delta=_inventory_delta(before.inventory, after.inventory), candidates=None)
         if count is not None and count > selected.count:
@@ -1239,6 +1299,12 @@ class MinecraftRuntime:
     def minecraft_chest_withdraw(
         self, item: str, count: int | None = None, chest: Vec3i | None = None
     ) -> ChestMoveResult:
+        """Withdraw actual items from an explicit nearby storage cell.
+
+        Furnace contents require the smelting tool. Invalid storage targets
+        return a typed failure before opening or transfer. Transport errors
+        remain uncertain and require fresh observation before another method.
+        """
         before = self._require_body()
         if chest is None:
             return ChestMoveResult(ok=False, reason="no_chest_window", message="Open a chest first or provide its position.", item=None, moved_count=0, window=None, inventory_delta=None, candidates=None)
@@ -1259,6 +1325,8 @@ class MinecraftRuntime:
             inventory_delta=_inventory_delta(before.inventory, after.inventory),
             candidates=None,
         )
+        if result.reason:
+            return ChestMoveResult(ok=False, reason=result.reason, message="Inspect the storage target and approach within five blocks. Furnaces use minecraft_smelt_item with the remaining input count and enough fuel.", **common)
         if result.available_count == 0:
             return ChestMoveResult(ok=False, reason="not_found", message=f"The chest item was not found: {item}", **common)
         if result.inventory_space == 0:
@@ -1649,6 +1717,12 @@ class MinecraftRuntime:
         )
 
     def minecraft_equip_best_tool(self, target: Vec3i) -> EquipBestToolResult:
+        """Choose owned equipment and report fresh target eligibility.
+
+        The theoretical best tool comes from block metadata, not inventory.
+        This action can leave equipment unchanged. Current eligibility alone
+        cannot establish a dig or progress toward the caller's resource goal.
+        """
         self._require_body()
         block = self.body.blocks([target]).blocks[0]
         if block.name in void_blocks:
@@ -1665,36 +1739,20 @@ class MinecraftRuntime:
                 candidates=None,
             )
         result = self.body.equip_best_tool(target)
-        if result.best_possible_tool is None:
-            if block.name in {"dirt", "grass_block", "sand", "gravel", "clay", "soul_sand", "soul_soil"}:
-                return EquipBestToolResult(
-                    ok=True,
-                    requested=block.name,
-                    target_block=block.name,
-                    best_possible_tool=None,
-                    previous_held=result.previous_held,
-                    equipped=result.held_item,
-                    hotbar=result.hotbar,
-                    candidates=None,
-                )
-            return EquipBestToolResult(
-                ok=False,
-                reason="unharvestable",
-                message="No tool you own can harvest this block.",
-                requested=result.target_block or "",
-                target_block=result.target_block,
-                best_possible_tool=None,
-                previous_held=result.previous_held,
-                equipped=None,
-                hotbar=result.hotbar,
-                candidates=None,
-            )
+        current = self.body.blocks([target]).blocks[0]
+        eligible = current.can_harvest_with_held
+        # The body selects an owned item. The public craft hint names the
+        # fastest registry tool, which need not exist in current inventory.
+        # Re-read after equip; owning a fast but unsuitable tier is not enough.
         return EquipBestToolResult(
-            ok=True,
-            reason=None,
-            requested=result.best_possible_tool,
+            ok=eligible is True,
+            reason=None if eligible is True else "unharvestable" if eligible is False else "harvestability_unknown",
+            message="The current held item can harvest this block. Repeating equip does not acquire materials."
+                if eligible is True else "The current held item cannot establish harvesting. Inspect best_tools and rebuild missing recipe prerequisites from owned or self-gathered materials.",
+            requested=result.held_item.name if result.held_item else block.name,
             target_block=result.target_block,
-            best_possible_tool=result.best_possible_tool,
+            best_possible_tool=current.best_tools[0] if current.best_tools else None,
+            can_harvest_with_held=eligible,
             previous_held=result.previous_held,
             equipped=result.held_item,
             hotbar=result.hotbar,
@@ -1745,10 +1803,14 @@ class MinecraftRuntime:
         before = self._require_body()
         result = self.body.staircase_down(depth, torch)
         after = self.body.state()
+        died = after.death_count > before.death_count
+        reason = "player_died" if died else result.hazards_found[0] if result.hazards_found else None
+        if result.depth_achieved != depth and reason is None:
+            reason = "partial_descent"
         return StaircaseResult(
-            ok=True,
-            reason=None,
-            message=None,
+            ok=reason is None,
+            reason=reason,
+            message="The descent stopped. Inspect the current body and landing before another action." if reason else None,
             depth_requested=result.depth_requested,
             depth_achieved=result.depth_achieved,
             end_position=result.end_position,
@@ -1756,6 +1818,9 @@ class MinecraftRuntime:
             hazards_found=result.hazards_found,
             torches_placed=result.torches_placed,
             inventory_delta=_inventory_delta(before.inventory, after.inventory),
+            body_session=self.body.session_id,
+            death_count_before=before.death_count,
+            death_count_after=after.death_count,
             image=self.body.screenshot(),
         )
 

@@ -12,6 +12,31 @@ import { Vec3 } from "vec3";
 import { ViewerCapture } from "./capture.js";
 const { goals, Movements, pathfinder } = pathfinderPackage;
 const WALK_SPEED_BLOCKS_PER_SECOND = 4.3;
+/** Protect every column touched by the standing survival player's width. */
+export function underPlayerSupport(feet, cell) {
+    return cell.y < Math.floor(feet.y) && cell.x + 1 > feet.x - 0.3
+        && cell.x < feet.x + 0.3 && cell.z + 1 > feet.z - 0.3 && cell.z < feet.z + 0.3;
+}
+/** Bound the real furnace wait and report exhausted fuel without losing input. */
+export function smeltStopReason(elapsedMs, fuelRemaining, fuelCount, inputCount) {
+    if (elapsedMs >= 90000)
+        return "smelt_timeout";
+    if (elapsedMs >= 2000 && fuelRemaining === 0 && fuelCount === 0 && inputCount > 0)
+        return "fuel_exhausted";
+    return null;
+}
+/** Refuse unsupported storage targets before opening or transferring items. */
+export function storageTargetReason(name, distance) {
+    if (name === null)
+        return "target_changed";
+    if (!["chest", "trapped_chest", "barrel", "shulker_box"].includes(name) && !name.endsWith("_shulker_box"))
+        return "not_storage_container";
+    return distance > 5 ? "out_of_range" : null;
+}
+/** Count owned stacks in the live window's player inventory, excluding input. */
+export function windowInventoryCount(slots, start, end, name) {
+    return slots.slice(start, end).reduce((sum, item) => sum + (item?.name === name ? item.count : 0), 0);
+}
 export class MinecraftBody {
     configuration;
     bot = null;
@@ -289,6 +314,8 @@ export class MinecraftBody {
     }
     async walkSurface(x, z, timeoutMs) {
         const bot = this.bot;
+        const started = performance.now();
+        const remaining = () => Math.max(0, timeoutMs - (performance.now() - started));
         // Approximate travel: the exact column can be liquid or filled, so a
         // standable cell within a small ring is an acceptable destination. A
         // larger body of water still reports no_standable_surface.
@@ -297,25 +324,30 @@ export class MinecraftBody {
             const requested = { x, y: bot.entity.position.y, z };
             return walkFailure(bot, requested, "no_standable_surface", "No standable surface near the target.", "no_path", 0, 0);
         }
-        const result = await this.walk("minecraft_walk_to_surface", surface, new goals.GoalBlock(surface.x, surface.y, surface.z), timeoutMs);
+        const finish = (step) => walkFailure(bot, surface, step.reason, step.message ?? "The surface approach did not reach its target.", step.status, step.hops, performance.now() - started, { ...step.diagnostics, ...walkDiagnostics(bot, surface, step.diagnostics.cause) });
+        const result = await this.walk("minecraft_walk_to_surface", surface, new goals.GoalBlock(surface.x, surface.y, surface.z), remaining());
         if (result.status === "reached")
-            return result;
+            return { ...result, duration_ms: performance.now() - started };
+        if (result.reason === "stopped" || remaining() <= 0)
+            return finish(result);
         // The direct surface column is unreachable. If the partial path stopped
         // at the base of an open vertical shaft, pillar up is the next step.
         const shaftBase = openShaftBaseNear(bot, result.final_position, 8);
         if (shaftBase !== null) {
-            const approach = await this.walk("minecraft_walk_to_surface", shaftBase, new goals.GoalBlock(shaftBase.x, shaftBase.y, shaftBase.z), timeoutMs);
+            const approach = await this.walk("minecraft_walk_to_surface", shaftBase, new goals.GoalBlock(shaftBase.x, shaftBase.y, shaftBase.z), remaining());
             if (approach.ok) {
-                return walkFailure(bot, surface, "pillar_up_required", `Walked to ${shaftBase.x}, ${shaftBase.y}, ${shaftBase.z}; pillar up is required to reach the surface.`, "partial", approach.hops, result.duration_ms + approach.duration_ms);
+                return walkFailure(bot, surface, "pillar_up_required", `Walked to ${shaftBase.x}, ${shaftBase.y}, ${shaftBase.z}; pillar up is required to reach the surface.`, "partial", approach.hops, performance.now() - started);
             }
+            if (approach.reason === "stopped" || remaining() <= 0)
+                return finish(approach);
         }
         const directShaft = standableBelow(bot, x, z, surface.y - 1);
         if (directShaft === null)
-            return result;
-        const approach = await this.walk("minecraft_walk_to_surface", directShaft, new goals.GoalBlock(directShaft.x, directShaft.y, directShaft.z), timeoutMs);
+            return finish(result);
+        const approach = await this.walk("minecraft_walk_to_surface", directShaft, new goals.GoalBlock(directShaft.x, directShaft.y, directShaft.z), remaining());
         if (!approach.ok)
-            return result;
-        return walkFailure(bot, surface, "pillar_up_required", `Walked to ${directShaft.x}, ${directShaft.y}, ${directShaft.z}; pillar up is required to reach the surface.`, "partial", approach.hops, result.duration_ms + approach.duration_ms);
+            return finish(approach);
+        return walkFailure(bot, surface, "pillar_up_required", `Walked to ${directShaft.x}, ${directShaft.y}, ${directShaft.z}; pillar up is required to reach the surface.`, "partial", approach.hops, performance.now() - started);
     }
     findPath(target, limit, timeoutMs) {
         const bot = this.bot;
@@ -363,18 +395,49 @@ export class MinecraftBody {
     }
     async useBlock(position, kind) {
         const bot = this.bot;
+        // An old container window can prevent the next block interaction.
+        // Close it before sending a new activation and retain no stale contents.
+        if (bot.currentWindow !== null)
+            bot.closeWindow(bot.currentWindow);
         const block = bot.blockAt(new Vec3(position.x, position.y, position.z));
         const properties = block.getProperties();
+        const toggle = ["door", "gate", "trapdoor"].includes(kind);
+        const expectsWindow = ["chest", "barrel", "shulker_box", "hopper", "furnace", "crafting_table"].includes(kind);
+        const before = typeof properties.open === "boolean" ? properties.open : null;
         await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true);
         await bot.activateBlock(block);
-        await delay(300);
+        if (!toggle && !expectsWindow)
+            await delay(300);
+        // Sending a packet does not prove that the server applied it.
+        // Observe the toggle or new window, with one bounded ten-second wait.
+        const deadline = performance.now() + 10000;
+        let after = null;
+        let confirmed = false;
+        do {
+            const current = bot.blockAt(block.position);
+            const open = current?.getProperties().open;
+            after = typeof open === "boolean" ? open : null;
+            confirmed = toggle ? current?.name === block.name && confirmedToggleAction(kind, before, after) !== null
+                : expectsWindow ? bot.currentWindow !== null : true;
+            if (confirmed)
+                break;
+            await delay(100);
+        } while (performance.now() < deadline);
         return {
-            action: activationAction(kind, properties.open === true),
-            window: openedWindow(bot, kind, position),
+            ok: confirmed,
+            reason: confirmed ? null : "activation_unconfirmed",
+            open_before: before,
+            open_after: after,
+            action: confirmed ? (toggle ? confirmedToggleAction(kind, before, after) : activationAction(kind, properties.open === true)) : null,
+            window: confirmed && expectsWindow ? openedWindow(bot, kind, position) : null,
         };
     }
     async equip(itemName) {
         const bot = this.bot;
+        // Equip from the player inventory, rather than an open container window.
+        // Window-relative slot numbers can otherwise wait for an unrelated update.
+        if (bot.currentWindow !== null)
+            bot.closeWindow(bot.currentWindow);
         const previous = itemFromStack(bot.heldItem);
         const stack = bot.inventory.items().find((item) => item.name === itemName);
         await bot.equip(stack, "hand");
@@ -427,6 +490,7 @@ export class MinecraftBody {
         }
         let recipe = null;
         let missing = [];
+        let smallestDeficit = Number.POSITIVE_INFINITY;
         let needsTable = false;
         for (const candidate of candidates) {
             const candidateMissing = missingIngredientsFor(bot, candidate, repetitions);
@@ -436,8 +500,13 @@ export class MinecraftBody {
                 recipe = candidate;
                 break;
             }
-            if (missing.length === 0)
+            // A failed craft must report costs for the closest inventory variant.
+            // The first oak recipe can hide a smaller birch-plank deficit.
+            const deficit = candidateMissing.reduce((sum, need) => sum + need.required - need.have, 0);
+            if (deficit < smallestDeficit) {
+                smallestDeficit = deficit;
                 missing = candidateMissing;
+            }
         }
         if (recipe === null) {
             const reason = needsTable ? "crafting_table_not_found" : "missing_ingredients";
@@ -690,6 +759,7 @@ export class MinecraftBody {
     }
     async recipeSearch(itemNames, craftableNow, limit) {
         const bot = this.bot;
+        const tableAvailable = bot.findBlocks({ matching: bot.registry.blocksByName.crafting_table.id, maxDistance: 4, count: 1 }).length > 0;
         const matches = [];
         for (const itemName of itemNames) {
             if (matches.length >= limit)
@@ -700,7 +770,15 @@ export class MinecraftBody {
             const recipes = bot.recipesAll(item.id, null, true);
             if (recipes.length === 0)
                 continue;
-            matches.push(recipeEntryFrom(bot, itemName, recipes[0], craftableNow));
+            // Crafting tries every variant. Search must also account for the wood
+            // or other ingredients that the player actually holds.
+            const entries = recipes.map((recipe) => recipeEntryFrom(bot, itemName, recipe, tableAvailable));
+            const deficit = (entry) => entry.ingredients.reduce((sum, need) => sum + Math.max(0, need.required - need.have), 0);
+            const selected = entries.find((entry) => entry.craftable_now)
+                ?? entries.reduce((best, entry) => deficit(entry) < deficit(best) ? entry : best);
+            if (craftableNow !== null && selected.craftable_now !== craftableNow)
+                continue;
+            matches.push(selected);
         }
         const total = Object.keys(bot.registry.recipes).length;
         return { matches, total_recipes: total };
@@ -753,47 +831,89 @@ export class MinecraftBody {
         let blocksDug = 0;
         let torchesPlaced = 0;
         let depthAchieved = 0;
-        for (let step = 0; step < depth; step += 1) {
-            const feet = bot.entity.position.floored();
-            const stepCell = feet.offset(dir.x, -1, dir.z);
-            const stepBlock = bot.blockAt(stepCell);
-            const stepHazard = stairHazardName(stepBlock);
-            if (stepHazard !== null) {
-                hazards.push(stepHazard);
-                break;
-            }
-            let stopped = false;
-            for (const cell of [
-                feet.offset(dir.x, 1, dir.z),
-                feet.offset(dir.x, 0, dir.z),
-                stepCell,
-            ]) {
-                const block = bot.blockAt(cell);
-                if (block === null || VOID_BLOCKS.has(block.name))
-                    continue;
-                const cellHazard = stairHazardName(block);
-                if (cellHazard !== null) {
-                    hazards.push(cellHazard);
-                    stopped = true;
+        const startingDeaths = this.deathCount;
+        this.currentCommand = "minecraft_staircase_down";
+        this.commandStopped = false;
+        try {
+            for (let step = 0; step < depth; step += 1) {
+                if (this.commandStopped || this.deathCount !== startingDeaths || bot.health <= 0) {
+                    hazards.push(this.commandStopped ? "stopped" : "player_died");
                     break;
                 }
-                await this.equipBestTool(vector(cell));
-                const mineResult = await this.mine(vector(cell));
-                if (!mineResult.can_harvest) {
-                    hazards.push(block.name);
-                    stopped = true;
+                const feet = bot.entity.position.floored();
+                const stepCell = feet.offset(dir.x, -1, dir.z);
+                // The carved cell is body space. Its floor must remain intact.
+                // Timed forward input can cross this landing and fall into a cave.
+                const floor = bot.blockAt(stepCell.offset(0, -1, 0));
+                const floorHazard = staircaseFloorHazard(floor === null ? null : {
+                    block_name: floor.name, is_solid: floor.boundingBox === "block",
+                });
+                if (floorHazard !== null) {
+                    hazards.push(floorHazard);
                     break;
                 }
-                blocksDug += 1;
+                const stepBlock = bot.blockAt(stepCell);
+                const stepHazard = stairHazardName(stepBlock);
+                if (stepHazard !== null) {
+                    hazards.push(stepHazard);
+                    break;
+                }
+                let stopped = false;
+                for (const cell of [
+                    feet.offset(dir.x, 1, dir.z),
+                    feet.offset(dir.x, 0, dir.z),
+                    stepCell,
+                ]) {
+                    const block = bot.blockAt(cell);
+                    if (block === null || VOID_BLOCKS.has(block.name))
+                        continue;
+                    const cellHazard = stairHazardName(block);
+                    if (cellHazard !== null) {
+                        hazards.push(cellHazard);
+                        stopped = true;
+                        break;
+                    }
+                    await this.equipBestTool(vector(cell));
+                    const mineResult = await this.mine(vector(cell));
+                    if (!mineResult.ok) {
+                        hazards.push(mineResult.reason ?? block.name);
+                        stopped = true;
+                        break;
+                    }
+                    blocksDug += 1;
+                    if (this.commandStopped || this.deathCount !== startingDeaths || bot.health <= 0) {
+                        hazards.push(this.commandStopped ? "stopped" : "player_died");
+                        stopped = true;
+                        break;
+                    }
+                }
+                if (stopped)
+                    break;
+                if (!standable(bot, vector(stepCell))) {
+                    hazards.push("landing_changed");
+                    break;
+                }
+                const beforeStep = vector(bot.entity.position);
+                const walk = await this.walk("minecraft_staircase_down", vector(stepCell), new goals.GoalBlock(stepCell.x, stepCell.y, stepCell.z), 5000);
+                if (this.commandStopped || this.deathCount !== startingDeaths || bot.health <= 0) {
+                    hazards.push(this.commandStopped ? "stopped" : "player_died");
+                    break;
+                }
+                if (!staircaseStepReached(beforeStep, vector(stepCell), vector(bot.entity.position), bot.entity.onGround, startingDeaths, this.deathCount)) {
+                    hazards.push(this.deathCount !== startingDeaths ? "player_died" : walk.reason ?? "step_not_reached");
+                    break;
+                }
+                depthAchieved += 1;
+                if (torch && depthAchieved % 3 === 0) {
+                    if (await this.placeTorch())
+                        torchesPlaced += 1;
+                }
             }
-            if (stopped)
-                break;
-            await this.stepForward();
-            depthAchieved += 1;
-            if (torch && depthAchieved % 3 === 0) {
-                if (await this.placeTorch())
-                    torchesPlaced += 1;
-            }
+        }
+        finally {
+            bot.clearControlStates();
+            bot.pathfinder.setGoal(null);
+            this.currentCommand = null;
         }
         return {
             depth_requested: depth,
@@ -803,20 +923,6 @@ export class MinecraftBody {
             hazards_found: hazards,
             torches_placed: torchesPlaced,
         };
-    }
-    async stepForward() {
-        const bot = this.bot;
-        const startY = Math.floor(bot.entity.position.y);
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-            if (Math.floor(bot.entity.position.y) < startY)
-                break;
-            await bot.look(bot.entity.yaw, 0, true);
-            bot.setControlState("forward", true);
-            await delay(500);
-            bot.clearControlStates();
-            await delay(500);
-        }
-        await delay(600);
     }
     async placeTorch() {
         const bot = this.bot;
@@ -1036,6 +1142,11 @@ export class MinecraftBody {
     async mine(position) {
         const bot = this.bot;
         const block = bot.blockAt(new Vec3(position.x, position.y, position.z));
+        // Check the actual pose at the mutation boundary, including an edge
+        // that touches two columns. Dig adjacent steps from a supported side.
+        if (underPlayerSupport(bot.entity.position, position)) {
+            return { ok: false, reason: "unsafe_support", block: { position, name: block.name, display_name: block.displayName, replaceable: block.boundingBox === "empty" }, tool_used: bot.heldItem?.name ?? null, can_harvest: block.canHarvest(bot.heldItem?.type ?? null) === true, drops: [] };
+        }
         // Collision bounds do not determine whether a block can be dug.
         // Grass and tall grass have empty bounds but support normal digging.
         if (["air", "cave_air", "void_air"].includes(block.name)) {
@@ -1107,13 +1218,19 @@ export class MinecraftBody {
     }
     async chestMove(position, itemName, count, direction) {
         const bot = this.bot;
-        const block = bot.blockAt(new Vec3(position.x, position.y, position.z));
+        const target = new Vec3(position.x, position.y, position.z);
+        const block = bot.blockAt(target);
+        const reason = storageTargetReason(block?.name ?? null, bot.entity.position.distanceTo(target));
+        if (reason !== null)
+            return { reason, moved_count: 0, available_count: 0, inventory_space: 0, window: null };
+        if (bot.currentWindow !== null)
+            bot.closeWindow(bot.currentWindow);
         const window = await bot.openContainer(block);
         await delay(250);
         const current = bot.blockAt(new Vec3(position.x, position.y, position.z));
-        if (current === null || !["chest", "trapped_chest", "barrel", "shulker_box"].includes(current.name)) {
+        if (storageTargetReason(current?.name ?? null, bot.entity.position.distanceTo(target)) !== null) {
             window.close();
-            return { moved_count: 0, available_count: 0, inventory_space: 0, window: null };
+            return { reason: "target_changed", moved_count: 0, available_count: 0, inventory_space: 0, window: null };
         }
         const item = bot.registry.itemsByName[itemName];
         const availableCount = direction === "withdraw"
@@ -1137,26 +1254,61 @@ export class MinecraftBody {
     }
     async smelt(position, inputName, inputCount, fuelName, fuelCount) {
         const bot = this.bot;
+        if (bot.currentWindow !== null)
+            bot.closeWindow(bot.currentWindow);
         const block = bot.blockAt(new Vec3(position.x, position.y, position.z));
         const furnace = await bot.openFurnace(block);
-        const input = bot.registry.itemsByName[inputName];
-        const fuel = bot.registry.itemsByName[fuelName];
-        await furnace.putInput(input.id, null, inputCount);
-        await furnace.putFuel(fuel.id, null, fuelCount);
-        while ((furnace.outputItem()?.count ?? 0) < inputCount) {
-            await delay(250);
-            const current = bot.blockAt(new Vec3(position.x, position.y, position.z));
-            if (current === null || current.name !== "furnace") {
-                furnace.close();
-                return { ok: false, reason: "target_changed", output: null, input_consumed: inputCount, fuel_consumed: fuelCount, window: null };
+        const furnaceBefore = openedWindow(bot, "furnace", position);
+        const recovered = itemFromStack(furnace.outputItem());
+        try {
+            // A timed-out request can leave all three slots populated. Collect those
+            // real contents separately before loading another batch; never erase them.
+            if (furnace.outputItem() !== null)
+                await furnace.takeOutput();
+            if (furnace.inputItem() !== null)
+                await furnace.takeInput();
+            if (furnace.fuelItem() !== null)
+                await furnace.takeFuel();
+            // Mineflayer copies the open window's player slots to bot.inventory only
+            // when it closes. Recovered input is already in the live window now.
+            const countOwned = (name) => windowInventoryCount(furnace.slots, furnace.inventoryStart, furnace.inventoryEnd, name);
+            if (countOwned(inputName) < inputCount || countOwned(fuelName) < fuelCount) {
+                return { ok: false, reason: "missing", output: null, recovered_output: recovered, furnace_before: furnaceBefore, input_consumed: 0, fuel_consumed: 0, window: openedWindow(bot, "furnace", position) };
             }
+            await furnace.putInput(bot.registry.itemsByName[inputName].id, null, inputCount);
+            await furnace.putFuel(bot.registry.itemsByName[fuelName].id, null, fuelCount);
+            const started = performance.now();
+            let reason = null;
+            while ((furnace.outputItem()?.count ?? 0) < inputCount) {
+                await delay(250);
+                const current = bot.blockAt(new Vec3(position.x, position.y, position.z));
+                if (current === null || current.name !== "furnace") {
+                    reason = "target_changed";
+                    break;
+                }
+                const elapsed = performance.now() - started;
+                reason = smeltStopReason(elapsed, furnace.fuel, furnace.fuelItem()?.count ?? 0, furnace.inputItem()?.count ?? 0);
+                if (reason !== null)
+                    break;
+            }
+            const output = itemFromStack(furnace.outputItem());
+            const remainingInput = furnace.inputItem()?.count ?? 0;
+            const remainingFuel = furnace.fuelItem()?.count ?? 0;
+            if (reason !== "target_changed") {
+                if (output !== null)
+                    await furnace.takeOutput();
+                if (remainingInput > 0)
+                    await furnace.takeInput();
+                if (remainingFuel > 0)
+                    await furnace.takeFuel();
+            }
+            return { ok: reason === null, reason, output, recovered_output: recovered, furnace_before: furnaceBefore, input_consumed: inputCount - remainingInput, fuel_consumed: fuelCount - remainingFuel, window: openedWindow(bot, "furnace", position) };
         }
-        const output = itemFromStack(furnace.outputItem());
-        await furnace.takeOutput();
-        await delay(300);
-        const window = openedWindow(bot, "furnace", position);
-        furnace.close();
-        return { ok: true, reason: null, output, input_consumed: inputCount, fuel_consumed: fuelCount, window };
+        finally {
+            // Closing the window does not undo inserted items after a protocol error.
+            // The next request must inspect furnace_before and reconcile those effects.
+            furnace.close();
+        }
     }
     async stopCommand(scope = "both") {
         const command = scope === "command" || scope === "both" ? this.currentCommand : null;
@@ -1204,30 +1356,42 @@ export class MinecraftBody {
     async walk(command, target, goal, timeoutMs) {
         const bot = this.bot;
         const started = performance.now();
+        // Search, partial-route search, movement, and replanning share one budget.
+        const remaining = () => Math.max(0, timeoutMs - (performance.now() - started));
         const startPosition = vector(bot.entity.position);
         const movements = survivalMovements(bot, target);
         bot.pathfinder.setMovements(movements);
         bot.pathfinder.thinkTimeout = timeoutMs;
         let effectiveGoal = goal;
-        const preview = bot.pathfinder.getPathTo(movements, goal, timeoutMs);
+        if (remaining() <= 0) {
+            return walkFailure(bot, target, "timeout", "The path search time limit expired.", "timeout", 0, performance.now() - started, walkDiagnostics(bot, target, "search_timeout"));
+        }
+        const preview = bot.pathfinder.getPathTo(movements, goal, remaining());
         const diagnostic = (cause, error) => ({
             ...walkDiagnostics(bot, target, cause),
             path_status: preview.status,
             error_name: error instanceof Error ? error.name : null,
             error_message: error === undefined ? null : error instanceof Error ? error.message : String(error),
         });
+        if (preview.status === "timeout" || remaining() <= 0) {
+            return walkFailure(bot, target, "timeout", "The path search time limit expired.", "timeout", 0, performance.now() - started, diagnostic("search_timeout"));
+        }
         if (preview.status === "noPath") {
-            const partialNode = furthestReachableNode(bot, movements, goal, timeoutMs);
+            const partialNode = furthestReachableNode(bot, movements, goal, remaining());
+            if (remaining() <= 0) {
+                return walkFailure(bot, target, "timeout", "The path search time limit expired.", "timeout", 0, performance.now() - started, diagnostic("search_timeout"));
+            }
             if (partialNode === null) {
                 return walkFailure(bot, target, "no_path", "No route found within the configured movement rules and search corridor.", "no_path", 0, performance.now() - started, diagnostic("search_no_path"));
             }
             effectiveGoal = new goals.GoalBlock(partialNode.x, partialNode.y, partialNode.z);
         }
-        if (preview.status === "timeout") {
+        if (remaining() <= 0) {
             return walkFailure(bot, target, "timeout", "The path search time limit expired.", "timeout", 0, performance.now() - started, diagnostic("search_timeout"));
         }
         this.currentCommand = command;
         this.commandStopped = false;
+        bot.pathfinder.thinkTimeout = remaining();
         let timeout = null;
         try {
             await Promise.race([
@@ -1238,7 +1402,7 @@ export class MinecraftBody {
                         const error = new Error("The walk time limit expired.");
                         error.name = "WalkTimeout";
                         reject(error);
-                    }, timeoutMs);
+                    }, remaining());
                 }),
             ]);
             await delay(150);
@@ -1289,11 +1453,27 @@ export class MinecraftBody {
         const bot = this.bot;
         return positions.map((position) => {
             const block = bot.blockAt(new Vec3(position.x, position.y, position.z));
+            const current = block;
+            const bestTools = Object.values(bot.registry.itemsByName)
+                .filter((item) => /_(pickaxe|axe|shovel|hoe)$|^shears$/.test(item.name)
+                && current.canHarvest(item.id) === true
+                && current.digTime(item.id, false, false, false) < current.digTime(null, false, false, false))
+                .sort((a, b) => current.digTime(a.id, false, false, false) - current.digTime(b.id, false, false, false))
+                .map((item) => item.name);
             return {
                 position,
                 name: block.name,
                 display_name: block.displayName,
                 replaceable: block.boundingBox === "empty",
+                // Preserve observed state and cell-local collision boxes. A block name
+                // or an open flag alone cannot establish clearance in a direction.
+                properties: block.getProperties(),
+                collision_shapes: block.shapes.map((shape) => [...shape]),
+                best_tools: bestTools,
+                can_harvest_with_held: current.canHarvest(bot.heldItem?.type ?? null) === true,
+                drops: (current.drops ?? []).map((drop) => typeof drop === "number" ? drop : typeof drop.drop === "number" ? drop.drop : drop.drop.id)
+                    .map((id) => bot.registry.items[id]?.name).filter((name) => name !== undefined),
+                hardness: current.hardness ?? null,
             };
         });
     }
@@ -1425,7 +1605,7 @@ function allIngredientsFor(bot, recipe, repetitions) {
     }
     return result;
 }
-function recipeEntryFrom(bot, itemName, recipe, craftableNow) {
+function recipeEntryFrom(bot, itemName, recipe, tableAvailable) {
     let grid = "";
     const legend = {};
     if (recipe.inShape) {
@@ -1459,7 +1639,7 @@ function recipeEntryFrom(bot, itemName, recipe, craftableNow) {
         ingredients,
         output_count: recipe.result.count,
         needs_crafting_table: recipe.requiresTable,
-        craftable_now: craftableNow === null ? missing.length === 0 : craftableNow === (missing.length === 0),
+        craftable_now: missing.length === 0 && (!recipe.requiresTable || tableAvailable),
     };
 }
 function eightCardinal(heading) {
@@ -1708,6 +1888,18 @@ function walkFailure(bot, target, reason, message, status, hops, durationMs, dia
         duration_ms: durationMs,
     };
 }
+/** Report a toggle only when both observed states prove that it changed. */
+export function confirmedToggleAction(kind, before, after) {
+    if (before === null || after === null || before === after)
+        return null;
+    if (kind === "door")
+        return after ? "door_opened" : "door_closed";
+    if (kind === "gate")
+        return after ? "gate_opened" : "gate_closed";
+    if (kind === "trapdoor")
+        return after ? "trapdoor_opened" : "trapdoor_closed";
+    return null;
+}
 function activationAction(kind, wasOpen) {
     if (kind === "door")
         return wasOpen ? "door_closed" : "door_opened";
@@ -1838,11 +2030,14 @@ function playerStatus(bot) {
     const biomeId = bot.world.getBiome(feet) ?? 0;
     const biome = bot.registry.biomes?.[biomeId]?.name ?? "plains";
     const inWater = footBlock !== null && footBlock.name.startsWith("water");
+    // Mineflayer 4.38 can overwrite oxygenLevel from another entity's air.
+    // Player air_supply is metadata field 1; its protocol default is 300 ticks.
+    const airSupply = bot.entity.metadata[1];
     return {
         health: bot.health ?? 20,
         max_health: 20,
         food: bot.food ?? 20,
-        oxygen: bot.oxygenLevel ?? 20,
+        oxygen: Math.max(0, Math.min(20, Math.round(Number(airSupply ?? 300) / 15))),
         xp_level: bot.experience?.level ?? 0,
         biome,
         dimension: bot.game?.dimension ?? "overworld",
@@ -1970,6 +2165,22 @@ function normalizeDegrees(value) {
 function cardinalFromYaw(yaw) {
     const directions = ["south", "west", "north", "east"];
     return directions[Math.round(yaw / 90) % 4];
+}
+/** Require a loaded solid floor before clearing one descending notch. */
+export function staircaseFloorHazard(floor) {
+    if (floor === null)
+        return "unknown_floor";
+    if (floor.is_solid !== true)
+        return "unsupported_floor";
+    if (["water", "lava", "gravel", "sand", "red_sand", "magma_block", "cactus", "powder_snow"].includes(floor.block_name)) {
+        return floor.block_name;
+    }
+    return null;
+}
+/** Count only a grounded one-block descent to the exact cell in the same life. */
+export function staircaseStepReached(start, target, end, onGround, beforeDeaths, afterDeaths) {
+    return beforeDeaths === afterDeaths && onGround && Math.floor(start.y) - target.y === 1
+        && Math.floor(end.x) === target.x && Math.floor(end.y) === target.y && Math.floor(end.z) === target.z;
 }
 function stairHazardName(block) {
     if (block === null)

@@ -598,6 +598,8 @@ class ObserveResult(ToolOutcome):
         description="Your exact pose: position, yaw, pitch, look vector."
     )
     player: PlayerStatus = Field(description="Vitals and world context.")
+    body_session: str = Field(description="Identity of this body process. A new process starts a separate death counter.")
+    death_count: int = Field(ge=0, description="Observed player deaths in this body session. Respawn does not undo a death.")
     held_item: InventoryItem | None = Field(
         default=None, description="Item in your main hand, None when empty."
     )
@@ -685,8 +687,16 @@ class InspectBlockResult(ToolOutcome):
         description="Internal name of the block, 'air' when empty."
     )
     display_name: str = Field(description="Human-readable block name.")
+    properties: dict[str, str | int | float | bool] | None = Field(
+        default=None,
+        description="Observed block-state properties. Null means this older result supplied no state.",
+    )
+    collision_shapes: list[tuple[float, float, float, float, float, float]] | None = Field(
+        default=None,
+        description="Observed cell-local collision boxes: [minX,minY,minZ,maxX,maxY,maxZ]. Empty means no collision; null means unavailable.",
+    )
     is_solid: bool = Field(
-        description="True when the block has a full collision box."
+        description="True when the block is classified as having non-empty collision bounds. Use collision_shapes for actual geometry."
     )
     exposed_faces: list[Direction6] = Field(
         description="Faces touching a non-solid cell. Empty = fully buried."
@@ -900,6 +910,8 @@ class SmeltItemResult(ToolOutcome):
     output: InventoryItem | None = Field(
         default=None, description="Smelted stack added to your inventory."
     )
+    recovered_output: InventoryItem | None = Field(default=None, description="Existing output collected before the new batch; separate from new smelting.")
+    furnace_before: ContainerWindow | None = Field(default=None, description="Actual furnace slots before recovery or new input insertion.")
     inventory_delta: InventoryDelta | None = Field(
         default=None, description="Net inventory change of the whole smelt."
     )
@@ -927,7 +939,7 @@ class MineBlockResult(ToolOutcome):
     can_harvest: bool | None = Field(
         default=None,
         description="True when the tool was correct and drops could fall. "
-        "False means the block broke but dropped NOTHING (wrong tool tier).",
+        "False means the held tool cannot harvest it. The body refuses that dig; the block remains unchanged.",
     )
     pickup: PickupStatus | None = Field(
         default=None,
@@ -1122,11 +1134,15 @@ class UseBlockResult(ToolOutcome):
 
     When a container opened, `window` carries its full contents so you can
     immediately follow up with deposit/withdraw calls.
+    Door, gate, and trapdoor actions require an observed open-state change.
+    An unconfirmed activation returns no action after a ten-second wait.
     """
 
     block: BlockRef | None = Field(
         default=None, description="The block that was activated."
     )
+    open_before: bool | None = Field(default=None, description="Observed open property before activation, when the block has one.")
+    open_after: bool | None = Field(default=None, description="Observed open property after activation, when the block has one.")
     action: Literal[
         "door_opened",
         "door_closed",
@@ -1308,6 +1324,7 @@ class InfoResult(ToolOutcome):
     """Identity, connection and layout information for this character."""
 
     username: str = Field(description="Minecraft username of this body.")
+    server_rules: str = Field(default="", description="Current Babymode rules read from the server. These include natural regeneration and nutrition effects.")
     server: str = Field(description="Game server address this body joins.")
     body_url: str = Field(description="HTTP endpoint of the body process.")
     agent_home: str = Field(description="Workspace root directory.")
@@ -1463,6 +1480,9 @@ class EquipBestToolResult(EquipResult):
         description="Best tool that exists for that block, even when you "
         "do not own it yet (craft hint).",
     )
+    can_harvest_with_held: bool | None = Field(
+        default=None, description="Fresh eligibility of the item actually held after this equip attempt.",
+    )
 
 
 class EatBestResult(UseItemResult):
@@ -1478,6 +1498,10 @@ class EatBestResult(UseItemResult):
 
 class StaircaseResult(ToolOutcome):
     """Outcome of carving a safe descending staircase."""
+
+    body_session: str | None = Field(default=None, description="Identity of the observed body connection.")
+    death_count_before: int | None = Field(default=None, ge=0, description="Body deaths before this action.")
+    death_count_after: int | None = Field(default=None, ge=0, description="Body deaths after this action.")
 
     depth_requested: int = Field(
         description="How deep you asked to descend."

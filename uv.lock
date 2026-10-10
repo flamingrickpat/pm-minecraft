@@ -852,8 +852,8 @@ wheels = [
 ]
 
 [[package]]
-name = "pm-minecraft-v2"
-version = "0.1.0"
+name = "pm-minecraft"
+version = "0.2.1"
 source = { virtual = "." }
 dependencies = [
     { name = "fastmcp" },

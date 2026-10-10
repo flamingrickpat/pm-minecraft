@@ -1,0 +1,1104 @@
+{
+  "schema": "pm.alpha-block-activation.v1",
+  "scope": "Captured real protocol failure and independent real interaction probe. No native M3 acceptance.",
+  "failed_activation": {
+    "seq": 11,
+    "event": "result",
+    "tool": "minecraft_use_block",
+    "arguments": {
+      "position": {
+        "x": 28,
+        "y": 104,
+        "z": 1
+      }
+    },
+    "revision": 0,
+    "time": 1791627720.9247532,
+    "epoch": 190,
+    "session": "25ca1eac8d78485d80504c874e976238",
+    "ok": true,
+    "result": {
+      "warnings": [],
+      "ok": true,
+      "reason": null,
+      "message": null,
+      "block": {
+        "position": {
+          "x": 28,
+          "y": 104,
+          "z": 1
+        },
+        "block_name": "birch_door",
+        "display_name": "Birch Door"
+      },
+      "action": "door_opened",
+      "window": {
+        "kind": "chest",
+        "position": {
+          "x": 28,
+          "y": 104,
+          "z": 1
+        },
+        "slots": [
+          {
+            "slot": 0,
+            "item": null,
+            "count": 0
+          },
+          {
+            "slot": 1,
+            "item": null,
+            "count": 0
+          },
+          {
+            "slot": 2,
+            "item": null,
+            "count": 0
+          }
+        ]
+      },
+      "image": null
+    },
+    "images": []
+  },
+  "independent_closed_door": {
+    "scope": "Independent read-only door state. No world mutation or task acceptance.",
+    "results": [
+      {
+        "command": "execute if block 28 104 1 minecraft:birch_door[open=true] run data get entity tdd_player Pos",
+        "result": ""
+      },
+      {
+        "command": "execute if block 28 104 1 minecraft:birch_door[open=false] run data get entity tdd_player Pos",
+        "result": "tdd_player has the following entity data: [27.7d, 104.0d, 1.4993509442915673d]"
+      },
+      {
+        "command": "execute if block 28 105 1 minecraft:birch_door[open=true] run data get entity tdd_player Pos",
+        "result": ""
+      },
+      {
+        "command": "execute if block 28 105 1 minecraft:birch_door[open=false] run data get entity tdd_player Pos",
+        "result": "tdd_player has the following entity data: [27.7d, 104.0d, 1.4993509442915673d]"
+      }
+    ]
+  },
+  "confirmed_probe": {
+    "status": "passed",
+    "at": "2026-10-10T10:35:12.673759+00:00",
+    "scope": "Real tool protocol only. No native task acceptance, reset, item grant, or position change.",
+    "checks": {
+      "actual_furnace_window": true,
+      "first_toggle_confirmed": true,
+      "no_stale_window": true,
+      "second_toggle_confirmed": true,
+      "same_position_inventory_vitals": true
+    },
+    "calls": [
+      {
+        "tool": "minecraft_observe",
+        "arguments": {
+          "include_image": false
+        },
+        "ok": true,
+        "result": {
+          "warnings": [],
+          "ok": true,
+          "reason": null,
+          "message": null,
+          "camera": {
+            "feet_position": {
+              "x": 27.7,
+              "y": 104.0,
+              "z": 1.5
+            },
+            "eye_position": {
+              "x": 27.7,
+              "y": 105.62,
+              "z": 1.5
+            },
+            "block_position": {
+              "x": 27,
+              "y": 104,
+              "z": 1
+            },
+            "yaw": 269.89,
+            "pitch": -54.45,
+            "cardinal": "east",
+            "look_vector": {
+              "x": 0.58,
+              "y": -0.81,
+              "z": -0.0
+            }
+          },
+          "player": {
+            "health": 20.0,
+            "max_health": 20.0,
+            "food": 20,
+            "oxygen": 20,
+            "xp_level": 0,
+            "biome": "meadow",
+            "dimension": "overworld",
+            "time_of_day": 17162,
+            "is_day": false,
+            "is_raining": false,
+            "on_ground": true,
+            "in_water": false
+          },
+          "body_session": "e6d3852a9f3a4ca3af9e42b287630b97",
+          "death_count": 0,
+          "held_item": {
+            "name": "egg",
+            "display_name": "Egg",
+            "count": 2,
+            "slot": null,
+            "durability": null,
+            "max_durability": null
+          },
+          "hotbar": [
+            {
+              "slot": 0,
+              "item": "egg",
+              "count": 2
+            },
+            {
+              "slot": 1,
+              "item": "cobblestone",
+              "count": 3
+            },
+            {
+              "slot": 2,
+              "item": "iron_pickaxe",
+              "count": 1
+            },
+            {
+              "slot": 3,
+              "item": "stone_pickaxe",
+              "count": 1
+            },
+            {
+              "slot": 4,
+              "item": "birch_door",
+              "count": 2
+            },
+            {
+              "slot": 5,
+              "item": "dirt",
+              "count": 17
+            },
+            {
+              "slot": 6,
+              "item": "iron_ingot",
+              "count": 3
+            },
+            {
+              "slot": 7,
+              "item": "dandelion",
+              "count": 3
+            },
+            {
+              "slot": 8,
+              "item": null,
+              "count": 0
+            }
+          ],
+          "inventory": [
+            {
+              "name": "dirt",
+              "display_name": "Dirt",
+              "count": 17,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "cobblestone",
+              "display_name": "Cobblestone",
+              "count": 3,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "dandelion",
+              "display_name": "Dandelion",
+              "count": 3,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "iron_ingot",
+              "display_name": "Iron Ingot",
+              "count": 3,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "birch_door",
+              "display_name": "Birch Door",
+              "count": 2,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "egg",
+              "display_name": "Egg",
+              "count": 2,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "iron_pickaxe",
+              "display_name": "Iron Pickaxe",
+              "count": 1,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "stone_pickaxe",
+              "display_name": "Stone Pickaxe",
+              "count": 1,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            }
+          ],
+          "nearby_blocks": [
+            {
+              "block_name": "birch_door",
+              "display_name": "Birch Door",
+              "count": 2,
+              "nearest": {
+                "x": 28,
+                "y": 104,
+                "z": 1
+              },
+              "distance": 0.58
+            },
+            {
+              "block_name": "birch_planks",
+              "display_name": "Birch Planks",
+              "count": 98,
+              "nearest": {
+                "x": 28,
+                "y": 104,
+                "z": 2
+              },
+              "distance": 0.58
+            },
+            {
+              "block_name": "air",
+              "display_name": "Air",
+              "count": 2568,
+              "nearest": {
+                "x": 27,
+                "y": 104,
+                "z": 1
+              },
+              "distance": 0.86
+            },
+            {
+              "block_name": "grass_block",
+              "display_name": "Grass Block",
+              "count": 268,
+              "nearest": {
+                "x": 27,
+                "y": 103,
+                "z": 2
+              },
+              "distance": 1.32
+            },
+            {
+              "block_name": "dirt",
+              "display_name": "Dirt",
+              "count": 300,
+              "nearest": {
+                "x": 28,
+                "y": 102,
+                "z": 1
+              },
+              "distance": 2.08
+            },
+            {
+              "block_name": "grass",
+              "display_name": "Grass",
+              "count": 28,
+              "nearest": {
+                "x": 25,
+                "y": 105,
+                "z": 1
+              },
+              "distance": 2.92
+            },
+            {
+              "block_name": "stone",
+              "display_name": "Stone",
+              "count": 1580,
+              "nearest": {
+                "x": 26,
+                "y": 102,
+                "z": 3
+              },
+              "distance": 3.02
+            },
+            {
+              "block_name": "dandelion",
+              "display_name": "Dandelion",
+              "count": 22,
+              "nearest": {
+                "x": 25,
+                "y": 104,
+                "z": -1
+              },
+              "distance": 3.68
+            },
+            {
+              "block_name": "furnace",
+              "display_name": "Furnace",
+              "count": 2,
+              "nearest": {
+                "x": 30,
+                "y": 102,
+                "z": 5
+              },
+              "distance": 4.64
+            },
+            {
+              "block_name": "crafting_table",
+              "display_name": "Crafting Table",
+              "count": 2,
+              "nearest": {
+                "x": 30,
+                "y": 102,
+                "z": 6
+              },
+              "distance": 5.44
+            },
+            {
+              "block_name": "coal_ore",
+              "display_name": "Coal Ore",
+              "count": 39,
+              "nearest": {
+                "x": 22,
+                "y": 104,
+                "z": 2
+              },
+              "distance": 5.72
+            },
+            {
+              "block_name": "iron_ore",
+              "display_name": "Iron Ore",
+              "count": 1,
+              "nearest": {
+                "x": 23,
+                "y": 97,
+                "z": -4
+              },
+              "distance": 10.07
+            },
+            {
+              "block_name": "gravel",
+              "display_name": "Gravel",
+              "count": 2,
+              "nearest": {
+                "x": 28,
+                "y": 96,
+                "z": -7
+              },
+              "distance": 11.68
+            },
+            {
+              "block_name": "copper_ore",
+              "display_name": "Copper Ore",
+              "count": 1,
+              "nearest": {
+                "x": 19,
+                "y": 96,
+                "z": 2
+              },
+              "distance": 11.83
+            }
+          ],
+          "nearby_entities": [
+            {
+              "entity_id": 1,
+              "entity_type": "item",
+              "display_name": "Item",
+              "position": {
+                "x": 31.12,
+                "y": 101.0,
+                "z": 2.13
+              },
+              "distance": 4.6,
+              "health": null,
+              "hostile": false
+            },
+            {
+              "entity_id": 2,
+              "entity_type": "item",
+              "display_name": "Item",
+              "position": {
+                "x": 31.12,
+                "y": 101.0,
+                "z": 2.89
+              },
+              "distance": 4.76,
+              "health": null,
+              "hostile": false
+            }
+          ],
+          "image": null
+        },
+        "images": [],
+        "instruction_revision": 0,
+        "journal_sequence": 1,
+        "gameplay": {
+          "outcome": null,
+          "recovery": null,
+          "failed_recovery": null,
+          "paused_methods": [],
+          "decision_evidence": "scratch/decision-evidence.json",
+          "full_history": "scratch/gameplay-evidence.json"
+        }
+      },
+      {
+        "tool": "minecraft_use_block",
+        "arguments": {
+          "position": {
+            "x": 30,
+            "y": 102,
+            "z": 5
+          }
+        },
+        "ok": true,
+        "result": {
+          "warnings": [],
+          "ok": true,
+          "reason": null,
+          "message": null,
+          "block": {
+            "position": {
+              "x": 30,
+              "y": 102,
+              "z": 5
+            },
+            "block_name": "furnace",
+            "display_name": "Furnace"
+          },
+          "open_before": null,
+          "open_after": null,
+          "action": "furnace_opened",
+          "window": {
+            "kind": "furnace",
+            "position": {
+              "x": 30,
+              "y": 102,
+              "z": 5
+            },
+            "slots": [
+              {
+                "slot": 0,
+                "item": null,
+                "count": 0
+              },
+              {
+                "slot": 1,
+                "item": null,
+                "count": 0
+              },
+              {
+                "slot": 2,
+                "item": null,
+                "count": 0
+              }
+            ]
+          },
+          "image": null
+        },
+        "images": [],
+        "instruction_revision": 0,
+        "journal_sequence": 2,
+        "gameplay": {
+          "outcome": {
+            "kind": "completion_candidate",
+            "unsuccessful": false,
+            "reason": null,
+            "quantities": {},
+            "inventory_delta": {},
+            "made_progress": false,
+            "completion_verified": false,
+            "source": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-block-activation60\\protocol\\scratch\\actor-journal.jsonl",
+            "seq": 2,
+            "time": 1791628534.2900388,
+            "tool": "minecraft_use_block",
+            "arguments": {
+              "position": {
+                "x": 30,
+                "y": 102,
+                "z": 5
+              }
+            }
+          },
+          "recovery": null,
+          "failed_recovery": null,
+          "paused_methods": [],
+          "decision_evidence": "scratch/decision-evidence.json",
+          "full_history": "scratch/gameplay-evidence.json"
+        }
+      },
+      {
+        "tool": "minecraft_use_block",
+        "arguments": {
+          "position": {
+            "x": 28,
+            "y": 104,
+            "z": 1
+          }
+        },
+        "ok": true,
+        "result": {
+          "warnings": [],
+          "ok": true,
+          "reason": null,
+          "message": null,
+          "block": {
+            "position": {
+              "x": 28,
+              "y": 104,
+              "z": 1
+            },
+            "block_name": "birch_door",
+            "display_name": "Birch Door"
+          },
+          "open_before": true,
+          "open_after": false,
+          "action": "door_closed",
+          "window": null,
+          "image": null
+        },
+        "images": [],
+        "instruction_revision": 0,
+        "journal_sequence": 3,
+        "gameplay": {
+          "outcome": {
+            "kind": "completion_candidate",
+            "unsuccessful": false,
+            "reason": null,
+            "quantities": {},
+            "inventory_delta": {},
+            "made_progress": false,
+            "completion_verified": false,
+            "source": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-block-activation60\\protocol\\scratch\\actor-journal.jsonl",
+            "seq": 3,
+            "time": 1791628534.6910377,
+            "tool": "minecraft_use_block",
+            "arguments": {
+              "position": {
+                "x": 28,
+                "y": 104,
+                "z": 1
+              }
+            }
+          },
+          "recovery": null,
+          "failed_recovery": null,
+          "paused_methods": [],
+          "decision_evidence": "scratch/decision-evidence.json",
+          "full_history": "scratch/gameplay-evidence.json"
+        }
+      },
+      {
+        "tool": "minecraft_use_block",
+        "arguments": {
+          "position": {
+            "x": 28,
+            "y": 104,
+            "z": 1
+          }
+        },
+        "ok": true,
+        "result": {
+          "warnings": [],
+          "ok": true,
+          "reason": null,
+          "message": null,
+          "block": {
+            "position": {
+              "x": 28,
+              "y": 104,
+              "z": 1
+            },
+            "block_name": "birch_door",
+            "display_name": "Birch Door"
+          },
+          "open_before": false,
+          "open_after": true,
+          "action": "door_opened",
+          "window": null,
+          "image": null
+        },
+        "images": [],
+        "instruction_revision": 0,
+        "journal_sequence": 4,
+        "gameplay": {
+          "outcome": {
+            "kind": "completion_candidate",
+            "unsuccessful": false,
+            "reason": null,
+            "quantities": {},
+            "inventory_delta": {},
+            "made_progress": false,
+            "completion_verified": false,
+            "source": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-block-activation60\\protocol\\scratch\\actor-journal.jsonl",
+            "seq": 4,
+            "time": 1791628535.2675545,
+            "tool": "minecraft_use_block",
+            "arguments": {
+              "position": {
+                "x": 28,
+                "y": 104,
+                "z": 1
+              }
+            }
+          },
+          "recovery": null,
+          "failed_recovery": null,
+          "paused_methods": [],
+          "decision_evidence": "scratch/decision-evidence.json",
+          "full_history": "scratch/gameplay-evidence.json"
+        }
+      },
+      {
+        "tool": "minecraft_observe",
+        "arguments": {
+          "include_image": false
+        },
+        "ok": true,
+        "result": {
+          "warnings": [],
+          "ok": true,
+          "reason": null,
+          "message": null,
+          "camera": {
+            "feet_position": {
+              "x": 27.7,
+              "y": 104.0,
+              "z": 1.5
+            },
+            "eye_position": {
+              "x": 27.7,
+              "y": 105.62,
+              "z": 1.5
+            },
+            "block_position": {
+              "x": 27,
+              "y": 104,
+              "z": 1
+            },
+            "yaw": 269.89,
+            "pitch": -54.45,
+            "cardinal": "east",
+            "look_vector": {
+              "x": 0.58,
+              "y": -0.81,
+              "z": -0.0
+            }
+          },
+          "player": {
+            "health": 20.0,
+            "max_health": 20.0,
+            "food": 20,
+            "oxygen": 20,
+            "xp_level": 0,
+            "biome": "meadow",
+            "dimension": "overworld",
+            "time_of_day": 17202,
+            "is_day": false,
+            "is_raining": false,
+            "on_ground": true,
+            "in_water": false
+          },
+          "body_session": "e6d3852a9f3a4ca3af9e42b287630b97",
+          "death_count": 0,
+          "held_item": {
+            "name": "egg",
+            "display_name": "Egg",
+            "count": 2,
+            "slot": null,
+            "durability": null,
+            "max_durability": null
+          },
+          "hotbar": [
+            {
+              "slot": 0,
+              "item": "egg",
+              "count": 2
+            },
+            {
+              "slot": 1,
+              "item": "cobblestone",
+              "count": 3
+            },
+            {
+              "slot": 2,
+              "item": "iron_pickaxe",
+              "count": 1
+            },
+            {
+              "slot": 3,
+              "item": "stone_pickaxe",
+              "count": 1
+            },
+            {
+              "slot": 4,
+              "item": "birch_door",
+              "count": 2
+            },
+            {
+              "slot": 5,
+              "item": "dirt",
+              "count": 17
+            },
+            {
+              "slot": 6,
+              "item": "iron_ingot",
+              "count": 3
+            },
+            {
+              "slot": 7,
+              "item": "dandelion",
+              "count": 3
+            },
+            {
+              "slot": 8,
+              "item": null,
+              "count": 0
+            }
+          ],
+          "inventory": [
+            {
+              "name": "dirt",
+              "display_name": "Dirt",
+              "count": 17,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "cobblestone",
+              "display_name": "Cobblestone",
+              "count": 3,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "dandelion",
+              "display_name": "Dandelion",
+              "count": 3,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "iron_ingot",
+              "display_name": "Iron Ingot",
+              "count": 3,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "birch_door",
+              "display_name": "Birch Door",
+              "count": 2,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "egg",
+              "display_name": "Egg",
+              "count": 2,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "iron_pickaxe",
+              "display_name": "Iron Pickaxe",
+              "count": 1,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            },
+            {
+              "name": "stone_pickaxe",
+              "display_name": "Stone Pickaxe",
+              "count": 1,
+              "slot": null,
+              "durability": null,
+              "max_durability": null
+            }
+          ],
+          "nearby_blocks": [
+            {
+              "block_name": "birch_door",
+              "display_name": "Birch Door",
+              "count": 2,
+              "nearest": {
+                "x": 28,
+                "y": 104,
+                "z": 1
+              },
+              "distance": 0.58
+            },
+            {
+              "block_name": "birch_planks",
+              "display_name": "Birch Planks",
+              "count": 98,
+              "nearest": {
+                "x": 28,
+                "y": 104,
+                "z": 2
+              },
+              "distance": 0.58
+            },
+            {
+              "block_name": "air",
+              "display_name": "Air",
+              "count": 2568,
+              "nearest": {
+                "x": 27,
+                "y": 104,
+                "z": 1
+              },
+              "distance": 0.86
+            },
+            {
+              "block_name": "grass_block",
+              "display_name": "Grass Block",
+              "count": 268,
+              "nearest": {
+                "x": 27,
+                "y": 103,
+                "z": 2
+              },
+              "distance": 1.32
+            },
+            {
+              "block_name": "dirt",
+              "display_name": "Dirt",
+              "count": 300,
+              "nearest": {
+                "x": 28,
+                "y": 102,
+                "z": 1
+              },
+              "distance": 2.08
+            },
+            {
+              "block_name": "grass",
+              "display_name": "Grass",
+              "count": 28,
+              "nearest": {
+                "x": 25,
+                "y": 105,
+                "z": 1
+              },
+              "distance": 2.92
+            },
+            {
+              "block_name": "stone",
+              "display_name": "Stone",
+              "count": 1580,
+              "nearest": {
+                "x": 26,
+                "y": 102,
+                "z": 3
+              },
+              "distance": 3.02
+            },
+            {
+              "block_name": "dandelion",
+              "display_name": "Dandelion",
+              "count": 22,
+              "nearest": {
+                "x": 25,
+                "y": 104,
+                "z": -1
+              },
+              "distance": 3.68
+            },
+            {
+              "block_name": "furnace",
+              "display_name": "Furnace",
+              "count": 2,
+              "nearest": {
+                "x": 30,
+                "y": 102,
+                "z": 5
+              },
+              "distance": 4.64
+            },
+            {
+              "block_name": "crafting_table",
+              "display_name": "Crafting Table",
+              "count": 2,
+              "nearest": {
+                "x": 30,
+                "y": 102,
+                "z": 6
+              },
+              "distance": 5.44
+            },
+            {
+              "block_name": "coal_ore",
+              "display_name": "Coal Ore",
+              "count": 39,
+              "nearest": {
+                "x": 22,
+                "y": 104,
+                "z": 2
+              },
+              "distance": 5.72
+            },
+            {
+              "block_name": "iron_ore",
+              "display_name": "Iron Ore",
+              "count": 1,
+              "nearest": {
+                "x": 23,
+                "y": 97,
+                "z": -4
+              },
+              "distance": 10.07
+            },
+            {
+              "block_name": "gravel",
+              "display_name": "Gravel",
+              "count": 2,
+              "nearest": {
+                "x": 28,
+                "y": 96,
+                "z": -7
+              },
+              "distance": 11.68
+            },
+            {
+              "block_name": "copper_ore",
+              "display_name": "Copper Ore",
+              "count": 1,
+              "nearest": {
+                "x": 19,
+                "y": 96,
+                "z": 2
+              },
+              "distance": 11.83
+            }
+          ],
+          "nearby_entities": [
+            {
+              "entity_id": 1,
+              "entity_type": "item",
+              "display_name": "Item",
+              "position": {
+                "x": 31.12,
+                "y": 101.0,
+                "z": 2.13
+              },
+              "distance": 4.6,
+              "health": null,
+              "hostile": false
+            },
+            {
+              "entity_id": 2,
+              "entity_type": "item",
+              "display_name": "Item",
+              "position": {
+                "x": 31.12,
+                "y": 101.0,
+                "z": 2.89
+              },
+              "distance": 4.76,
+              "health": null,
+              "hostile": false
+            }
+          ],
+          "image": null
+        },
+        "images": [],
+        "instruction_revision": 0,
+        "journal_sequence": 5,
+        "gameplay": {
+          "outcome": null,
+          "recovery": null,
+          "failed_recovery": null,
+          "paused_methods": [],
+          "decision_evidence": "scratch/decision-evidence.json",
+          "full_history": "scratch/gameplay-evidence.json"
+        }
+      }
+    ],
+    "oracles": [
+      {
+        "at": "2026-10-10T10:35:33.913836+00:00",
+        "halves": [
+          {
+            "true": "tdd_player has the following entity data: [27.7d, 104.0d, 1.4993509442915673d]",
+            "false": ""
+          },
+          {
+            "true": "tdd_player has the following entity data: [27.7d, 104.0d, 1.4993509442915673d]",
+            "false": ""
+          }
+        ]
+      },
+      {
+        "at": "2026-10-10T10:35:34.910933+00:00",
+        "halves": [
+          {
+            "true": "",
+            "false": "tdd_player has the following entity data: [27.7d, 104.0d, 1.4993509442915673d]"
+          },
+          {
+            "true": "",
+            "false": "tdd_player has the following entity data: [27.7d, 104.0d, 1.4993509442915673d]"
+          }
+        ]
+      },
+      {
+        "at": "2026-10-10T10:35:35.464764+00:00",
+        "halves": [
+          {
+            "true": "tdd_player has the following entity data: [27.7d, 104.0d, 1.4993509442915673d]",
+            "false": ""
+          },
+          {
+            "true": "tdd_player has the following entity data: [27.7d, 104.0d, 1.4993509442915673d]",
+            "false": ""
+          }
+        ]
+      }
+    ],
+    "finished": "2026-10-10T10:35:37.492156+00:00"
+  },
+  "sources": [
+    {
+      "path": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-m3-20\\app\\managed_tasks\\ad5f4b4094a14bf6bcfe9caeead2770a\\attempts\\actor-0044\\scratch\\actor-journal.jsonl",
+      "sha256": "96e75d2a5c84073c9d98e113436b1e163d0fd8e0d56cba16d25d4dd6d53ce8d2"
+    },
+    {
+      "path": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13\\workflow-split\\server-door58.json",
+      "sha256": "e4a3f939f99217253bb2cc4377ec64eb9b7d51e71d7152bc886b00a2e708d702"
+    },
+    {
+      "path": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-block-activation60\\receipt.json",
+      "sha256": "4e98bc5cb4213af07c6f321f9eae5f2fce1facdcb18601cb8696b41072b86e46"
+    }
+  ]
+}

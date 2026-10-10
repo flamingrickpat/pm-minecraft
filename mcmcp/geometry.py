@@ -4,7 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from .models import Box, Vec3i
+from .models import Box, Vec3f, Vec3i
+
+
+def player_intersects_cell(feet: Vec3f, cell: Vec3i) -> bool:
+    """Return whether a cell overlaps the standing survival player's body.
+
+    Width is 0.6 blocks and height is 1.8 blocks. Use the standing height
+    during crouching too. A floor ending at the feet remains permitted.
+    This pure check sends no world action and does not consume inventory.
+    """
+    return (cell.x + 1 > feet.x - 0.3 and cell.x < feet.x + 0.3
+            and cell.z + 1 > feet.z - 0.3 and cell.z < feet.z + 0.3
+            and cell.y + 1 > feet.y and cell.y < feet.y + 1.8)
 
 
 def build_cells(

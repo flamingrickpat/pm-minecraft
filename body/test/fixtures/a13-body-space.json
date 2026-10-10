@@ -1,0 +1,28 @@
+{
+  "scope": "Captured M3-34 false harvestability, empty inspector metadata, digging below the player, block placement inside the body, and actual suffocation. Projected metadata and safe controls check boundaries only, not a repaired live pass.",
+  "sources": {
+    "journal": {
+      "path": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-m3-20\\app\\managed_tasks\\ad5f4b4094a14bf6bcfe9caeead2770a\\attempts\\actor-0020\\scratch\\actor-journal.jsonl",
+      "sha256": "44f1494a39f71d7c4189d92ab6787d426ce835ceab827bd2d110f6aafa7d8af6"
+    },
+    "server_log": {
+      "path": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-m3-34\\services\\server.log",
+      "sha256": "0949ad495266da5829d51fc813372508cf78fc483510a278da4fe32b094862a0"
+    }
+  },
+  "feet": {
+    "x": -20.7,
+    "y": 117.0,
+    "z": 28.5
+  },
+  "placed_inside": {
+    "x": -21,
+    "y": 117,
+    "z": 28
+  },
+  "dug_below": {
+    "x": -21,
+    "y": 116,
+    "z": 28
+  }
+}

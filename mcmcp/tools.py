@@ -120,6 +120,8 @@ class MinecraftTools:
         """Take a compact snapshot of your current situation.
 
         Nearby blocks and entities use a fixed {{OBSERVE_RADIUS_BLOCKS}}-block radius.
+        body_session and death_count identify observed deaths in this body process.
+        Respawn restores vitals but does not establish survival of the old hazard.
         The radius includes its boundary. Distance is Euclidean distance from
         your feet to a block-cell position or entity position.
         THE orientation tool. Start of every session, after any disorienting
@@ -233,6 +235,11 @@ class MinecraftTools:
 
         WORLD BEHAVIOR:
             - Pure read. Walks nothing, breaks nothing.
+            - `properties` reports current block state. `collision_shapes`
+              reports cell-local boxes as [minX,minY,minZ,maxX,maxY,maxZ].
+              Add the cell position to get world bounds. Account for your
+              body width and height when choosing a route. An open flag alone
+              does not establish clearance in your travel direction.
             - `neighbors` lists all six face-adjacent cells with their contents,
               so you can reason about collapses, lava behind walls, etc.
             - `can_harvest_with_held=False` means: breaking it will destroy the
@@ -343,6 +350,12 @@ class MinecraftTools:
         you even try to craft.
 
         The result contains at most {{RECIPE_RESULT_LIMIT}} recipes.
+
+        Each item entry shows one concrete ingredient variant. It selects
+        available ingredients, or the smallest current ingredient deficit.
+        If you own logs but need planks, search "*_planks" with
+        craftable_now=True and craft that available plank recipe first.
+        Then search the required item again with the new inventory.
 
         Args:
             pattern: Glob on the crafted item's name. Default "*" matches the
@@ -477,7 +490,7 @@ class MinecraftTools:
     ) -> SmeltItemResult:
         """Smelt items in a nearby furnace, fully automatic.
 
-        Finds a furnace within {{FURNACE_DISTANCE_BLOCKS}} blocks, clears stale
+        Finds a furnace within {{FURNACE_DISTANCE_BLOCKS}} blocks, collects retained
         slots, loads input and fuel, waits for the smelt, and returns the output
         to your inventory. The distance includes its boundary. It uses distance
         from your feet to the furnace block-cell position. The whole trip is one
@@ -486,9 +499,9 @@ class MinecraftTools:
         Args:
             input: Item name or glob to smelt, e.g. "raw_iron", "*raw_iron".
             input_count: How many to smelt, default 1.
-            fuel: Fuel name or glob, default None = auto-pick best available
-                (coal/charcoal > planks > logs > sticks).
+            fuel: Fuel name or glob, default None selects coal.
             fuel_count: Fuel items to burn, default 1. One coal smelts 8 items.
+                One log or plank smelts 1.5 items; three iron require two logs.
 
         Failure modes:
             - reason "furnace_not_found": no furnace is within
@@ -497,6 +510,13 @@ class MinecraftTools:
             - reason "missing": short on input or fuel - see `missing` list.
             - reason "ambiguous": input/fuel glob matched several items.
             - reason "target_changed": the furnace disappeared after work started.
+            - reason "fuel_exhausted": fuel ended before the batch finished.
+            - reason "smelt_timeout": the body wait reached 90 seconds.
+
+        Partial output remains useful. Unused input and fuel return to inventory.
+        furnace_before records retained slots before the action. recovered_output
+        reports earlier output separately from this batch. After an interruption,
+        request only the remaining input count and enough fuel. No output is erased.
 
         See also: minecraft_recipe_search, minecraft_craft_item
         """
@@ -854,6 +874,11 @@ class MinecraftTools:
         The universal activation. A door toggles open/closed (call again to
         close), a chest opens (returns its full contents in `window`), a
         crafting table opens (enables 3x3 crafting), buttons/levers trigger.
+        The previous container window closes before activation.
+        Door, gate, and trapdoor labels require an observed state change.
+        `open_before` and `open_after` report their actual open properties.
+        Activating an already open door closes it.
+        A window belongs only to the newly opened container.
 
         Args:
             position: The interactable block's cell.
@@ -862,6 +887,10 @@ class MinecraftTools:
             - reason "not_found": no block at the cell.
             - reason "not_interactable": the block has no use action.
             - reason "out_of_range": stand closer first.
+
+            - reason "activation_unconfirmed": the server did not confirm the
+              state change or new window within ten seconds. A delayed effect
+              remains possible. Inspect current state before another activation.
 
         See also: minecraft_find_interactables, minecraft_chest_deposit
         """
@@ -874,13 +903,14 @@ class MinecraftTools:
     ) -> ChestMoveResult:
         """Move items from your inventory into a container.
 
-        Uses the currently open window (opened via minecraft_use_block), or
-        opens `chest` itself when you pass its cell.
+        Pass an explicit chest, barrel, or shulker-box cell, even after opening
+        its window. The body validates its current type and five-block range.
+        A furnace uses minecraft_smelt_item with the remaining input count.
 
         Args:
             item: Exact item name or glob to move.
             count: How many; None (default) = all matching.
-            chest: Optional chest/barrel cell to open when nothing is open.
+            chest: Explicit storage cell. None returns no_chest_window.
 
         Failure modes:
             - reason "no_chest_window": nothing open and no chest given.
@@ -888,6 +918,8 @@ class MinecraftTools:
             - reason "insufficient": you own fewer than requested; message
               says how much was moved instead.
             - reason "target_changed": the container disappeared during transfer.
+            - reason "not_storage_container": the target is not chest-like storage.
+            - reason "out_of_range": the storage target is more than five blocks away.
 
         See also: minecraft_chest_withdraw, minecraft_use_block
         """
@@ -900,16 +932,20 @@ class MinecraftTools:
     ) -> ChestMoveResult:
         """Take items from a container into your inventory.
 
-        Mirror of minecraft_chest_deposit: open window or pass `chest`.
+        Pass an explicit storage cell, as in minecraft_chest_deposit.
+        Furnaces use minecraft_smelt_item, which collects earlier output and
+        resumes the remaining raw input with the supplied fuel.
 
         Args:
             item: Exact item name or glob to take.
             count: How many; None (default) = all the container holds.
-            chest: Optional chest/barrel cell to open when nothing is open.
+            chest: Explicit storage cell. None returns no_chest_window.
 
         Failure modes:
             - reason "no_chest_window": nothing open and no chest given.
             - reason "ambiguous" / "not_found": item resolution - candidates.
+            - reason "not_storage_container": use the tool for the actual target type.
+            - reason "out_of_range": approach within five blocks first.
             - reason "insufficient": container holds fewer than requested.
             - reason "inventory_full": your inventory has no output slot.
             - reason "target_changed": the container disappeared during transfer.
@@ -1088,6 +1124,9 @@ class MinecraftTools:
         Confirms who you are, whether the body is connected and spawned, how
         many deaths you have suffered, and where drafts/skills/memory live.
         Call when something feels off with the connection.
+        server_rules reports current Babymode rules from a read-only server query.
+        If natural regeneration is off, full food cannot heal damage.
+        Check enabled nutrition effects before assuming a well-fed healing buff.
 
         See also: minecraft_observe
         """
@@ -1292,17 +1331,19 @@ class MinecraftTools:
     def minecraft_equip_best_tool(self, target: Vec3i) -> EquipBestToolResult:
         """Auto-equip the fastest suitable tool you own for a block.
 
-        Inspects the block at `target`, ranks YOUR tools by harvest speed and
-        tier, equips the best one. Kills the whole inspect -> craft -> equip
-        -> retry dance in one call. When nothing you own is adequate,
-        `best_possible_tool` names the tool to CRAFT next.
+        Inspect the target and select an owned item by its breaking speed.
+        `can_harvest_with_held` reports fresh eligibility after the attempt.
+        `best_possible_tool` names the fastest registry tool, even if you
+        do not own it. Use actual recipes to choose a suitable craftable tool.
+        This call does not create supplies. It can leave equipment unchanged.
 
         Args:
             target: Cell of the block you want to mine.
 
         Failure modes:
             - reason "not_found": no block at the cell.
-            - reason "unharvestable": no tool can harvest this block.
+            - reason "unharvestable": the current held item cannot harvest it.
+            - reason "harvestability_unknown": fresh eligibility is missing.
 
         See also: minecraft_equip, minecraft_craft_item
         """
@@ -1341,8 +1382,14 @@ class MinecraftTools:
             torch: Place torches for light as you go (default True).
 
         Failure modes:
-            - ok=True with depth_achieved < depth_requested: stopped at a
-              hazard - read hazards_found before continuing.
+            - ok=False with partial depth: the descent stopped at a hazard,
+              unsupported landing, failed step, cancellation, or death.
+              Read reason and hazards_found before another action.
+            - Each cleared notch requires a loaded solid floor. Movement
+              targets one exact landing and counts only a grounded descent
+              of one block. Missing support requires another safe route.
+            - A changed death counter means inventory loss, not material
+              consumption. Respawn cannot prove a successful descent.
             - Check `warnings` for tool loss or held-item drift. Carry
               spare tools; re-equip before the next dig.
 

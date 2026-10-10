@@ -1,0 +1,38 @@
+{
+  "scope": "Actual M3-33 staircase reported eight steps while dropping from Y29 to Y0, followed by same-body death and empty inventory. Native text incorrectly called missing items consumed as blocks. Captured and projected boundary checks do not establish a safe live descent or healing. The target and positive one-step control are explicit contract projections, not another world action.",
+  "sources": {
+    "journal": {
+      "path": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-m3-20\\app\\managed_tasks\\ad5f4b4094a14bf6bcfe9caeead2770a\\attempts\\actor-0018\\scratch\\actor-journal.jsonl",
+      "sha256": "793c152c175d3b1185d434460b0b022a3074168a676731f412aeb8779ba6c753"
+    },
+    "geometry_journal": {
+      "path": "C:\\source\\pm\\pm_next_v2\\.runtime\\alpha\\a13-m3-20\\app\\managed_tasks\\ad5f4b4094a14bf6bcfe9caeead2770a\\attempts\\actor-0016\\scratch\\actor-journal.jsonl",
+      "sha256": "278d4108b1701ae6b6f08d4f4b5aa20c9973429a6c01d70df6139375a855319d"
+    }
+  },
+  "floor": {
+    "block_name": "stone",
+    "is_solid": true
+  },
+  "air": {
+    "block_name": "air",
+    "is_solid": false
+  },
+  "start": {
+    "x": 29.4,
+    "y": 29.0,
+    "z": 1.56
+  },
+  "reported_end": {
+    "x": 38.7,
+    "y": 0.0,
+    "z": 1.5
+  },
+  "projected_target": {
+    "x": 30,
+    "y": 28,
+    "z": 1
+  },
+  "death_count_before": 0,
+  "death_count_after": 1
+}

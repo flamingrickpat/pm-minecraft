@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .models import (
     BlockCount,
@@ -48,6 +48,12 @@ class BodyBlock(BaseModel):
     name: str
     display_name: str
     replaceable: bool
+    properties: dict[str, str | int | float | bool] | None = None
+    collision_shapes: list[tuple[float, float, float, float, float, float]] | None = None
+    best_tools: list[str] = Field(default_factory=list)
+    can_harvest_with_held: bool | None = None
+    drops: list[str] = Field(default_factory=list)
+    hardness: float | None = None
 
 
 class BodyBlocks(BaseModel):
@@ -207,12 +213,16 @@ class BodyUseBlock(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    ok: bool
+    reason: Literal["activation_unconfirmed"] | None
+    open_before: bool | None
+    open_after: bool | None
     action: Literal[
         "door_opened", "door_closed", "gate_opened", "gate_closed",
         "trapdoor_opened", "trapdoor_closed", "container_opened",
         "crafting_table_opened", "furnace_opened", "button_pressed",
         "lever_toggled", "bed_entered", "activated",
-    ]
+    ] | None
     window: ContainerWindow | None
 
 
@@ -270,7 +280,7 @@ class BodyDoorPlacement(BaseModel):
 
 class BodyMine(BaseModel):
     ok: bool
-    reason: Literal["unharvestable", "target_changed"] | None
+    reason: Literal["unharvestable", "target_changed", "unsafe_support"] | None
     block: BodyBlock
     tool_used: str | None
     can_harvest: bool
@@ -288,6 +298,7 @@ class BodyAttack(BaseModel):
 
 
 class BodyChestMove(BaseModel):
+    reason: Literal["target_changed", "not_storage_container", "out_of_range"] | None = None
     moved_count: int
     available_count: int
     inventory_space: int
@@ -296,8 +307,10 @@ class BodyChestMove(BaseModel):
 
 class BodySmelt(BaseModel):
     ok: bool
-    reason: Literal["target_changed"] | None
+    reason: Literal["target_changed", "fuel_exhausted", "smelt_timeout", "missing"] | None
     output: InventoryItem | None
+    recovered_output: InventoryItem | None = None
+    furnace_before: ContainerWindow | None = None
     input_consumed: int
     fuel_consumed: int
     window: ContainerWindow | None

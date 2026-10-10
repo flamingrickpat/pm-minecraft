@@ -15,6 +15,7 @@ from pathlib import Path
 import secrets
 import subprocess
 import time
+from uuid import uuid4
 
 import requests
 
@@ -67,11 +68,16 @@ class MinecraftBody:
     def __init__(self, configuration: Configuration):
         patch_prismarine_viewer(configuration.body_entrypoint.parents[1])
         self.configuration = configuration
+        # This public identity scopes death counters to one Node body process.
+        # It is separate from the private HTTP authorization token.
+        self.session_id = uuid4().hex
         self.token = secrets.token_urlsafe(32)
         self.url = f"http://{configuration.body_host}:{configuration.body_port}"
         configuration.agent_home.mkdir(parents=True, exist_ok=True)
         self.log_path = configuration.agent_home / "body.log"
-        self.log_file = self.log_path.open("w", encoding="utf-8")
+        self.log_file = self.log_path.open("a", encoding="utf-8")
+        self.log_file.write(f"\nBody session {self.session_id}\n")
+        self.log_file.flush()
         environment = os.environ.copy()
         environment.update(
             {
@@ -113,7 +119,11 @@ class MinecraftBody:
         return BodyCatalog.model_validate(self._request("GET", "/catalog"))
 
     def blocks(self, positions: list[Vec3i]) -> BodyBlocks:
-        """Read exact loaded block cells in request order."""
+        """Read exact loaded cells and current harvesting facts in order.
+
+        Tool names and breaking speed come from the active game registry.
+        Held-tool eligibility comes from the live block. No dig is sent.
+        """
         return BodyBlocks.model_validate(
             self._request(
                 "POST",
@@ -131,7 +141,9 @@ class MinecraftBody:
     def find_blocks(self, options: dict) -> BodyFindBlocks:
         """Scan the loaded world for exposed matching blocks."""
         return BodyFindBlocks.model_validate(
-            self._request("POST", "/find_blocks", options)
+            # Broad patterns inspect faces across the full loaded search box.
+            # The two-second status-read timeout can expire during that scan.
+            self._request("POST", "/find_blocks", options, timeout=30)
         )
 
     def raytrace(self) -> BodyRaytrace:
@@ -235,14 +247,16 @@ class MinecraftBody:
         return BodySkillOutcome.model_validate(self._request("POST", "/execute_skill", {"path": path, "source": source, "arguments": arguments, "budget_ms": budget_ms}, timeout=budget_ms / 1000 + 15))
 
     def use_block(self, position: Vec3i, kind: str) -> BodyUseBlock:
-        """Activate one loaded block."""
+        """Activate one loaded block and cover its ten-second confirmation wait."""
         return BodyUseBlock.model_validate(self._request("POST", "/use_block", {
             "position": position.model_dump(),
             "kind": kind,
-        }))
+        }, timeout=15))
 
     def equip(self, item: str) -> BodyEquip:
-        return BodyEquip.model_validate(self._request("POST", "/equip", {"item": item}))
+        # Mineflayer can wait up to twenty seconds for the inventory slot.
+        # Do not abandon a still-running equip at the two-second read limit.
+        return BodyEquip.model_validate(self._request("POST", "/equip", {"item": item}, timeout=30))
 
     def use_item(self) -> BodyUseItem:
         return BodyUseItem.model_validate(self._request("POST", "/use_item", timeout=10))
