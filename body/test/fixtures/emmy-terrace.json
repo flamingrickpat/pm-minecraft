@@ -1,0 +1,12 @@
+{
+  "source": "Read-only minecraft_inspect_block survey on the real server, 2026-10-21. Rows run z=-3..-1, columns x=14..16.",
+  "feet": { "x": 15.33, "y": 111, "z": -2.3 },
+  "minimum": { "x": 14, "y": 110, "z": -3 },
+  "layers": [
+    [["dirt", "grass_block", "air"], ["dirt", "dirt", "grass_block"], ["stone", "dirt", "dirt"]],
+    [["grass_block", "air", "air"], ["grass_block", "grass_block", "air"], ["dirt", "grass_block", "grass_block"]],
+    [["air", "air", "air"], ["air", "air", "air"], ["grass_block", "air", "air"]],
+    [["air", "air", "air"], ["air", "air", "air"], ["air", "air", "air"]]
+  ],
+  "live_after_fix": { "x": 3.59, "y": 119, "z": 6.5, "duration_ms": 5862.43, "status": "reached", "health": 20, "deaths": 0 }
+}

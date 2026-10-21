@@ -118,13 +118,14 @@ def test_rotate_straight_up(live_test):
         live_test,
         layout=Layout(),
     )
+    call_mcp(scenario, 'minecraft_rotate', {'yaw_degrees': 135, 'absolute': True})
     truth_before = capture_truth(scenario)
     res = call_mcp(scenario, 'minecraft_rotate', {'pitch_degrees': 90, 'absolute': True}, timeout=660)
     result = parse_result(scenario, res, 'minecraft_rotate', {'pitch_degrees': 90, 'absolute': True}, truth_before=truth_before)
     assert result.ok is True
     assert result.reason is None
     assert_field(scenario, result, 'camera.yaw', Approx(
-        value=0,
+        value=135,
         tolerance=0.5,
     ))
     assert_field(scenario, result, 'camera.pitch', Approx(
@@ -145,13 +146,14 @@ def test_rotate_straight_down(live_test):
         live_test,
         layout=Layout(),
     )
+    call_mcp(scenario, 'minecraft_rotate', {'yaw_degrees': 135, 'absolute': True})
     truth_before = capture_truth(scenario)
     res = call_mcp(scenario, 'minecraft_rotate', {'pitch_degrees': -90, 'absolute': True}, timeout=660)
     result = parse_result(scenario, res, 'minecraft_rotate', {'pitch_degrees': -90, 'absolute': True}, truth_before=truth_before)
     assert result.ok is True
     assert result.reason is None
     assert_field(scenario, result, 'camera.yaw', Approx(
-        value=0,
+        value=135,
         tolerance=0.5,
     ))
     assert_field(scenario, result, 'camera.pitch', Approx(

@@ -21,6 +21,8 @@ export class ViewerCapture {
   private page: Page | null = null;
   private viewerStarted = false;
   private warming: Promise<void> | null = null;
+  private bot: Bot | null = null;
+  private pendingCapture: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly viewerPort: number,
@@ -28,6 +30,7 @@ export class ViewerCapture {
   ) {}
 
   start(bot: Bot): void {
+    this.bot = bot;
     if (this.viewerStarted) {
       return;
     }
@@ -36,12 +39,41 @@ export class ViewerCapture {
     this.warming = this.warm();
   }
 
-  async capture(): Promise<CapturedFrame> {
+  capture(): Promise<CapturedFrame> {
+    const frame = this.pendingCapture.then(() => this.captureFrame());
+    this.pendingCapture = frame.then(() => {}, () => {});
+    return frame;
+  }
+
+  private async captureFrame(): Promise<CapturedFrame> {
     await this.warming;
     while (true) {
       try {
         const page = await this.ensurePage();
+        const bot = this.bot!;
+        // bot.look(force=true) changes the pose before the viewer's next move
+        // packet. Render this snapshot directly, then wait for browser frames.
+        const state = {
+          position: { x: bot.entity.position.x, y: bot.entity.position.y + 1.62, z: bot.entity.position.z },
+          yaw: bot.entity.yaw, pitch: bot.entity.pitch,
+          timeOfDay: bot.time.timeOfDay, isRaining: bot.isRaining,
+          dimension: bot.game.dimension,
+        };
+        await page.evaluate(async (snapshot) => {
+          const bridge = (globalThis as any).mcmcpViewer;
+          await bridge.viewer.waitForChunksToRender();
+          bridge.capturing = true;
+          await new Promise(resolve => setTimeout(resolve, 75));
+          await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+          // Flush the viewer's position tween before setting the exact pose.
+          bridge.viewer.update();
+          bridge.viewer.camera.rotation.set(snapshot.pitch, snapshot.yaw, 0, 'ZYX');
+          bridge.viewer.camera.position.set(snapshot.position.x, snapshot.position.y, snapshot.position.z);
+          (globalThis as any).mcmcpUpdateEnvironment(bridge.viewer, snapshot);
+          bridge.renderer.render(bridge.viewer.scene, bridge.viewer.camera);
+        }, state);
         const png = Buffer.from(await page.screenshot({ type: "png" }));
+        await page.evaluate(() => { (globalThis as any).mcmcpViewer.capturing = false; });
         return { png_base64: png.toString("base64"), width: 640, height: 480 };
       } catch (error) {
         console.error(`Viewer capture failed: ${String(error)}. Trying again.`);
@@ -80,10 +112,18 @@ export class ViewerCapture {
       this.page = await this.browser.newPage();
       await this.page.setViewport({ width: 640, height: 480, deviceScaleFactor: 1 });
       await this.page.goto(`http://127.0.0.1:${this.viewerPort}`, {
-        waitUntil: "networkidle2",
+        waitUntil: "domcontentloaded",
         timeout: 15000,
       });
       await this.page.waitForSelector("canvas", { timeout: 15000 });
+      await this.page.waitForFunction(() => (globalThis as any).mcmcpViewer?.viewer.version !== undefined, { timeout: 15000 });
+      await this.page.evaluate(() => {
+        const bridge = (globalThis as any).mcmcpViewer;
+        const setCamera = bridge.viewer.setFirstPersonCamera.bind(bridge.viewer);
+        bridge.viewer.setFirstPersonCamera = (...args: unknown[]) => {
+          if (!bridge.capturing) setCamera(...args);
+        };
+      });
       await delay(500);
     }
     return this.page;

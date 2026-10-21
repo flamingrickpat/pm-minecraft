@@ -4,6 +4,22 @@ import pytest
 
 from tests.live_case import BlockSpec, Layout, WorldExpectation, assert_failure_unchanged, assert_field, assert_message, assert_protocol_error, assert_response_image, assert_world_state, call_mcp, capture_failure_snapshot, capture_truth, parse_result, setup
 
+def test_craft_preserves_surviving_held_ingredient_and_other_hotbar_slots(live_test):
+    scenario = setup(live_test, Layout(slot_items=(
+        ('hotbar.0', 'dandelion', 2),
+        ('hotbar.3', 'wooden_pickaxe', 1),
+        ('hotbar.7', 'torch', 8),
+    )))
+    response = call_mcp(scenario, 'minecraft_craft_item', {'item': 'yellow_dye'})
+    assert not response.isError, response
+    assert response.structuredContent['ok'], response.structuredContent
+    observed = call_mcp(scenario, 'minecraft_observe', {'include_image': False}).structuredContent
+    assert observed['held_item']['name'] == 'dandelion'
+    assert observed['hotbar'][0]['count'] == 1
+    assert observed['hotbar'][3]['item'] == 'wooden_pickaxe'
+    assert observed['hotbar'][7]['item'] == 'torch'
+    assert observed['hotbar'][7]['count'] == 8
+
 @pytest.mark.smoke
 def test_craft_item_planks_once(live_test):
     scenario = setup(

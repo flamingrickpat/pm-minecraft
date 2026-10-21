@@ -670,8 +670,8 @@ class MinecraftTools:
 
     def minecraft_rotate(
         self,
-        yaw_degrees: float = 0.0,
-        pitch_degrees: float = 0.0,
+        yaw_degrees: float | None = None,
+        pitch_degrees: float | None = None,
         absolute: bool = False,
     ) -> RotateResult:
         """Turn the view and receive the new world transform plus a screenshot.
@@ -686,6 +686,7 @@ class MinecraftTools:
               UP.
             - absolute=True interprets them as target angles: yaw 0=south(+Z),
               90=west(-X), 180=north(-Z), 270=east(+X); pitch +90=straight up.
+            - An omitted angle keeps its current value in either mode.
 
         Args:
             yaw_degrees: Horizontal turn in degrees (right positive).

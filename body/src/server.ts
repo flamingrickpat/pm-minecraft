@@ -92,7 +92,7 @@ export function startServer(
       return;
     }
     if (request.method === "POST" && request.url === "/rotate") {
-      const value = await readJson(request) as { yaw_degrees: number; pitch_degrees: number; absolute: boolean };
+      const value = await readJson(request) as { yaw_degrees: number | null; pitch_degrees: number | null; absolute: boolean };
       writeJson(response, 200, { camera: await body.rotate(value.yaw_degrees, value.pitch_degrees, value.absolute) });
       return;
     }
@@ -123,7 +123,7 @@ export function startServer(
     }
     if (request.method === "POST" && request.url === "/find_path") {
       const value = await readJson(request) as { target: Vector; limit: number; timeout_ms: number };
-      writeJson(response, 200, body.findPath(value.target, value.limit, value.timeout_ms));
+      writeJson(response, 200, await body.findPath(value.target, value.limit, value.timeout_ms));
       return;
     }
     if (request.method === "POST" && request.url === "/use_block") {

@@ -295,7 +295,7 @@ def test_find_path_void_blocked(live_test):
     assert result.ok is True
     assert result.reason is None
     assert_field(scenario, result, 'state', 'blocked')
-    assert_field(scenario, result, 'blocker', NonEmpty())
+    assert result.blocker is None  # Unsupported ground has no blocking solid cell.
     assert_response_image(res, result, False)
     assert_world_state(scenario, (WorldExpectation(
         kind='player_near',

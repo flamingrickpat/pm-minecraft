@@ -42,7 +42,8 @@ def test_build_fill_skips_blocks_occupied_by_player(live_test):
     ))
 
 
-def test_build_fill(live_test):
+@pytest.mark.parametrize("include_image", [False, True])
+def test_build_fill(live_test, include_image):
     scenario = setup(
         live_test,
         layout=Layout(
@@ -80,14 +81,14 @@ def test_build_fill(live_test):
         'material': 'cobblestone',
         'start': '$start',
         'end': '$end',
-        'include_image': False,
+        'include_image': include_image,
     }, timeout=660)
     result = parse_result(scenario, res, 'minecraft_build', {
         'shape': 'fill',
         'material': 'cobblestone',
         'start': '$start',
         'end': '$end',
-        'include_image': False,
+        'include_image': include_image,
     }, truth_before=truth_before)
     assert result.ok is True
     assert result.reason is None
@@ -95,7 +96,7 @@ def test_build_fill(live_test):
     assert_field(scenario, result, 'material_resolved', 'cobblestone')
     assert_field(scenario, result, 'planned_cells', 8)
     assert_field(scenario, result, 'placed_count', 8)
-    assert_response_image(res, result, False)
+    assert_response_image(res, result, include_image)
     assert_world_state(scenario, (
         WorldExpectation(
             kind='box_block_count',

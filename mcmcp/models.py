@@ -1117,7 +1117,7 @@ class WalkResult(ToolOutcome):
     diagnostics: WalkDiagnostics = Field(description="Specific cause, original error, and observed block context for choosing another action.")
     hops: int | None = Field(
         default=None,
-        description="Pathfinding segments used. High numbers hint at "
+        description="Nonempty path segments planned, including failed movement attempts. High numbers hint at "
         "detours.",
     )
     camera: ViewTransform | None = Field(

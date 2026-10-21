@@ -953,8 +953,11 @@ class MinecraftRuntime:
             )
 
         if material_name.endswith("_door"):
-            return self._build_doors(shape, material, material_name, cells, in_range, out_of_range,
-                                     bounds, state, generation, started)
+            result = self._build_doors(shape, material, material_name, cells, in_range, out_of_range,
+                                       bounds, state, generation, started)
+            result.image = self.body.screenshot() if include_image else None
+            result.duration_ms = (time.monotonic() - started) * 1000
+            return result
 
         blocks = self.body.blocks(in_range).blocks
         occupied = [
@@ -1016,7 +1019,7 @@ class MinecraftRuntime:
             missing_material_cells=missing,
             inventory_delta=_inventory_delta(state.inventory, after.inventory),
             candidates=None,
-            image=None,
+            image=self.body.screenshot() if include_image else None,
             duration_ms=(time.monotonic() - started) * 1000,
         )
 
@@ -1063,8 +1066,8 @@ class MinecraftRuntime:
 
     def minecraft_rotate(
         self,
-        yaw_degrees: float = 0.0,
-        pitch_degrees: float = 0.0,
+        yaw_degrees: float | None = None,
+        pitch_degrees: float | None = None,
         absolute: bool = False,
     ) -> RotateResult:
         before = self._require_body().camera
@@ -2162,7 +2165,9 @@ class MinecraftRuntime:
         return PathPreviewResult(
             ok=True,
             reason=None,
-            message="The preview path completed.",
+            message=("A route was found." if preview.state == "reachable" else
+                     "No route was found within the movement rules and search corridor; unsupported ground or an unclimbable slope may have no single blocking block."
+                     if preview.state == "blocked" else "The bounded search could not establish a route."),
             state=preview.state,
             path_length=preview.path_length,
             hops=preview.hops,

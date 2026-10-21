@@ -150,7 +150,7 @@ class MinecraftBody:
         """Read the first block the view ray hits."""
         return BodyRaytrace.model_validate(self._request("GET", "/raytrace"))
 
-    def rotate(self, yaw_degrees: float, pitch_degrees: float, absolute: bool) -> BodyRotate:
+    def rotate(self, yaw_degrees: float | None, pitch_degrees: float | None, absolute: bool) -> BodyRotate:
         """Turn the Mineflayer camera."""
         return BodyRotate.model_validate(self._request("POST", "/rotate", {
             "yaw_degrees": yaw_degrees,

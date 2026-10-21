@@ -110,7 +110,7 @@ export function startServer(body, host, port, token) {
         }
         if (request.method === "POST" && request.url === "/find_path") {
             const value = await readJson(request);
-            writeJson(response, 200, body.findPath(value.target, value.limit, value.timeout_ms));
+            writeJson(response, 200, await body.findPath(value.target, value.limit, value.timeout_ms));
             return;
         }
         if (request.method === "POST" && request.url === "/use_block") {

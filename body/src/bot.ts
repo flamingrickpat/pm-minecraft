@@ -12,11 +12,14 @@ import { log } from "./log.js";
 import pathfinderPackage from "mineflayer-pathfinder";
 import type { Movements as PathfinderMovements, goals as PathfinderGoals } from "mineflayer-pathfinder";
 import { Vec3 } from "vec3";
+import { isDeepStrictEqual } from "node:util";
 import { CapturedFrame, ViewerCapture } from "./capture.js";
 
 const { goals, Movements, pathfinder } = pathfinderPackage;
 
 const WALK_SPEED_BLOCKS_PER_SECOND = 4.3;
+const PATH_PLAN_MILLISECONDS = 5000;
+const WALK_STALL_MILLISECONDS = 5000;
 
 export type BodyConfiguration = {
   host: string;
@@ -492,13 +495,14 @@ export class MinecraftBody {
     return { hit: false, hit_position: null, hit_block: null, hit_face: null, distance: null };
   }
 
-  async rotate(yawDegrees: number, pitchDegrees: number, absolute: boolean): Promise<Camera> {
+  async rotate(yawDegrees: number | null, pitchDegrees: number | null, absolute: boolean): Promise<Camera> {
     const bot = this.bot!;
-    const currentYaw = normalizeDegrees(bot.entity.yaw * 180 / Math.PI);
+    const currentYaw = normalizeDegrees(180 - bot.entity.yaw * 180 / Math.PI);
     const currentPitch = bot.entity.pitch * 180 / Math.PI;
-    const yaw = normalizeDegrees(absolute ? yawDegrees : currentYaw + yawDegrees + 180);
-    const pitch = clamp(absolute ? pitchDegrees : currentPitch + pitchDegrees, -90, 90);
-    await bot.look(yaw * Math.PI / 180, pitch * Math.PI / 180, true);
+    const yaw = normalizeDegrees(yawDegrees == null ? currentYaw : absolute ? yawDegrees : currentYaw + yawDegrees);
+    const pitch = clamp(pitchDegrees == null ? currentPitch : absolute ? pitchDegrees : currentPitch + pitchDegrees, -90, 90);
+    // Mineflayer uses 0=north, pi=south; the public camera uses Minecraft yaw.
+    await bot.look((180 - yaw) * Math.PI / 180, pitch * Math.PI / 180, true);
     return cameraFromBot(bot);
   }
 
@@ -573,6 +577,7 @@ export class MinecraftBody {
     const bot = this.bot!;
     const started = performance.now();
     const remaining = () => Math.max(0, timeoutMs - (performance.now() - started));
+    const surfaceStart = vector(bot.entity.position);
     // Approximate travel: the exact column can be liquid or filled, so a
     // standable cell within a small ring is an acceptable destination. A
     // larger body of water still reports no_standable_surface.
@@ -581,14 +586,21 @@ export class MinecraftBody {
       const requested = { x, y: bot.entity.position.y, z };
       return walkFailure(bot, requested, "no_standable_surface", "No standable surface near the target.", "no_path", 0, 0);
     }
+    let totalHops = 0;
     const finish = (step: WalkResult) => walkFailure(
       bot, surface, step.reason, step.message ?? "The surface approach did not reach its target.",
-      step.status, step.hops, performance.now() - started,
-      { ...step.diagnostics, ...walkDiagnostics(bot, surface, step.diagnostics.cause) },
+      step.status === "no_path" && distance(surfaceStart, bot.entity.position) > 0.05 ? "partial" : step.status,
+      totalHops, performance.now() - started,
+      { ...walkDiagnostics(bot, surface, step.diagnostics.cause),
+        path_status: step.diagnostics.path_status,
+        error_name: step.diagnostics.error_name,
+        error_message: step.diagnostics.error_message },
     );
     const result = await this.walk("minecraft_walk_to_surface", surface, new goals.GoalBlock(surface.x, surface.y, surface.z), remaining());
+    totalHops += result.hops;
     if (result.status === "reached") return { ...result, duration_ms: performance.now() - started };
-    if (result.reason === "stopped" || remaining() <= 0) return finish(result);
+    if (result.reason === "stopped" || result.reason === "movement_error"
+      || result.diagnostics.cause === "movement_stalled" || remaining() <= 0) return finish(result);
 
     // The direct surface column is unreachable. If the partial path stopped
     // at the base of an open vertical shaft, pillar up is the next step.
@@ -600,6 +612,7 @@ export class MinecraftBody {
         new goals.GoalBlock(shaftBase.x, shaftBase.y, shaftBase.z),
         remaining(),
       );
+      totalHops += approach.hops;
       if (approach.ok) {
         return walkFailure(
           bot,
@@ -607,7 +620,7 @@ export class MinecraftBody {
           "pillar_up_required",
           `Walked to ${shaftBase.x}, ${shaftBase.y}, ${shaftBase.z}; pillar up is required to reach the surface.`,
           "partial",
-          approach.hops,
+          totalHops,
           performance.now() - started,
         );
       }
@@ -622,6 +635,7 @@ export class MinecraftBody {
       new goals.GoalBlock(directShaft.x, directShaft.y, directShaft.z),
       remaining(),
     );
+    totalHops += approach.hops;
     if (!approach.ok) return finish(approach);
     return walkFailure(
       bot,
@@ -629,12 +643,12 @@ export class MinecraftBody {
       "pillar_up_required",
       `Walked to ${directShaft.x}, ${directShaft.y}, ${directShaft.z}; pillar up is required to reach the surface.`,
       "partial",
-      approach.hops,
+      totalHops,
       performance.now() - started,
     );
   }
 
-  findPath(target: Vector, limit: number, timeoutMs: number): PathPreview {
+  async findPath(target: Vector, limit: number, timeoutMs: number): Promise<PathPreview> {
     const bot = this.bot!;
     const started = performance.now();
     const start = vector(bot.entity.position);
@@ -647,20 +661,16 @@ export class MinecraftBody {
       : new goals.GoalBlock(target.x, target.y, target.z);
     const movements = survivalMovements(bot, target);
     bot.pathfinder.setMovements(movements);
-    let preview: { status: "noPath" | "timeout" | "success" | "partial"; path: { x: number; y: number; z: number }[] } | null = null;
-    const search = bot.pathfinder.getPathFromTo(movements, bot.entity.position, goal, { timeout: timeoutMs });
-    for (const step of search) {
-      preview = step.result;
-      if (preview.status !== "partial") break;
-    }
+    const preview = await searchRoute(bot, movements, goal, Math.min(timeoutMs, PATH_PLAN_MILLISECONDS));
     const elapsed = performance.now() - started;
     if (preview === null || preview.status === "noPath") {
+      const blocker = findBlockingCell(bot, start, target);
       return {
         state: "blocked",
         path_length: null,
         hops: null,
         estimated_seconds: null,
-        blocker: findBlockingCell(bot, start, target),
+        blocker,
         duration_ms: elapsed,
       };
     }
@@ -792,7 +802,15 @@ export class MinecraftBody {
       const reason = needsTable ? "crafting_table_not_found" : "missing_ingredients";
       return { ok: false, reason, missing: needsTable ? [] : missing, item: null, repetitions: 0, table: tablePosition ? vector(tablePosition) : null };
     }
-    await bot.craft(recipe, repetitions, recipe.requiresTable ? table! : undefined);
+    const selectedSlot = bot.quickBarSlot;
+    const previousHotbar = bot.inventory.slots.slice(36, 45);
+    try {
+      await bot.craft(recipe, repetitions, recipe.requiresTable ? table! : undefined);
+    } finally {
+      if (bot.currentWindow !== null) bot.closeWindow(bot.currentWindow);
+      await restoreHotbar(bot, previousHotbar);
+      bot.setQuickBarSlot(selectedSlot);
+    }
     await delay(300);
     const stack = bot.inventory.items().find((entry) => entry.name === itemName && entry.metadata === recipe.result.metadata);
     return { ok: true, reason: null, missing: [], item: stack ? itemFromStack(stack) : null, repetitions, table: tablePosition ? vector(tablePosition) : null };
@@ -1614,91 +1632,102 @@ export class MinecraftBody {
   ): Promise<WalkResult> {
     const bot = this.bot!;
     const started = performance.now();
-    // Search, partial-route search, movement, and replanning share one budget.
     const remaining = () => Math.max(0, timeoutMs - (performance.now() - started));
     const startPosition = vector(bot.entity.position);
     const movements = survivalMovements(bot, target);
     bot.pathfinder.setMovements(movements);
-    bot.pathfinder.thinkTimeout = timeoutMs;
-
-    let effectiveGoal = goal;
-    if (remaining() <= 0) {
-      return walkFailure(bot, target, "timeout", "The path search time limit expired.", "timeout", 0, performance.now() - started, walkDiagnostics(bot, target, "search_timeout"));
-    }
-    const preview = bot.pathfinder.getPathTo(movements, goal, remaining());
+    this.currentCommand = command;
+    this.commandStopped = false;
+    let preview: Awaited<ReturnType<typeof searchRoute>> = null;
+    let hops = 0;
+    let timeout: NodeJS.Timeout | null = null;
+    let watchdog: NodeJS.Timeout | null = null;
     const diagnostic = (cause: string, error?: unknown): WalkDiagnostics => ({
       ...walkDiagnostics(bot, target, cause),
-      path_status: preview.status,
+      path_status: preview?.status ?? null,
       error_name: error instanceof Error ? error.name : null,
       error_message: error === undefined ? null : error instanceof Error ? error.message : String(error),
     });
-    if (preview.status === "timeout" || remaining() <= 0) {
-      return walkFailure(bot, target, "timeout", "The path search time limit expired.", "timeout", 0, performance.now() - started, diagnostic("search_timeout"));
-    }
-    if (preview.status === "noPath") {
-      const partialNode = furthestReachableNode(bot, movements, goal, remaining());
+    const measuredHops = () => Math.max(hops, distance(startPosition, bot.entity.position) > 0.05 ? 1 : 0);
+    const routeUpdate = (result: { path: unknown[] }) => { if (result.path.length > 0) hops += 1; };
+    bot.on('path_update', routeUpdate);
+    try {
       if (remaining() <= 0) {
         return walkFailure(bot, target, "timeout", "The path search time limit expired.", "timeout", 0, performance.now() - started, diagnostic("search_timeout"));
       }
-      if (partialNode === null) {
-        return walkFailure(bot, target, "no_path", "No route found within the configured movement rules and search corridor.", "no_path", 0, performance.now() - started, diagnostic("search_no_path"));
+      // Consume cooperative A* slices instead of treating the first 40 ms
+      // 'partial' result as a complete search. One plan never owns 120 seconds.
+      preview = await searchRoute(bot, movements, goal, Math.min(remaining(), PATH_PLAN_MILLISECONDS), () => this.commandStopped);
+      if (this.commandStopped) {
+        return walkFailure(bot, target, "stopped", "The walk was stopped.", "partial", 0, performance.now() - started, diagnostic("stopped"));
       }
-      effectiveGoal = new goals.GoalBlock(partialNode.x, partialNode.y, partialNode.z);
-    }
-    if (remaining() <= 0) {
-      return walkFailure(bot, target, "timeout", "The path search time limit expired.", "timeout", 0, performance.now() - started, diagnostic("search_timeout"));
-    }
-    this.currentCommand = command;
-    this.commandStopped = false;
-    bot.pathfinder.thinkTimeout = remaining();
-    let timeout: NodeJS.Timeout | null = null;
-    try {
+      let effectiveGoal = goal;
+      if (preview === null || preview.status !== 'success') {
+        const endpoint = preview?.path.at(-1);
+        const useful = endpoint !== undefined && distance(startPosition, endpoint) > 1
+          && goal.heuristic(endpoint as any) < goal.heuristic(startPosition as any);
+        if (!useful || remaining() <= 0) {
+          const expired = preview?.status === 'timeout' || remaining() <= 0;
+          return walkFailure(bot, target, expired ? "timeout" : "no_path",
+            expired ? "No useful route found within the five-second planning budget." : "No route found within the configured movement rules and search corridor.",
+            expired ? "timeout" : "no_path", 0, performance.now() - started, diagnostic(expired ? "search_timeout" : "search_no_path"));
+        }
+        // Reuse the observed partial route rather than running the same failed
+        // search a second time. Normal movement loads chunks for the next call.
+        effectiveGoal = new goals.GoalBlock(endpoint!.x, endpoint!.y, endpoint!.z);
+      }
+      bot.pathfinder.thinkTimeout = Math.min(remaining(), PATH_PLAN_MILLISECONDS);
+      let lastProgress = performance.now();
+      let lastPosition = vector(bot.entity.position);
       await Promise.race([
         bot.pathfinder.goto(effectiveGoal),
         new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(() => {
-            bot.pathfinder.setGoal(null);
-            const error = new Error("The walk time limit expired.");
-            error.name = "WalkTimeout";
+          const fail = (name: string, message: string) => {
+            const error = Object.assign(new Error(message), { name });
             reject(error);
-          }, remaining());
+            bot.pathfinder.setGoal(null);
+          };
+          timeout = setTimeout(() => fail("WalkTimeout", "The walk time limit expired."), remaining());
+          watchdog = setInterval(() => {
+            if (distance(lastPosition, bot.entity.position) >= 0.25) {
+              lastPosition = vector(bot.entity.position);
+              lastProgress = performance.now();
+            } else if (performance.now() - lastProgress >= WALK_STALL_MILLISECONDS) {
+              fail("WalkStalled", "The player made no movement progress for five seconds.");
+            }
+          }, 250);
         }),
       ]);
       await delay(150);
-      const duration = performance.now() - started;
-      this.currentCommand = null;
       if (distance(bot.entity.position, target) > this.configuration.walkReachedDistanceBlocks) {
-        return walkFailure(
-          bot,
-          target,
-          "no_path",
+        return walkFailure(bot, target, "no_path",
           `The path ended ${distance(bot.entity.position, target).toFixed(2)} blocks from the target, outside the ${this.configuration.walkReachedDistanceBlocks}-block reached distance.`,
-          "partial",
-          1,
-          duration,
-          diagnostic("outside_reached_distance"),
-        );
+          "partial", measuredHops(), performance.now() - started, diagnostic("outside_reached_distance"));
       }
-      return walkSuccess(bot, target, duration, diagnostic(effectiveGoal === goal ? "goal_reached" : "partial_goal_within_tolerance"));
+      return { ...walkSuccess(bot, target, performance.now() - started,
+        diagnostic(effectiveGoal === goal ? "goal_reached" : "partial_goal_within_tolerance")), hops: measuredHops() };
     } catch (error) {
       await delay(150);
       const duration = performance.now() - started;
-      const stopped = this.commandStopped;
-      this.currentCommand = null;
-      if (stopped) {
-        return walkFailure(bot, target, "stopped", "The walk was stopped.", "partial", 0, duration, diagnostic("stopped", error));
+      const status = distance(startPosition, bot.entity.position) > 0.05 ? "partial" : "no_path";
+      if (this.commandStopped) {
+        return walkFailure(bot, target, "stopped", "The walk was stopped.", "partial", measuredHops(), duration, diagnostic("stopped", error));
       }
       if (error instanceof Error && (error.name === "WalkTimeout" || error.name === "Timeout")) {
-        const replanning = error.name === "Timeout";
-        return walkFailure(bot, target, "timeout", error.message, "timeout", 0, duration, diagnostic(replanning ? "replanning_timeout" : "movement_timeout", error));
+        return walkFailure(bot, target, "timeout", error.message, "timeout", measuredHops(), duration,
+          diagnostic(error.name === "Timeout" ? "replanning_timeout" : "movement_timeout", error));
       }
-      const status = distance(startPosition, bot.entity.position) > 0.05 ? "partial" : "no_path";
-      const noPath = error instanceof Error && error.name === "NoPath";
-      return walkFailure(bot, target, noPath ? "no_path" : "movement_error", error instanceof Error ? `${error.name}: ${error.message}` : String(error), status, 0, duration, diagnostic(noPath ? "movement_no_path" : "movement_error", error));
+      const stalled = error instanceof Error && error.name === 'WalkStalled';
+      const noPath = stalled || error instanceof Error && error.name === "NoPath";
+      return walkFailure(bot, target, noPath ? "no_path" : "movement_error",
+        error instanceof Error ? `${error.name}: ${error.message}` : String(error), status, measuredHops(), duration,
+        diagnostic(stalled ? "movement_stalled" : noPath ? "movement_no_path" : "movement_error", error));
     } finally {
-      if (timeout !== null) {
-        clearTimeout(timeout);
-      }
+      if (timeout !== null) clearTimeout(timeout);
+      if (watchdog !== null) clearInterval(watchdog);
+      bot.removeListener('path_update', routeUpdate);
+      this.currentCommand = null;
+      bot.pathfinder.setGoal(null);
       bot.clearControlStates();
     }
   }
@@ -1757,14 +1786,27 @@ export class MinecraftBody {
   }
 }
 
-function survivalMovements(bot: Bot, target: Vector | null): PathfinderMovements {
+export function survivalMovements(bot: Bot, target: Vector | null): PathfinderMovements {
   const movements = new Movements(bot);
   movements.canDig = false;
   movements.allow1by1towers = false;
   movements.allowParkour = false;
   movements.scafoldingBlocks = [];
-  movements.maxDropDown = 1;
+  // Upstream measures the landing floor from the current feet, so 2 permits
+  // a one-block descent. A value of 1 rejects cardinal descents entirely.
+  movements.maxDropDown = 2;
   movements.infiniteLiquidDropdownDistance = false;
+  // The upstream graph permits diagonal climbs around one open corner. Its
+  // straight-line movement controller can then press into both terrace faces
+  // indefinitely. Use cardinal jumps on slopes and diagonals on clear flats.
+  const diagonal = movements.getMoveDiagonal.bind(movements);
+  movements.getMoveDiagonal = (node, direction, neighbors) => {
+    const candidates: Parameters<typeof diagonal>[2] = [];
+    diagonal(node, direction, candidates);
+    if (!standable(bot, { x: node.x + direction.x, y: node.y, z: node.z })
+      || !standable(bot, { x: node.x, y: node.y, z: node.z + direction.z })) return;
+    neighbors.push(...candidates.filter(next => next.y === node.y));
+  };
   if (target !== null) {
     // A generous corridor around the start-to-target line. It must be wide
     // enough for real detours (cave exits, staircases) while keeping an
@@ -1782,6 +1824,27 @@ function survivalMovements(bot: Bot, target: Vector | null): PathfinderMovements
     );
   }
   return movements;
+}
+
+/** Put surviving hotbar stacks back with ordinary inventory clicks. */
+async function restoreHotbar(bot: Bot, previous: Bot["inventory"]["slots"]): Promise<void> {
+  const restored = new Set<number>();
+  for (let index = 0; index < previous.length; index += 1) {
+    const wanted = previous[index];
+    if (wanted === null) continue;
+    const destination = 36 + index;
+    const matches = (stack: typeof wanted | null) => stack !== null
+      && stack.type === wanted.type && stack.metadata === wanted.metadata
+      && isDeepStrictEqual(stack.nbt, wanted.nbt);
+    if (!matches(bot.inventory.slots[destination])) {
+      const source = bot.inventory.slots.findIndex((stack, slot) =>
+        slot >= 9 && slot < 45 && !restored.has(slot) && matches(stack));
+      // A fully consumed ingredient has no surviving stack to restore.
+      if (source === -1) continue;
+      await bot.moveSlotItem(source, destination);
+    }
+    restored.add(destination);
+  }
 }
 
 function missingIngredientsFor(bot: Bot, recipe: SkRecipe, repetitions: number): IngredientNeedData[] {
@@ -1932,7 +1995,7 @@ function aggregateSectors(rays: HorizonRay[]): HorizonSector[] {
     const list = byCardinal.get(cardinal);
     if (list === undefined) continue;
     const hits = list.filter((ray) => ray.hit);
-    const terrain = hits.length >= 7 ? "solid_wall" : hits.length >= 2 ? "_terrain" : "open";
+    const terrain = hits.length >= 7 ? "solid_wall" : hits.length >= 2 ? "mixed_terrain" : "open";
     const notable = distinctNames(hits.map((ray) => ray.block_name));
     sectors.push({ cardinal, terrain, notable_blocks: notable });
   }
@@ -2012,7 +2075,7 @@ function findBlockingCell(bot: Bot, start: Vector, target: Vector): PathPreview[
     if (feet === null || head === null || floor === null) continue;
     if (feet.boundingBox !== "empty") return { block_name: feet.name, position: blockVector(feet) };
     if (head.boundingBox !== "empty") return { block_name: head.name, position: blockVector(head) };
-    if (floor.boundingBox === "empty") return { block_name: floor.name, position: blockVector(floor) };
+    // Missing support is a terrain constraint, not a blocking air block.
   }
   return null;
 }
@@ -2024,7 +2087,8 @@ function standable(bot: Bot, target: Vector): boolean {
   const floor = bot.blockAt(cell.offset(0, -1, 0))!;
   // Water has an empty bounding box, so without the liquid check on feet and
   // head a two-deep water column looks like a place to stand.
-  return feet.boundingBox === "empty" && head.boundingBox === "empty"
+  return feet !== null && head !== null && floor !== null
+    && feet.boundingBox === "empty" && head.boundingBox === "empty"
     && !isLiquid(feet.name) && !isLiquid(head.name)
     && floor.boundingBox !== "empty" && !isLiquid(floor.name);
 }
@@ -2047,7 +2111,10 @@ function standableSurfaceNear(bot: Bot, x: number, z: number, radius: number): V
       }
     }
   }
-  found.sort((a, b) => b.target.y - a.target.y || a.ring - b.ring);
+  // Prefer the requested column. Picking the highest neighbor can turn a
+  // reachable hillside destination into a cliff or treetop two blocks away.
+  found.sort((a, b) => a.ring - b.ring
+    || distance(bot.entity.position, a.target) - distance(bot.entity.position, b.target));
   return found[0]?.target ?? null;
 }
 
@@ -2059,17 +2126,16 @@ function standableBelow(bot: Bot, x: number, z: number, startY: number): Vector 
   return null;
 }
 
-function furthestReachableNode(bot: Bot, movements: PathfinderMovements, goal: PathfinderGoals.Goal, timeoutMs: number): Vector | null {
-  let bestPath: { x: number; y: number; z: number }[] | null = null;
+async function searchRoute(bot: Bot, movements: PathfinderMovements, goal: PathfinderGoals.Goal,
+  timeoutMs: number, stopped: () => boolean = () => false): Promise<ReturnType<Bot["pathfinder"]["getPathTo"]> | null> {
+  let result: ReturnType<Bot["pathfinder"]["getPathTo"]> | null = null;
   const search = bot.pathfinder.getPathFromTo(movements, bot.entity.position, goal, { timeout: timeoutMs });
   for (const step of search) {
-    if (step.result.path.length > (bestPath?.length ?? 0)) {
-      bestPath = step.result.path.map((node) => ({ x: node.x, y: node.y, z: node.z }));
-    }
-    if ((step.result.status as string) !== "partial") break;
+    result = step.result;
+    if ((result.status as string) !== 'partial' || stopped()) break;
+    await delay(0);
   }
-  if (bestPath === null || bestPath.length < 2) return null;
-  return bestPath[bestPath.length - 1];
+  return result;
 }
 
 function openShaftBaseNear(bot: Bot, position: Vector, radius: number): Vector | null {
@@ -2447,7 +2513,7 @@ function aggregateInventory(bot: Bot | null): InventoryItem[] {
 
 function cameraFromBot(bot: Bot): Camera {
   const feet = bot.entity.position;
-  const yaw = normalizeDegrees(bot.entity.yaw * 180 / Math.PI);
+  const yaw = normalizeDegrees(180 - bot.entity.yaw * 180 / Math.PI);
   const pitch = bot.entity.pitch * 180 / Math.PI;
   const yawRadians = bot.entity.yaw;
   const pitchRadians = bot.entity.pitch;
@@ -2462,7 +2528,7 @@ function cameraFromBot(bot: Bot): Camera {
     look_vector: {
       x: -Math.sin(yawRadians) * horizontal,
       y: Math.sin(pitchRadians),
-      z: Math.cos(yawRadians) * horizontal,
+      z: -Math.cos(yawRadians) * horizontal,
     },
   };
 }
