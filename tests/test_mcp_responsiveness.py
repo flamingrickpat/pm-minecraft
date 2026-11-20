@@ -122,16 +122,16 @@ def _reachable_layout(offset_x: int) -> Layout:
 
 
 def _oak_tree_layout() -> Layout:
-    """Four oak logs with a canopy, matching the standard harvest_tree setup."""
+    """Place the first log beyond mining reach so cancellation can interrupt the approach."""
     return Layout(
         blocks=(
-            BlockSpec(key="log_0", offset=(3, 0, 0), block="oak_log"),
-            BlockSpec(key="log_1", offset=(3, 1, 0), block="oak_log"),
-            BlockSpec(key="log_2", offset=(3, 2, 0), block="oak_log"),
-            BlockSpec(key="log_3", offset=(3, 3, 0), block="oak_log"),
-            BlockSpec(key="leaf_0", offset=(2, 4, 0), block="oak_leaves[persistent=true]"),
-            BlockSpec(key="leaf_1", offset=(3, 4, 0), block="oak_leaves[persistent=true]"),
-            BlockSpec(key="leaf_2", offset=(4, 4, 0), block="oak_leaves[persistent=true]"),
+            BlockSpec(key="log_0", offset=(9, 0, 0), block="oak_log"),
+            BlockSpec(key="log_1", offset=(9, 1, 0), block="oak_log"),
+            BlockSpec(key="log_2", offset=(9, 2, 0), block="oak_log"),
+            BlockSpec(key="log_3", offset=(9, 3, 0), block="oak_log"),
+            BlockSpec(key="leaf_0", offset=(8, 4, 0), block="oak_leaves[persistent=true]"),
+            BlockSpec(key="leaf_1", offset=(9, 4, 0), block="oak_leaves[persistent=true]"),
+            BlockSpec(key="leaf_2", offset=(10, 4, 0), block="oak_leaves[persistent=true]"),
         ),
         items=(("iron_axe", 1),),
     )
@@ -344,6 +344,8 @@ def test_stop_halts_composite_harvest_tree(live_test):
         timeout=90,
     )
     wait_for_action(scenario, DuringAction("player_moved", "player", ""))
+    status = call_mcp(scenario, "minecraft_status", {}).structuredContent
+    assert status["active_command"] == "minecraft_harvest_tree"
     stop_res = call_mcp(scenario, "minecraft_stop", {"scope": "both"}, timeout=10)
     assert stop_res.isError is False
     assert stop_res.structuredContent["ok"] is True
@@ -355,5 +357,8 @@ def test_stop_halts_composite_harvest_tree(live_test):
         {"base": "$log_0"},
         truth_before=truth_before,
     )
+    assert stop_res.structuredContent["stopped_command"] == "minecraft_harvest_tree"
+    assert call_mcp(scenario, "minecraft_status", {}).structuredContent["active_command"] is None
+    assert result.reason == "stopped"
     # A stopped composite must not keep going and finish every log.
     assert result.logs_collected < 4

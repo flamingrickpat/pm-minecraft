@@ -8,6 +8,8 @@ Body, RCON, file, and model errors retain their original exceptions.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+from threading import Event
 from fnmatch import fnmatchcase
 import json
 import math
@@ -121,6 +123,15 @@ from .models import (
 )
 from .names import candidates, glob_candidates, matching
 from .server_assist import ServerAssist
+
+
+# The command gate binds this before any pre-action inventory reads.
+gather_cancel: ContextVar[Event | None] = ContextVar("gather_cancel", default=None)
+
+
+def _gather_stopped() -> bool:
+    event = gather_cancel.get()
+    return event is not None and event.is_set()
 
 
 class MinecraftRuntime:
@@ -1650,19 +1661,25 @@ class MinecraftRuntime:
         mined_cells = []
         drops = []
         for exposed in connected:
+            if _gather_stopped():
+                break
             walked = self.minecraft_walk_to_visible(exposed.position.x, exposed.position.y, exposed.position.z)
+            if _gather_stopped():
+                break
             ore = exposed.position
             feet = walked.final_position
             if feet is None:
                 continue
             if math.floor(feet.x) == ore.x and math.floor(feet.z) == ore.z and math.floor(feet.y) == ore.y + 1:
                 for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    if _gather_stopped():
+                        break
                     stance = Vec3f(x=ore.x + dx, y=ore.y + 1, z=ore.z + dz)
                     if self.body.walk_exact(stance, 1500).ok:
                         break
             elif not walked.ok and _distance(feet, ore) > 5:
                 continue
-            if self.body.blocks([ore]).blocks[0].name != exposed.block_name:
+            if _gather_stopped() or self.body.blocks([ore]).blocks[0].name != exposed.block_name:
                 continue
             mined = self.minecraft_mine_block(ore)
             if mined.ok:
@@ -1670,10 +1687,11 @@ class MinecraftRuntime:
                 if mined.pickup:
                     drops.extend(mined.pickup.drop_items)
         after = self.body.state()
-        reason = None if mined_cells else "no_path"
-        message = None if mined_cells else "No connected ore block was reachable."
+        stopped = _gather_stopped()
+        reason = "stopped" if stopped else None if mined_cells else "no_path"
+        message = "Vein mining stopped." if stopped else None if mined_cells else "No connected ore block was reachable."
         feet = after.camera.feet_position if after.camera else None
-        return MineVeinResult(final_player_cell=Vec3i(x=math.floor(feet.x), y=math.floor(feet.y), z=math.floor(feet.z)) if feet else None, nearest_ore_cell=found.nearest.position, ok=bool(mined_cells), reason=reason, message=message, block=found.results[0].block_name, mined_cells=mined_cells, mined_count=len(mined_cells), drops=drops, pickup=None, inventory_delta=_inventory_delta(before.inventory, after.inventory), image=self.body.screenshot())
+        return MineVeinResult(final_player_cell=Vec3i(x=math.floor(feet.x), y=math.floor(feet.y), z=math.floor(feet.z)) if feet else None, nearest_ore_cell=found.nearest.position, ok=bool(mined_cells) and not stopped, reason=reason, message=message, block=found.results[0].block_name, mined_cells=mined_cells, mined_count=len(mined_cells), drops=drops, pickup=None, inventory_delta=_inventory_delta(before.inventory, after.inventory), image=self.body.screenshot())
 
     def minecraft_harvest_tree(
         self, base: Vec3i | None = None
@@ -1682,25 +1700,54 @@ class MinecraftRuntime:
         found = self.minecraft_find_block("*_log")
         if not found.ok:
             return HarvestTreeResult(ok=False, reason="not_found", message="No exposed tree logs were found.", base=base, logs_collected=0, saplings_collected=0, other_drops=[], inventory_delta=None, image=None)
-        selected = [value for value in found.results if base is None or _distance(value.position, base) <= 4]
-        if not selected:
-            return HarvestTreeResult(ok=False, reason="not_found", message="No tree logs were found near the requested base.", base=base, logs_collected=0, saplings_collected=0, other_drops=[], inventory_delta=None, image=None)
-        anchor = selected[0].position
+        anchor = base or found.nearest.position
+        bounds = found.coverage.bounds
+        if not (bounds.min.x <= anchor.x <= bounds.max.x and bounds.min.y <= anchor.y <= bounds.max.y
+                and bounds.min.z <= anchor.z <= bounds.max.z):
+            return HarvestTreeResult(ok=False, reason="not_found", message="The requested log is outside the search area.", base=anchor, logs_collected=0, saplings_collected=0, other_drops=[], inventory_delta=None, image=None)
         canopy_cells = [
             Vec3i(x=x, y=y, z=z)
             for x in range(anchor.x - 3, anchor.x + 4)
-            for y in range(anchor.y, anchor.y + 7)
+            for y in range(anchor.y - 5, anchor.y + 9)
             for z in range(anchor.z - 3, anchor.z + 4)
         ]
         canopy = self.body.blocks(canopy_cells).blocks
-        if not any(cell.name.endswith("_leaves") for cell in canopy):
+        targets = _tree_logs(canopy, anchor)
+        if not targets:
             return HarvestTreeResult(ok=False, reason="not_a_tree", message="The log is not part of a tree canopy.", base=anchor, logs_collected=0, saplings_collected=0, other_drops=[], inventory_delta=None, image=self.body.screenshot())
-        for value in selected:
-            self.minecraft_walk_to_visible(value.position.x, value.position.y, value.position.z)
-            self.minecraft_mine_block(value.position)
+        feet = before.camera.feet_position
+        reason = message = None
+        for target in targets:
+            if _gather_stopped():
+                break
+            pos = target.position
+            if _distance(feet, pos) > 5:
+                walked = self.minecraft_walk_to_visible(pos.x, pos.y, pos.z)
+                if not walked.ok:
+                    reason, message = walked.reason or "no_path", walked.message
+                    break
+                feet = walked.final_position or self.body.state().camera.feet_position
+            if _gather_stopped():
+                break
+            if self.body.blocks([pos]).blocks[0].name != target.name:
+                reason, message = "target_changed", "A selected log changed during the harvest."
+                break
+            mined = self.minecraft_mine_block(pos)
+            if not mined.ok:
+                reason, message = mined.reason, mined.message
+                break
         after = self.body.state()
         delta = _inventory_delta(before.inventory, after.inventory)
-        return HarvestTreeResult(ok=True, base=selected[0].position, logs_collected=max(0, _inventory_counts(after.inventory).get(selected[0].block_name, 0) - _inventory_counts(before.inventory).get(selected[0].block_name, 0)), saplings_collected=0, other_drops=[], inventory_delta=delta, image=self.body.screenshot())
+        collected = sum(max(0, change.delta) for change in delta.changes if change.item == targets[0].name)
+        if _gather_stopped():
+            reason, message = "stopped", "Tree harvest stopped."
+        elif not collected and reason is None:
+            reason, message = "no_pickup", "No logs entered the inventory."
+        return HarvestTreeResult(
+            ok=reason is None, reason=reason, message=message, base=targets[0].position,
+            logs_collected=collected, saplings_collected=0, other_drops=[],
+            inventory_delta=delta, image=self.body.screenshot(),
+        )
 
     def minecraft_craft_max(
         self, item: str, limit: int | None = None
@@ -2326,6 +2373,49 @@ def _equipment_warnings(before: BodyState, after: BodyState) -> list[str]:
 
 def _inventory_counts(items: list[InventoryItem]) -> dict[str, int]:
     return {item.name: item.count for item in items}
+
+
+def _tree_logs(cells: list[BodyBlock], anchor: Vec3i) -> list[BodyBlock]:
+    """Follow one trunk and its face-connected branches within the canopy scan."""
+    blocks = {(b.position.x, b.position.y, b.position.z): b for b in cells}
+    start = (anchor.x, anchor.y, anchor.z)
+    log = blocks[start].name
+    if not log.endswith("_log"):
+        return []
+    logs = {key for key, block in blocks.items() if block.name == log}
+    x, y, z = start
+    while (x, y - 1, z) in logs:
+        y -= 1
+    root = (x, y, z)
+    # A neighboring trunk can touch this crown. Preserve its rooted column.
+    trunk_columns = {(root[0], root[2])}
+    if log in {"dark_oak_log", "jungle_log", "spruce_log"}:
+        for dx, dz in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+            square = {(root[0] + i, root[2] + j) for i in (0, dx) for j in (0, dz)}
+            if all((i, root[1] + h, j) in logs for i, j in square for h in (0, 1)):
+                trunk_columns = square
+                break
+    other_trunks = set()
+    for x, y, z in logs:
+        below = blocks.get((x, y - 1, z))
+        if (x, z) in trunk_columns or below is None:
+            continue
+        if below.name != log and not below.replaceable and not below.name.endswith("_leaves"):
+            other_trunks.add((x, z))
+
+    pending = [root]
+    seen = {root}
+    leafy = False
+    for x, y, z in pending:
+        for key in ((x, y + 1, z), (x - 1, y, z), (x + 1, y, z),
+                    (x, y, z - 1), (x, y, z + 1), (x, y - 1, z)):
+            neighbor = blocks.get(key)
+            if neighbor and neighbor.name.endswith("_leaves"):
+                leafy = True
+            if key in logs and key not in seen and (key[0], key[2]) not in other_trunks:
+                seen.add(key)
+                pending.append(key)
+    return [blocks[key] for key in pending] if leafy else []
 
 
 def _distance(a: Vec3f, b: Vec3f | Vec3i) -> float:

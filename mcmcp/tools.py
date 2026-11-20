@@ -1280,7 +1280,8 @@ class MinecraftTools:
         """Chop one whole tree: trunk and reachable branches, collect drops.
 
         Give the base log cell, or omit it to auto-find the nearest tree. The
-        body climbs/chops until the tree is gone. Babymode inserts normal
+        body chops reachable, face-connected logs in a local canopy scan.
+        An unreachable log ends the harvest with partial counts. Babymode inserts normal
         mined loot directly into your inventory; only overflow drops.
         Leaf-decay drops are normal ground pickup - walk over them.
         One call replaces the chop-walk-chop loop. Verify

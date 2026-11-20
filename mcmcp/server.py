@@ -30,7 +30,7 @@ from .inspector import start_inspector
 from . import constants
 from .log_setup import setup_logging
 from .models import ImageRef, ToolOutcome
-from .runtime import MinecraftRuntime
+from .runtime import MinecraftRuntime, gather_cancel
 from .startup import initialize_agent_home
 from .tools import MinecraftTools
 from .body_fence import BodyFence
@@ -100,6 +100,12 @@ class WorldConnection:
                     self.transition = False
 
 
+class CommandStatus(ToolOutcome):
+    active_command: str | None
+    elapsed_seconds: float
+    cancellation_requested: bool
+
+
 class CommandGate:
     def __init__(self, fence: BodyFence | None = None) -> None:
         self.mutex = threading.Lock()
@@ -107,13 +113,39 @@ class CommandGate:
         self.connection: WorldConnection | None = None
         self.fence = fence
         self.running: tuple[str, float] | None = None
+        self.cancel: threading.Event | None = None
+
+    def minecraft_status(self) -> CommandStatus:
+        """Check the active command, its elapsed time, and any pending gather cancellation."""
+        with self.mutex:
+            return CommandStatus(
+                ok=True,
+                active_command=self.running[0] if self.running else None,
+                elapsed_seconds=time.monotonic() - self.running[1] if self.running else 0,
+                cancellation_requested=self.cancel is not None and self.cancel.is_set(),
+            )
 
     def call(self, method: Any, *args: Any, **kwargs: Any) -> Any:
         if method.__name__ in CONCURRENT_TOOLS:
-            if self.fence is not None:
-                with self.mutex:
+            cancel = None
+            with self.mutex:
+                if self.fence is not None:
                     self.fence.validate(method.__name__, getattr(self.fence.local, "token", None))
-            return method(*args, **kwargs)
+                if method.__name__ == "minecraft_stop" and kwargs.get("scope", args[0] if args else "both") != "skill":
+                    cancel = self.cancel
+                    if cancel is not None:
+                        parent_name = self.running[0]
+                        cancel.set()
+            result = method(*args, **kwargs)
+            if cancel is not None:
+                with self.idle:
+                    if not self.idle.wait_for(lambda: self.cancel is not cancel, timeout=5):
+                        result.ok = False
+                        result.reason = "stop_pending"
+                        result.message = "Stop requested. Check minecraft_status until the command finishes."
+                    elif result.ok:
+                        result.stopped_command = parent_name
+            return result
         # Hold the mutex only while checking/updating ownership. Never queue commands.
         with self.mutex:
             if self.fence is not None:
@@ -129,10 +161,15 @@ class CommandGate:
                     message=f"Command {name} is still running, {timing}. You can only call info, status, screenshot and stop.",
                 )
             self.running = (method.__name__, time.monotonic())
+            if method.__name__ in {"minecraft_harvest_tree", "minecraft_mine_vein"}:
+                self.cancel = threading.Event()
+            token = gather_cancel.set(self.cancel)
         try:
             return method(*args, **kwargs)
         finally:
+            gather_cancel.reset(token)
             with self.mutex:
+                self.cancel = None
                 self.running = None
                 self.idle.notify_all()
 
@@ -258,6 +295,7 @@ def build_server(configuration: Configuration) -> FastMCP:
         gate.connection = WorldConnection(runtime)
         methods.extend((method.__name__, method) for method in
                        (gate.connection.minecraft_connect, gate.connection.minecraft_disconnect))
+    methods.append(("minecraft_status", gate.minecraft_status))
     for name, method in methods:
         if name.startswith("minecraft_"):
             wrapper = _wrap_tool(method, frame_directory, gate, runtime)
