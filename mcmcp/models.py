@@ -1391,6 +1391,8 @@ class DistanceResult(ToolOutcome):
 class MineVeinResult(ToolOutcome):
     """Outcome of mining an entire connected ore vein as one action."""
 
+    final_player_cell: Vec3i | None = None
+    nearest_ore_cell: Vec3i | None = None
     block: str | None = Field(
         default=None, description="Ore block name that was mined."
     )
@@ -1512,6 +1514,7 @@ class StaircaseResult(ToolOutcome):
     end_position: Vec3f | None = Field(
         default=None, description="Where you stand after the descent."
     )
+    dug_cells: list[Vec3i] = Field(default_factory=list)
     blocks_dug: int = Field(
         description="Blocks removed to carve the staircase."
     )

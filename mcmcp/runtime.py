@@ -697,7 +697,7 @@ class MinecraftRuntime:
             return CraftItemResult(ok=False, reason="ambiguous", message="Multiple items matched. Use one exact name.", requested=item, resolved_item=None, repetitions_requested=repetitions, repetitions_crafted=0, output=None, inventory_delta=None, hotbar=before.hotbar, crafting_table_used=None, candidates=glob_candidates(matched), missing_ingredients=None)
         selected = matched[0].name
         result = self.body.craft(selected, repetitions)
-        if not result.ok:
+        if not result.ok and result.reason != 'craft_incomplete':
             return CraftItemResult(
                 ok=False,
                 reason=result.reason or "not_craftable",
@@ -715,7 +715,7 @@ class MinecraftRuntime:
             )
         after = self.body.state()
         output = next((value for value in after.inventory if value.name == selected), None)
-        return CraftItemResult(ok=True, requested=item, resolved_item=selected, repetitions_requested=repetitions, repetitions_crafted=result.repetitions, output=output, inventory_delta=_inventory_delta(before.inventory, after.inventory), hotbar=after.hotbar, crafting_table_used=result.table, candidates=None, missing_ingredients=None)
+        return CraftItemResult(ok=result.ok, reason=result.reason, requested=item, resolved_item=selected, repetitions_requested=repetitions, repetitions_crafted=result.repetitions, output=output, inventory_delta=_inventory_delta(before.inventory, after.inventory), hotbar=after.hotbar, crafting_table_used=result.table, candidates=None, missing_ingredients=None)
 
     def minecraft_equip(self, item: str) -> EquipResult:
         before = self._require_body()
@@ -1211,6 +1211,9 @@ class MinecraftRuntime:
         return self._walk_result(result)
 
     def minecraft_use_block(self, position: Vec3i) -> UseBlockResult:
+        return self.use_block(position)
+
+    def use_block(self, position: Vec3i, kind: str | None = None) -> UseBlockResult:
         """Activate a nearby block and retain its observed interaction result.
 
         The body closes the previous window before activation. Doors, gates,
@@ -1235,7 +1238,7 @@ class MinecraftRuntime:
                 window=None,
                 image=None,
             )
-        kind = interactable_kind(block.name)
+        kind = kind or interactable_kind(block.name)
         if kind is None:
             return UseBlockResult(
                 ok=False,
@@ -1638,15 +1641,32 @@ class MinecraftRuntime:
                 if neighbor is not None:
                     pending.append(neighbor)
         mined_cells = []
+        drops = []
         for exposed in connected:
             walked = self.minecraft_walk_to_visible(exposed.position.x, exposed.position.y, exposed.position.z)
-            if not walked.ok:
+            ore = exposed.position
+            feet = walked.final_position
+            if feet is None:
                 continue
-            mined = self.minecraft_mine_block(exposed.position)
+            if math.floor(feet.x) == ore.x and math.floor(feet.z) == ore.z and math.floor(feet.y) == ore.y + 1:
+                for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    stance = Vec3f(x=ore.x + dx, y=ore.y + 1, z=ore.z + dz)
+                    if self.body.walk_exact(stance, 1500).ok:
+                        break
+            elif not walked.ok and _distance(feet, ore) > 5:
+                continue
+            if self.body.blocks([ore]).blocks[0].name != exposed.block_name:
+                continue
+            mined = self.minecraft_mine_block(ore)
             if mined.ok:
                 mined_cells.append(exposed.position)
+                if mined.pickup:
+                    drops.extend(mined.pickup.drop_items)
         after = self.body.state()
-        return MineVeinResult(ok=bool(mined_cells), reason=None if mined_cells else "no_path", message=None if mined_cells else "No connected ore block was reachable.", block=found.results[0].block_name, mined_cells=mined_cells, mined_count=len(mined_cells), drops=[], pickup=None, inventory_delta=_inventory_delta(before.inventory, after.inventory), image=self.body.screenshot())
+        reason = None if mined_cells else "no_path"
+        message = None if mined_cells else "No connected ore block was reachable."
+        feet = after.camera.feet_position if after.camera else None
+        return MineVeinResult(final_player_cell=Vec3i(x=math.floor(feet.x), y=math.floor(feet.y), z=math.floor(feet.z)) if feet else None, nearest_ore_cell=found.nearest.position, ok=bool(mined_cells), reason=reason, message=message, block=found.results[0].block_name, mined_cells=mined_cells, mined_count=len(mined_cells), drops=drops, pickup=None, inventory_delta=_inventory_delta(before.inventory, after.inventory), image=self.body.screenshot())
 
     def minecraft_harvest_tree(
         self, base: Vec3i | None = None
@@ -1817,6 +1837,7 @@ class MinecraftRuntime:
             depth_requested=result.depth_requested,
             depth_achieved=result.depth_achieved,
             end_position=result.end_position,
+            dug_cells=result.dug_cells,
             blocks_dug=result.blocks_dug,
             hazards_found=result.hazards_found,
             torches_placed=result.torches_placed,

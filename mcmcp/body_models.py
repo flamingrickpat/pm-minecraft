@@ -437,6 +437,7 @@ class BodyStaircase(BaseModel):
     depth_requested: int
     depth_achieved: int
     end_position: Vec3f
+    dug_cells: list[Vec3i] = Field(default_factory=list)
     blocks_dug: int
     hazards_found: list[str]
     torches_placed: int

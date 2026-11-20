@@ -956,3 +956,16 @@ def test_craft_item_ambiguous__rain(live_test):
     assert_message(result, 'multiple', 'exact')
     assert_response_image(res, result, False)
     assert_failure_unchanged(scenario, failure_snapshot)
+
+
+def test_large_birch_batch_reports_observed_runs(live_test):
+    scenario = setup(live_test, Layout(items=(("birch_log", 24),)))
+    reply = call_mcp(scenario, "minecraft_craft_item", {"item": "birch_planks", "repetitions": 22})
+    result = reply.structuredContent
+    runs = result["repetitions_crafted"]
+    assert 0 < runs <= 22
+    assert result["ok"] == (runs == 22)
+    assert_world_state(scenario, (
+        WorldExpectation(kind="inventory", target="birch_log", expected=24 - runs),
+        WorldExpectation(kind="inventory", target="birch_planks", expected=4 * runs),
+    ))

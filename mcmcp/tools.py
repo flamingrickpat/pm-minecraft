@@ -845,9 +845,7 @@ class MinecraftTools:
         a saved house entrance, tunnel mouth, or farm plot. The body can travel
         for a long time and recalculates bounded path segments during travel.
 
-        Pathfinder reaches the target cell and the tool accepts a final
-        position within {{EXACT_WALK_TOLERANCE_BLOCKS}} blocks of the requested
-        coordinate. The fixed action limit is {{EXACT_WALK_SECONDS}} seconds.
+        Success requires grounded feet inside the requested cell. The fixed action limit is {{EXACT_WALK_SECONDS}} seconds.
 
         Give block-cell coordinates, for example (4302, 64, -411).
 
@@ -868,6 +866,10 @@ class MinecraftTools:
 # Interacting with blocks and containers
 # =========================================================================
 
+
+    def minecraft_use_item_on_block(self, position: Vec3i, face: Literal["up", "down", "north", "south", "east", "west"] = "up") -> UseBlockResult:
+        """Till soil, plant sweet berries, or harvest a ripe berry bush at the selected face."""
+        return self.runtime.use_block(position, f"farm_{face}")
 
     def minecraft_use_block(self, position: Vec3i) -> UseBlockResult:
         """Right-click a block: open doors, chests, tables; press buttons.

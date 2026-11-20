@@ -24,7 +24,7 @@ never teleportation, and never operator commands.
   hotbar, held item, nearby blocks, and nearby entities.
 - `minecraft_info` — the authoritative capability map and fixed limits. Re-read
   it whenever a parameter shape is unclear.
-- `minecraft_find_block(block, max_distance)` — nearest instance of a block
+- `minecraft_find_block(pattern="iron_ore")` — nearest instance of a block
   with line of sight. Walled-off/underground targets are invisible; explore or
   mine exposed faces first.
 - `minecraft_inspect_block(position)` — read one known position directly.
@@ -46,7 +46,7 @@ never teleportation, and never operator commands.
 - `minecraft_find_path(x, y, z)` — preview a path without walking it.
 - `minecraft_rotate(yaw_degrees, pitch_degrees, absolute)` — turn. Positive yaw
   = right, positive pitch = up.
-- `minecraft_look_at(x, y, z)` — aim the camera at a point.
+- `minecraft_look_at(position={"x": x, "y": y, "z": z})` — aim the camera at a point.
 - `minecraft_fine_control(controls, duration_ms)` — raw key presses for moments
   the walker cannot express (bridging, edge work).
 - `minecraft_pillar_up()` — ascend exactly one block: jump and place the held

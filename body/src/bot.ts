@@ -227,12 +227,12 @@ export type HorizonRay = { heading_degrees: number; cardinal: string; pitch: num
 export type HorizonSector = { cardinal: string; terrain: string; notable_blocks: string[] };
 export type HorizonLandmark = { kind: string; cardinal: string; confidence: string; evidence: string[] };
 export type BodyScanHorizon = { origin: Vector; rays: HorizonRay[]; sectors: HorizonSector[]; landmarks: HorizonLandmark[]; duration_ms: number };
-export type StaircaseOutcome = { depth_requested: number; depth_achieved: number; end_position: Vector; blocks_dug: number; hazards_found: string[]; torches_placed: number };
+export type StaircaseOutcome = { depth_requested: number; depth_achieved: number; end_position: Vector; blocks_dug: number; dug_cells: Vector[]; hazards_found: string[]; torches_placed: number };
 export type SkillOutcome = { status: "ok" | "timeout" | "stopped" | "typescript_error" | "access_denied"; reason: string | null; stdout_tail: string | null; stderr_tail: string | null; heartbeats: number; duration_ms: number };
 
 export type CraftResult = {
   ok: boolean;
-  reason: "missing_ingredients" | "crafting_table_not_found" | "not_craftable" | null;
+  reason: "missing_ingredients" | "crafting_table_not_found" | "not_craftable" | "craft_incomplete" | null;
   missing: IngredientNeedData[];
   item: InventoryItem | null;
   repetitions: number;
@@ -699,7 +699,18 @@ export class MinecraftBody {
     const expectsWindow = ["chest", "barrel", "shulker_box", "hopper", "furnace", "crafting_table"].includes(kind);
     const before = typeof properties.open === "boolean" ? properties.open : null;
     await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true);
-    await bot.activateBlock(block);
+    const farm = kind.startsWith("farm_");
+    const held = bot.heldItem?.name;
+    const harvest = block.name === "sweet_berry_bush" && Number(properties.age) >= 2;
+    const till = held?.endsWith("_hoe") && ["grass_block", "dirt"].includes(block.name);
+    const above = block.position.offset(0, 1, 0);
+    const plant = held === "sweet_berries" && bot.blockAt(above)?.name === "air";
+    if (farm && (!harvest && !(kind === "farm_up" && (till || plant)) ||
+        bot.entity.position.distanceTo(block.position) > 5)) {
+      return { ok: false, reason: "activation_unconfirmed", open_before: null, open_after: null, action: null, window: null };
+    }
+    const faces: Record<string, Vec3> = { up: new Vec3(0,1,0), down: new Vec3(0,-1,0), north: new Vec3(0,0,-1), south: new Vec3(0,0,1), east: new Vec3(1,0,0), west: new Vec3(-1,0,0) };
+    await bot.activateBlock(block, farm ? faces[kind.slice(5)] : undefined);
     if (!toggle && !expectsWindow) await delay(300);
     // Sending a packet does not prove that the server applied it.
     // Observe the toggle or new window, with one bounded ten-second wait.
@@ -710,7 +721,9 @@ export class MinecraftBody {
       const current = bot.blockAt(block.position);
       const open = current?.getProperties().open;
       after = typeof open === "boolean" ? open : null;
-      confirmed = toggle ? current?.name === block.name && confirmedToggleAction(kind, before, after) !== null
+      confirmed = farm ? (harvest ? current?.name === block.name && Number(current.getProperties().age) < Number(properties.age)
+        : till ? current?.name === "farmland" : bot.blockAt(above)?.name === "sweet_berry_bush")
+        : toggle ? current?.name === block.name && confirmedToggleAction(kind, before, after) !== null
         : expectsWindow ? bot.currentWindow !== null : true;
       if (confirmed) break;
       await delay(100);
@@ -802,10 +815,19 @@ export class MinecraftBody {
       const reason = needsTable ? "crafting_table_not_found" : "missing_ingredients";
       return { ok: false, reason, missing: needsTable ? [] : missing, item: null, repetitions: 0, table: tablePosition ? vector(tablePosition) : null };
     }
+    const inventoryCounts = () => {
+      const counts = new Map<number, number>();
+      for (const stack of bot.inventory.items()) counts.set(stack.type, (counts.get(stack.type) ?? 0) + stack.count);
+      return counts;
+    };
+    const beforeCraft = inventoryCounts();
     const selectedSlot = bot.quickBarSlot;
     const previousHotbar = bot.inventory.slots.slice(36, 45);
     try {
       await bot.craft(recipe, repetitions, recipe.requiresTable ? table! : undefined);
+    } catch (error) {
+      if (!bot.entity || !this.bot) throw error;
+      // Reconcile partial server-side crafts before reporting completion.
     } finally {
       if (bot.currentWindow !== null) bot.closeWindow(bot.currentWindow);
       await restoreHotbar(bot, previousHotbar);
@@ -813,7 +835,16 @@ export class MinecraftBody {
     }
     await delay(300);
     const stack = bot.inventory.items().find((entry) => entry.name === itemName && entry.metadata === recipe.result.metadata);
-    return { ok: true, reason: null, missing: [], item: stack ? itemFromStack(stack) : null, repetitions, table: tablePosition ? vector(tablePosition) : null };
+    const afterCraft = inventoryCounts();
+    const costs = new Map<number, number>();
+    for (const delta of recipe.delta) costs.set(delta.id, (costs.get(delta.id) ?? 0) + delta.count);
+    const output = costs.get(item.id) ?? 0;
+    const change = (id: number) => (afterCraft.get(id) ?? 0) - (beforeCraft.get(id) ?? 0);
+    const runs = output > 0 ? change(item.id) / output : 0;
+    const verified = Number.isInteger(runs) && runs >= 0 && runs <= repetitions &&
+      [...costs].every(([id, cost]) => change(id) === cost * runs);
+    const completed = verified ? runs : 0;
+    return { ok: completed === repetitions, reason: completed === repetitions ? null : "craft_incomplete", missing: [], item: stack ? itemFromStack(stack) : null, repetitions: completed, table: tablePosition ? vector(tablePosition) : null };
   }
 
   async dropItem(itemName: string, count: number | null): Promise<DropResult> {
@@ -978,7 +1009,7 @@ export class MinecraftBody {
     }
     const result = await this.craft(itemName, maxRuns);
     await delay(300);
-    const runs = result.ok ? result.repetitions : 0;
+    const runs = result.repetitions;
     return { item: itemName, crafted: runs * outputCount, table: result.table, reason: result.reason, missing: result.missing };
   }
 
@@ -1115,7 +1146,7 @@ export class MinecraftBody {
     const notchianDegrees = normalizeDegrees((Math.PI - bot.entity.yaw) * 180 / Math.PI);
     const dir = forwardStep(notchianDegrees);
     const hazards: string[] = [];
-    let blocksDug = 0;
+    const dugCells: Vector[] = [];
     let torchesPlaced = 0;
     let depthAchieved = 0;
     const startingDeaths = this.deathCount;
@@ -1167,7 +1198,7 @@ export class MinecraftBody {
             stopped = true;
             break;
           }
-          blocksDug += 1;
+          dugCells.push(vector(cell));
           if (this.commandStopped || this.deathCount !== startingDeaths || bot.health <= 0) {
             hazards.push(this.commandStopped ? "stopped" : "player_died");
             stopped = true;
@@ -1179,11 +1210,17 @@ export class MinecraftBody {
           hazards.push("landing_changed");
           break;
         }
-        const beforeStep = vector(bot.entity.position);
+        const beforeStep = vector(feet);
         const walk = await this.walk("minecraft_staircase_down", vector(stepCell),
           new goals.GoalBlock(stepCell.x, stepCell.y, stepCell.z), 5000);
         if (this.commandStopped || this.deathCount !== startingDeaths || bot.health <= 0) {
           hazards.push(this.commandStopped ? "stopped" : "player_died");
+          break;
+        }
+        const settleDeadline = performance.now() + 1000;
+        while (!bot.entity.onGround && performance.now() < settleDeadline && !this.commandStopped && this.deathCount === startingDeaths && bot.health > 0) await delay(50);
+        if (this.commandStopped || bot.health <= 0) {
+          hazards.push(this.commandStopped ? 'stopped' : 'player_died');
           break;
         }
         if (!staircaseStepReached(beforeStep, vector(stepCell), vector(bot.entity.position),
@@ -1205,7 +1242,8 @@ export class MinecraftBody {
       depth_requested: depth,
       depth_achieved: depthAchieved,
       end_position: vector(bot.entity.position),
-      blocks_dug: blocksDug,
+      dug_cells: dugCells,
+      blocks_dug: dugCells.length,
       hazards_found: hazards,
       torches_placed: torchesPlaced,
     };
@@ -1699,6 +1737,11 @@ export class MinecraftBody {
         }),
       ]);
       await delay(150);
+      if (command === "minecraft_walk_to_exact" && (!bot.entity.onGround ||
+          !bot.entity.position.floored().equals(new Vec3(target.x, target.y, target.z).floored()))) {
+        return walkFailure(bot, target, "no_path", "The player did not settle in the requested cell.",
+          "partial", measuredHops(), performance.now() - started, diagnostic("outside_requested_cell"));
+      }
       if (distance(bot.entity.position, target) > this.configuration.walkReachedDistanceBlocks) {
         return walkFailure(bot, target, "no_path",
           `The path ended ${distance(bot.entity.position, target).toFixed(2)} blocks from the target, outside the ${this.configuration.walkReachedDistanceBlocks}-block reached distance.`,
