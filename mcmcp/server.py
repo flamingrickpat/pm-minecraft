@@ -55,10 +55,56 @@ class ConcurrentToolCallResult(ToolOutcome):
     reason: Literal["concurrent_tool_call"] = "concurrent_tool_call"
 
 
+class NotConnected(ToolOutcome):
+    ok: Literal[False] = False
+    reason: Literal["not_connected"] = "not_connected"
+    message: str = "not connected, pls connect"
+
+
+class WorldConnection:
+    """Exclude world transitions while any gameplay or observation call is active."""
+
+    def __init__(self, runtime: Any):
+        self.runtime = runtime
+        self.lock = threading.Lock()
+        self.active = 0
+        self.transition = False
+
+    def minecraft_disconnect(self) -> ToolOutcome:
+        """Leave the world until minecraft_connect is called."""
+        self.runtime.stop_body()
+        self.runtime._last_tool_state = None
+        return ToolOutcome(ok=True, message="Disconnected from Minecraft.")
+
+    def minecraft_connect(self) -> ToolOutcome:
+        """Join the configured Minecraft server."""
+        self.runtime.start_body()
+        return ToolOutcome(ok=True, message="Connected to Minecraft.")
+
+    def dispatch(self, gate, action, *args, **kwargs):
+        name = action.__name__
+        changing = name in {"minecraft_connect", "minecraft_disconnect"}
+        with self.lock:
+            if self.transition or (changing and self.active):
+                return ConcurrentToolCallResult(message="Another tool is running. Retry after it finishes.")
+            if self.runtime.body is None and name != "minecraft_connect":
+                return NotConnected()
+            self.active += 1
+            self.transition = changing
+        try:
+            return gate.call(action, *args, **kwargs)
+        finally:
+            with self.lock:
+                self.active -= 1
+                if changing:
+                    self.transition = False
+
+
 class CommandGate:
     def __init__(self, fence: BodyFence | None = None) -> None:
         self.mutex = threading.Lock()
         self.idle = threading.Condition(self.mutex)
+        self.connection: WorldConnection | None = None
         self.fence = fence
         self.running: tuple[str, float] | None = None
 
@@ -112,7 +158,7 @@ def _wrap_tool(method: Any, frame_directory: Path, gate: CommandGate, runtime: M
 
     @functools.wraps(method)
     def action(*args: Any, **kwargs: Any) -> Any:
-        if runtime is None or method.__name__ in CONCURRENT_TOOLS:
+        if runtime is None or method.__name__ in CONCURRENT_TOOLS | {"minecraft_connect", "minecraft_disconnect"}:
             return method(*args, **kwargs)
         return runtime.call_with_warnings(method, *args, **kwargs)
 
@@ -120,7 +166,8 @@ def _wrap_tool(method: Any, frame_directory: Path, gate: CommandGate, runtime: M
     def wrapper(*args: Any, **kwargs: Any) -> ToolResult:
         started = time.monotonic()
         try:
-            result = gate.call(action, *args, **kwargs)
+            result = (gate.connection.dispatch(gate, action, *args, **kwargs) if gate.connection
+                      else gate.call(action, *args, **kwargs))
         except Exception:
             log.exception("%s args=%s failed after %.0f ms", method.__name__, kwargs, (time.monotonic() - started) * 1000)
             raise
@@ -156,7 +203,7 @@ def _wrap_tool(method: Any, frame_directory: Path, gate: CommandGate, runtime: M
 
 
 def _tool_output_schema(method: Any) -> dict:
-    schema = TypeAdapter(get_type_hints(method)["return"] | ConcurrentToolCallResult).json_schema()
+    schema = TypeAdapter(get_type_hints(method)["return"] | ConcurrentToolCallResult | NotConnected).json_schema()
     return {"type": "object", **schema}
 
 
@@ -206,7 +253,12 @@ def build_server(configuration: Configuration) -> FastMCP:
     fence = BodyFence(configuration.agent_home / "body-epoch.json")
     gate = CommandGate(fence)
     owned_tools = {}
-    for name, method in inspect.getmembers(tools, inspect.ismethod):
+    methods = inspect.getmembers(tools, inspect.ismethod)
+    if configuration.connection_tools:
+        gate.connection = WorldConnection(runtime)
+        methods.extend((method.__name__, method) for method in
+                       (gate.connection.minecraft_connect, gate.connection.minecraft_disconnect))
+    for name, method in methods:
         if name.startswith("minecraft_"):
             wrapper = _wrap_tool(method, frame_directory, gate, runtime)
             owned_tools[name] = validate_call(wrapper)
@@ -218,6 +270,8 @@ def build_server(configuration: Configuration) -> FastMCP:
         if not owner or not session or epoch < 1:
             raise ValueError("A body claim needs an owner, session, and positive epoch.")
         with gate.idle:
+            if gate.connection and runtime.body is None:
+                return NotConnected().model_dump()
             gate.idle.wait_for(lambda: gate.running is None)
             token = {"owner": owner, "epoch": epoch, "session": session, "active": True}
             if epoch == fence.state["epoch"]:
@@ -231,6 +285,8 @@ def build_server(configuration: Configuration) -> FastMCP:
     def minecraft_body_release(owner: str, epoch: int, session: str) -> dict:
         """Retain the epoch after its owner finishes external cleanup."""
         with gate.idle:
+            if gate.connection and runtime.body is None:
+                return NotConnected().model_dump()
             gate.idle.wait_for(lambda: gate.running is None)
             fence.validate("release", {"owner": owner, "epoch": epoch, "session": session})
             return fence.commit({**fence.state, "active": False})

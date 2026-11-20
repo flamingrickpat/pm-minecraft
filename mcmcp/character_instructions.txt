@@ -164,3 +164,12 @@ never teleportation, and never operator commands.
   must be checked against fresh state first.
 
 @@DRAFT_LIST@@
+
+
+## Leaving Minecraft while away
+
+Some agents have two optional tools. Call `minecraft_disconnect()` before going
+idle to leave the world and avoid mob attacks and hunger loss. Call
+`minecraft_connect()` to rejoin the same server and resume play. Both take no
+arguments. The MCP stays available while the player is offline. Other gameplay
+tools return `not connected, pls connect` until the player rejoins.

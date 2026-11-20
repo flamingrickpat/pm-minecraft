@@ -44,6 +44,7 @@ SETTINGS = (
     EnvironmentSetting("MINECRAFT_RCON_PASSWORD", "", "RCON password. Set this value."),
     EnvironmentSetting("MCP_HOST", "127.0.0.1", "MCP HTTP host."),
     EnvironmentSetting("MCP_PORT", "6767", "MCP HTTP port."),
+    EnvironmentSetting("MCMCP_CONNECTION_TOOLS", "false", "Allow the agent to disconnect and reconnect to Minecraft."),
     EnvironmentSetting("MCMCP_TEST_MODE", "false", "Enable test-only MCP routes."),
     EnvironmentSetting("MCMCP_WALK_REACHED_DISTANCE_BLOCKS", "3", "Distance that completes a walk."),
     EnvironmentSetting("MCMCP_LOG_LEVEL", "info", "Log level: error, warning, info, or debug."),
@@ -77,6 +78,7 @@ class Configuration:
     inspector_enabled: bool
     inspector_host: str
     inspector_port: int
+    connection_tools: bool = False
 
 
 def environment_template() -> str:
@@ -125,4 +127,5 @@ def load_configuration(config_file: Path | None = None) -> Configuration:
         values["MINECRAFT_RCON_HOST"], int(values["MINECRAFT_RCON_PORT"]), values["MINECRAFT_RCON_PASSWORD"], values["MCP_HOST"], int(values["MCP_PORT"]),
         values["MCMCP_TEST_MODE"].lower() == "true", float(values["MCMCP_WALK_REACHED_DISTANCE_BLOCKS"]),
         values["MCMCP_INSPECTOR_ENABLED"].lower() == "true", values["MCMCP_INSPECTOR_HOST"], int(values["MCMCP_INSPECTOR_PORT"]),
+        values["MCMCP_CONNECTION_TOOLS"].lower() == "true",
     )

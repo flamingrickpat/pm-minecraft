@@ -162,7 +162,12 @@ class MinecraftRuntime:
             self.body = None
         if self.body is None:
             self.body = MinecraftBody(self.configuration)
-            self._require_same_server("body handoff")
+            try:
+                self._require_same_server("body handoff")
+            except Exception:
+                self.body.close()
+                self.body = None
+                raise
 
     def _require_same_server(self, phase: str) -> None:
         """Exit if RCON and Mineflayer point to different server instances.
@@ -177,6 +182,8 @@ class MinecraftRuntime:
         while not same and time.monotonic() < deadline:
             time.sleep(0.1)
             same = self.assist.has_player()
+        if not same and self.configuration.connection_tools:
+            raise RuntimeError("Minecraft player did not appear on the configured RCON server.")
         if not same:
             print(
                 f"Minecraft {phase} failed: Mineflayer"

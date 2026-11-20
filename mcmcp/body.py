@@ -103,7 +103,11 @@ class MinecraftBody:
             text=True,
             env=environment,
         )
-        self._request_state()
+        try:
+            self._request_state()
+        except Exception:
+            self.close()
+            raise
 
     def state(self) -> BodyState:
         """Read the current Mineflayer connection and camera state."""
@@ -325,6 +329,8 @@ class MinecraftBody:
                     self.process.returncode,
                     body_log[-4000:],
                 )
+                if self.configuration.connection_tools:
+                    raise RuntimeError("Minecraft body exited. Check body.log and retry connect.")
                 os._exit(1)
             try:
                 response = requests.request(

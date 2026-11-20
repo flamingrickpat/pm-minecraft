@@ -349,3 +349,16 @@ The door reply contained no stale window. Position, inventory, and vitals remain
 Both toggles returned the door to its initial observed state through ordinary tool calls.
 The original mismatch and successful probe remain in `body/test/fixtures/a13-block-activation.json`.
 These protocol results do not establish native entry or complete M3 acceptance.
+
+
+## Leaving Minecraft while away
+
+Some agents have two optional tools. Call `minecraft_disconnect()` before going
+idle to leave the world and avoid mob attacks and hunger loss. Call
+`minecraft_connect()` to rejoin the same server and resume play. Both take no
+arguments. The MCP stays available while the player is offline. Other gameplay
+tools return `not connected, pls connect` until the player rejoins.
+
+Set `MCMCP_CONNECTION_TOOLS=true` in the MCP instance's environment file and
+restart the MCP to expose both tools. The player starts connected in either
+mode. Existing configurations default to always-on play with both tools hidden.
