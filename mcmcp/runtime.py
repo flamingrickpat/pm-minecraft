@@ -1369,6 +1369,12 @@ class MinecraftRuntime:
         after = self.body.state()
         interrupted = result.interrupted or entity_id in self._test_interrupted_entities
         self._test_interrupted_entities.discard(entity_id)
+        if result.reason is not None:
+            return AttackEntityResult(ok=False, reason=result.reason,
+                message=f"Attack ended after {result.hits} swings: {result.reason}.",
+                entity_id=entity_id, entity_type=result.entity_type, killed=False, hits=result.hits,
+                entity_health_remaining=result.health, self_damage_taken=None, drops_collected=result.drops,
+                inventory_delta=_inventory_delta(before.inventory, after.inventory))
         if interrupted:
             return AttackEntityResult(ok=False, reason="entity_not_found", message="The entity was not found before the attack completed.", entity_id=entity_id, entity_type=result.entity_type, killed=False, hits=result.hits, entity_health_remaining=None, self_damage_taken=None, drops_collected=[], inventory_delta=_inventory_delta(before.inventory, after.inventory))
         return AttackEntityResult(ok=True, entity_id=entity_id, entity_type=result.entity_type, killed=result.killed, hits=result.hits, entity_health_remaining=result.health, self_damage_taken=None, drops_collected=result.drops, inventory_delta=_inventory_delta(before.inventory, after.inventory))

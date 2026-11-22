@@ -1246,6 +1246,14 @@ export class MinecraftBody {
     async attack(entityId, limit) {
         const bot = this.bot;
         const entity = bot.entities[entityId];
+        if (!entity) {
+            return { reason: "entity_not_found", entity_id: entityId, entity_type: null, killed: false, interrupted: false, hits: 0, health: null, drops: [] };
+        }
+        this.currentCommand = "minecraft_attack_entity";
+        this.commandStopped = false;
+        let reason = null;
+        const started = performance.now();
+        let approachStarted = started;
         let hits = 0;
         let interrupted = false;
         const recordDamage = (packet) => {
@@ -1256,8 +1264,17 @@ export class MinecraftBody {
         bot._client.on("damage_event", recordDamage);
         try {
             while (hits < limit && bot.entities[entityId] !== undefined) {
+                if (this.commandStopped || this.skillStopRequested && this.currentSkill !== null) {
+                    reason = "stopped";
+                    break;
+                }
                 const target = bot.entities[entityId];
                 if (target.position.distanceTo(bot.entity.position) > 3) {
+                    // One pursuit gets five seconds to bring the target into reach.
+                    if (performance.now() - approachStarted >= 5000 || performance.now() - started >= 60000) {
+                        reason = "target_unreachable";
+                        break;
+                    }
                     await bot.lookAt(target.position, true);
                     bot.setControlState("forward", true);
                     await delay(250);
@@ -1268,14 +1285,16 @@ export class MinecraftBody {
                 await bot.attack(target);
                 hits += 1;
                 await delay(700);
+                approachStarted = performance.now();
             }
         }
         finally {
+            this.currentCommand = null;
             bot.clearControlStates();
             bot._client.removeListener("damage_event", recordDamage);
         }
         const remaining = bot.entities[entityId];
-        return { entity_id: entityId, entity_type: entity.name ?? targetName(entity), killed: remaining === undefined && !interrupted, interrupted, hits, health: remaining?.health ?? null, drops: [] };
+        return { reason, entity_id: entityId, entity_type: entity.name ?? targetName(entity), killed: remaining === undefined && !interrupted, interrupted, hits, health: remaining?.health ?? null, drops: [] };
     }
     async chestMove(position, itemName, count, direction) {
         const bot = this.bot;

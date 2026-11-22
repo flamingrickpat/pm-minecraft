@@ -288,6 +288,7 @@ class BodyMine(BaseModel):
 
 
 class BodyAttack(BaseModel):
+    reason: Literal["target_unreachable", "stopped", "entity_not_found"] | None
     entity_id: int
     entity_type: str | None
     killed: bool

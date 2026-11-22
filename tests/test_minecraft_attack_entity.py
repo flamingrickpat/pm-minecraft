@@ -3,6 +3,22 @@
 import pytest
 
 from tests.live_case import DuringAction, EntitySpec, Layout, WorldExpectation, assert_failure_unchanged, assert_field, assert_message, assert_protocol_error, assert_response_image, assert_world_state, call_mcp, call_mcp_during, capture_failure_snapshot, capture_truth, parse_result, setup
+def test_unreachable_target_releases_body(live_test):
+    scenario = setup(live_test, layout=Layout(entities=(EntitySpec(
+        key="target", entity="cow", offset=(0.5, 5.0, 0.5),
+        nbt='{NoAI:1b,NoGravity:1b,PersistenceRequired:1b,Tags:["tdd_target"]}',
+    ),)))
+    arguments = {"entity_id": "$target_id"}
+    before = capture_truth(scenario)
+    response = call_mcp(scenario, "minecraft_attack_entity", arguments, timeout=30)
+    result = parse_result(scenario, response, "minecraft_attack_entity", arguments, truth_before=before)
+    assert result.ok is False
+    assert result.reason == "target_unreachable"
+    assert result.hits == 0
+    observed = call_mcp(scenario, "minecraft_observe", {"include_image": False}, timeout=10)
+    assert not observed.isError
+
+
 def test_attack_entity_bare_hand(live_test):
     scenario = setup(
         live_test,
