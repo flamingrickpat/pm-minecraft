@@ -322,7 +322,17 @@ export class MinecraftBody {
       this.spawned = true;
       this.capture.start(bot);
     });
+    // Mineflayer retains the local entity across respawn. The server starts a
+    // new life with default air and can omit unchanged default metadata.
+    let awaitingNewLife = false;
+    bot._client.on("respawn", () => {
+      if (awaitingNewLife) {
+        delete bot.entity.metadata[1];
+        awaitingNewLife = false;
+      }
+    });
     bot.on("death", () => {
+      awaitingNewLife = true;
       this.deathCount += 1;
       this.spawned = false;
     });
@@ -2445,7 +2455,7 @@ function playerStatus(bot: Bot): PlayerStatus {
     health: bot.health ?? 20,
     max_health: 20,
     food: bot.food ?? 20,
-    oxygen: Math.max(0, Math.min(20, Math.round(Number(airSupply ?? 300) / 15))),
+    oxygen: Math.max(0, Math.min(20, Math.ceil(Number(airSupply ?? 300) / 15))),
     xp_level: bot.experience?.level ?? 0,
     biome,
     dimension: bot.game?.dimension ?? "overworld",
